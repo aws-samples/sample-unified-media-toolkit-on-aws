@@ -1,0 +1,114 @@
+{
+  "contract_version": 1,
+  "target": "audio-description",
+  "stability": "Anything not listed here — everything under _plan/, _records/ and takes/ — is internal and may change without notice. cues.json/placed.json/drops.json are the pipeline's working registers; the ledger is the reviewer-facing rollup of all three.",
+  "outputs": {
+    "cue-ledger": {
+      "basename": "cue_ledger.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "The reviewer's artifact: every cue and unmet obligation with TWO independent axes (importance: why it must exist; compliance: what shipping it costs) and a DERIVED disposition — the ship/review line is customer policy, re-derivable without a re-run.",
+      "example": {
+        "id": "w12",
+        "window_id": 12,
+        "at": 198.4,
+        "dur": 2.6,
+        "text": "A coastal highway.",
+        "state": "placed",
+        "budget": 7,
+        "necessity": 0.72,
+        "important": true,
+        "why_needed": [
+          "ENTRY for scene 7"
+        ],
+        "violations": [],
+        "disposition": "ship"
+      }
+    },
+    "windows": {
+      "basename": "windows.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "The narration windows with duties (scene entry / prelude / anticipatory / reveal), budgets, and evidence pointers — the plan the script was written against.",
+      "example": {
+        "window_id": 12,
+        "start": 198.3,
+        "end": 203.1,
+        "word_budget": 9,
+        "scene_entry": true,
+        "entry_for_scene": 7,
+        "shot_ids": [
+          61,
+          62
+        ]
+      }
+    },
+    "gaps": {
+      "basename": "ad_gaps.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Unserved obligations with named causes: beats no cue conveys, high-necessity orientation breaks no cue serves, scenes never grounded. Reviewer-accepted absences (decisions_s3uri) are filtered out.",
+      "example": {
+        "kind": "orientation",
+        "sec": 512.0,
+        "beat": "scene 14 orientation break (setting: office -> car)",
+        "necessity": 0.61,
+        "reason": "no usable silence within the search horizon"
+      }
+    },
+    "srt": {
+      "basename": "{title}.srt",
+      "kind": "file",
+      "mime": "text/plain",
+      "description": "The placed cues as SubRip captions ([AD] prefixed), timed to the fitted takes."
+    },
+    "vtt": {
+      "basename": "{title}.vtt",
+      "kind": "file",
+      "mime": "text/vtt",
+      "description": "The placed cues as WebVTT, same timing as the srt."
+    },
+    "dapt": {
+      "basename": "{title}.dapt.xml",
+      "kind": "file",
+      "mime": "application/ttml+xml",
+      "description": "W3C DAPT (Dubbing and Audio description Profile of TTML2) script — the interchange format professional post tooling ingests; one audioDescription Script Event per placed cue."
+    },
+    "review": {
+      "basename": "review.html",
+      "kind": "file",
+      "mime": "text/html",
+      "description": "Single-file review page over the LEDGER (the rows that did not ship are the point), with per-cue audio pointers."
+    },
+    "manifest": {
+      "basename": "ad_manifest.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Run header: inputs, sung_vocal_policy, shipped cue count, gap count, and the labeled output uris."
+    },
+    "usage": {
+      "basename": "usage_tracking.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Aggregated bedrock cost/tokens across every submission (cost_is_complete propagated from the producer) plus the tts submission count."
+    },
+    "render-manifest": {
+      "basename": "render_manifest.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Everything a renderer needs to produce the fitted takes or the full accessible mix: per-take wav uri + placement (at) + tempo, plus the af_chain. Chain media-processing's process_media with an ad_mix output group pointing here to get the ducked, loudness-normalized mix wav.",
+      "example": {
+        "sample_rate": 48000,
+        "af_chain": "equalizer=...,loudnorm=...",
+        "takes": [
+          {
+            "window_id": 12,
+            "wav": "s3://...",
+            "at": 198.4,
+            "tempo": 1.13
+          }
+        ]
+      }
+    }
+  }
+}

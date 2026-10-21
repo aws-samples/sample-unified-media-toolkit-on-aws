@@ -1,0 +1,365 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# ============================================================================
+# program-structure-analysis-on-aws — the CODE-ONLY micro-workflow
+# (README.md §8): sibling run artifacts in
+# (shot-segmentation + shot-metadata-enrichment, optionally
+# conversation-analysis / transcript / audiostem), CPL-style markers,
+# break candidates, narrative sequences and the news rundown out. No
+# model calls anywhere — every judgment already happened upstream; this
+# stack is runs, positions and joins, recomputable for free.
+#
+# TWO Lambdas out of ONE flat zip (the gateway dispatcher and the
+# operation-routed workflow handler) and ONE state machine with NO
+# external waits: ValidateAndPlan refuses before spend, Assemble writes
+# every product in one pass.
+#
+# A STANDALONE child: no sibling gateway-ARN parameters — the inputs are
+# s3 run pointers, read straight from the proxy bucket.
+# ============================================================================
+Description: >
+    program-structure-analysis micro-workflow: sibling run artifacts in
+    (shot-segmentation, shot-metadata-enrichment, optional
+    conversation-analysis / transcript / audiostem), CPL-style markers,
+    break candidates, sequences and the news rundown out. Code-only —
+    no model calls.
+
+Metadata:
+    AWS::CloudFormation::Interface:
+        ParameterGroups:
+            -
+                Label:
+                    default: Resource Naming
+                Parameters:
+                    - ResourcePrefix
+            -
+                Label:
+                    default: S3 Bucket
+                Parameters:
+                    - ProxyBucket
+        ParameterLabels:
+            ResourcePrefix:
+                default: Resource Name Prefix
+            ProxyBucket:
+                default: Proxy Bucket (sibling run artifacts in, structure out)
+
+Parameters:
+    ResourcePrefix:
+        Type: String
+        Description: Prefix applied to all resource names.
+        AllowedPattern: "[a-z0-9][a-z0-9-]*"
+    ProxyBucket:
+        Type: String
+        Description: S3 proxy bucket — sibling run artifacts are read from micro-workflow/* and outputs land under micro-workflow/program-structure-analysis/. No default on purpose.
+
+Mappings:
+    Solution:
+        Package:
+            GatewayTool: "%%PKG_GATEWAY_TOOL%%"
+            Workflow: "%%PKG_WORKFLOW%%"
+        Source:
+            Bucket: "%%BUCKET_NAME%%"
+            KeyPrefix: "%%KEY_PREFIX%%"
+    Lambda:
+        GatewayTool:
+            Name: gateway-tool
+            Memory: 512
+            Timeout: 60
+        Workflow:
+            Name: workflow
+            Memory: 1024
+            Timeout: 300
+
+Resources:
+    ############################################################################
+    # Gateway tool — analyze_program_structure / get_job_status / describe_tool
+    ############################################################################
+    GatewayToolLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            # -log suffix + LoggingConfig, never /aws/lambda/{name}: the
+            # canonical group may exist as an orphan from an earlier deploy,
+            # and CFN cannot adopt a group (micro-workflow-bundle/README.md §C8).
+            LogGroupName: !Sub
+                - ${ResourcePrefix}-program-structure-analysis-${tool}-log
+                - tool: !FindInMap [Lambda, GatewayTool, Name]
+            RetentionInDays: 30
+
+    GatewayToolRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}ProgramStructureAnalysisGatewayToolPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # Scoped logs, no AWSLambdaBasicExecutionRole (the
+                          # managed policy lets a function that cannot reach
+                          # its declared group silently create an unmanaged
+                          # one).
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt GatewayToolLogGroup.Arn
+                          - Effect: Allow
+                            Action: states:StartExecution
+                            Resource: !Ref ProgramStructureAnalysisStateMachine
+                          # DescribeExecution / GetExecutionHistory take
+                          # execution ARNs, not the machine ARN.
+                          - Effect: Allow
+                            Action:
+                                - states:DescribeExecution
+                                - states:GetExecutionHistory
+                            Resource: !Sub
+                                - arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${smName}:*
+                                - smName: !GetAtt ProgramStructureAnalysisStateMachine.Name
+                          # get_job_status lifts small header fields from the
+                          # finished analysis.
+                          - Effect: Allow
+                            Action: s3:GetObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/program-structure-analysis/*
+                          # Without ListBucket, GetObject on a MISSING key
+                          # answers 403 AccessDenied instead of 404 NoSuchKey
+                          # (measured live on prompt-registry, 2026-08-15).
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            Condition:
+                                StringLike:
+                                    s3:prefix: micro-workflow/*
+
+    GatewayToolLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Single-purpose dispatcher; reserved concurrency unnecessary
+        Properties:
+            # Unnamed on purpose: reached through LoggingConfig, renames stay
+            # one-update operations.
+            Description: !Sub ${ResourcePrefix}-program-structure-analysis gateway tool (analyze_program_structure / get_job_status / describe_tool)
+            Runtime: python3.13
+            Architectures:
+                - arm64
+            Handler: lambda_function.lambda_handler
+            Role: !GetAtt GatewayToolRole.Arn
+            Code:
+                S3Bucket: !FindInMap [Solution, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [Solution, Source, KeyPrefix]
+                      pkg: !FindInMap [Solution, Package, GatewayTool]
+            MemorySize: !FindInMap [Lambda, GatewayTool, Memory]
+            Timeout: !FindInMap [Lambda, GatewayTool, Timeout]
+            LoggingConfig:
+                LogGroup: !Ref GatewayToolLogGroup
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    STATE_MACHINE_ARN: !Ref ProgramStructureAnalysisStateMachine
+                    TOOL_VERSION: "%%VERSION%%"
+                    # Must equal the GatewayTarget Name in media-toolkit-gateway.
+                    TARGET_NAME: program-structure-analysis
+
+    ############################################################################
+    # Workflow Lambda — tree zip, operation-routed (lambda_function.py -> states/<name>/)
+    ############################################################################
+    WorkflowLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub
+                - ${ResourcePrefix}-program-structure-analysis-${tool}-log
+                - tool: !FindInMap [Lambda, Workflow, Name]
+            RetentionInDays: 30
+
+    WorkflowRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}ProgramStructureAnalysisWorkflowPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt WorkflowLogGroup.Arn
+                          # Reads transcripts (any micro-workflow/ output,
+                          # speech-diarization first) and the bedrock runs
+                          # response/summary/usage documents.
+                          - Effect: Allow
+                            Action: s3:GetObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/*
+                          # Writes ONLY its own run prefix and the caller-side
+                          # inference history pointers (the family's shared
+                          # workflow-history convention).
+                          - Effect: Allow
+                            Action: s3:PutObject
+                            Resource:
+                                - !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/program-structure-analysis/*
+                                - !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/histories/*
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            Condition:
+                                StringLike:
+                                    s3:prefix: micro-workflow/*
+                          # The 8 pattern: sibling gateway Lambdas invoked
+                          # directly — run_inference/get_model on bedrock,
+                          # get_prompt on the registry. Never their state
+                          # machines.
+
+    WorkflowLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Serial workflow states; reserved concurrency unnecessary
+        Properties:
+            Description: !Sub ${ResourcePrefix}-program-structure-analysis workflow states (operation-routed)
+            Runtime: python3.13
+            Architectures:
+                - arm64
+            Handler: lambda_function.lambda_handler
+            Role: !GetAtt WorkflowRole.Arn
+            Code:
+                S3Bucket: !FindInMap [Solution, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [Solution, Source, KeyPrefix]
+                      pkg: !FindInMap [Solution, Package, Workflow]
+            MemorySize: !FindInMap [Lambda, Workflow, Memory]
+            Timeout: !FindInMap [Lambda, Workflow, Timeout]
+            LoggingConfig:
+                LogGroup: !Ref WorkflowLogGroup
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    TARGET_NAME: program-structure-analysis
+                    TOOL_VERSION: "%%VERSION%%"
+
+    ############################################################################
+    # State machine
+    ############################################################################
+    StateMachineRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: states.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}ProgramStructureAnalysisStateMachinePolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource: !GetAtt WorkflowLambda.Arn
+
+    ProgramStructureAnalysisStateMachine:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            StateMachineName: !Sub ${ResourcePrefix}-program-structure-analysis
+            RoleArn: !GetAtt StateMachineRole.Arn
+            DefinitionSubstitutions:
+                WorkflowLambdaArn: !GetAtt WorkflowLambda.Arn
+            # Inline is the single source of truth for what deploys;
+            # definitions.json is the readability copy — edit BOTH, the
+            # build script fails on drift.
+            DefinitionString: |-
+                {
+                  "Comment": "program-structure-analysis: sibling run pointers -> CODE-ONLY Layer-2 rollup (no model calls anywhere; every judgment already happened in Layer-1/CA). Two states: refuse-before-work planning + one assembly pass. Products: structure.json (CPL markers, break candidates, narrative sequences; acts deliberately ABSENT on masters - a measured negative result, README.md \u00a78) and rundown.json (news mode: shot roles + stories with three timestamps + first-class interstitials). Readability copy of the template's inline DefinitionString; edit BOTH, the build fails on drift.",
+                  "StartAt": "Validate and plan",
+                  "TimeoutSeconds": 900,
+                  "States": {
+                    "Validate and plan": {
+                      "Type": "Task",
+                      "Comment": "Refusals: required pointers present and well-formed; mode resolved (explicit > CA overall_content_type > narrative) with the evidence recorded; news mode without CA refuses (the stories ARE CA's segments). Persists _plan/plan.json.",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "ValidateAndPlan",
+                          "uuid.$": "$.uuid",
+                          "input.$": "$.input"
+                        }
+                      },
+                      "OutputPath": "$.Payload",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Assemble"
+                    },
+                    "Assemble": {
+                      "Type": "Task",
+                      "Comment": "The whole rollup in one pass, pure code, seconds of runtime. NOT a Map on purpose: the \u00a710 chunking rule targets long-running legs and this is bounded by one episode's JSON, not the catalogue.",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "Assemble",
+                          "uuid.$": "$.uuid",
+                          "plan_s3uri.$": "$.plan_s3uri"
+                        }
+                      },
+                      "OutputPath": "$.Payload",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "End": true
+                    }
+                  }
+                }
+
+Outputs:
+    GatewayToolLambdaArn:
+        Description: ARN of the gateway tool Lambda — the value media-toolkit-gateway' ProgramStructureAnalysisToolLambdaArn parameter will consume.
+        Value: !GetAtt GatewayToolLambda.Arn
+    StateMachineArn:
+        Description: ARN of the program-structure-analysis state machine.
+        Value: !Ref ProgramStructureAnalysisStateMachine

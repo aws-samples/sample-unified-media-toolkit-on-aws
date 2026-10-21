@@ -1,0 +1,27 @@
+{
+  "contract_version": 1,
+  "target": "artwork-selection",
+  "stability": "Labels and basenames are stable API. Candidates are in FINAL order (vision order when rerank.status is applied, metadata order otherwise); `unusable` means the judge said never ship that frame. identity_source says where person identities came from (cast_resolution names, face_recognition fallback with anonymous person_* labels, or null). Anything not listed here (_plan/ and _rerank/ internals) may change without notice.",
+  "outputs": {
+    "artwork": {
+      "basename": "artwork_candidates.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "THE product. slates[archetype] = {candidates: [...], vision: {ranking, top_reason, n_unusable} | null}. Candidates are in FINAL order — vision order when rerank applied, metadata order otherwise (rerank.status says which and why). Each candidate carries shot_id, t (midpoint seconds), the evidence fields that qualified it (camera_shot_type, people, people_count, description), frame (s3 uri of the grabbed JPEG, proxy resolution; null when the archive was unreadable; for person archetypes this is the candidate's BEST frame — frames lists the alternative moments of the same shot the vision judge chose among, picked by face-recognition's eyes-open/sunglasses/occlusion attributes), and unusable (a reason string — present means the judge said never ship this frame). Furniture-tier candidates (graphics_overlay footage, or on-screen text present) additionally carry shot_kind and the verbatim texts_on_screen so the burned-in graphics are reviewable. eligibility is the rejection accounting: per-clause counts of shots Layer A removed plus eligible_clean/eligible_overlaid — an empty or thin slate always says why.",
+      "notes": "Consumer guidance: take candidates in order and SKIP any with `unusable`; the slate is deliberately diverse (one candidate per shot, no shot shared across archetypes), so the runner-up is a genuine alternative, not an adjacent frame. cast_names[0] is the derived lead (screen-time order, brief must-includes first); identity_source says where identities came from — 'cast_resolution' (real names), 'face_recognition' (the fallback: top faces by screen time, unnamed clusters under anonymous person_* labels — artwork needs the same prominent person, not a name), or null (no identity source; person archetypes empty). identity_fallback maps any person archetype whose slate the cast path left EMPTY to 'face_recognition' — person archetypes never ship empty while face identity exists (the cast NAME join can miss on spelling; the face-track temporal join cannot); candidates in those slates carry anonymous person_* labels when the cluster is unnamed. Clean plates always outrank furniture frames: a candidate with burned-in graphics appears only where a clean plate does not exist in the content (broadcast news is the designed case — nearly all its footage carries tickers/lower thirds). The final pick is editorial — this artifact is the reviewable evidence, not a verdict. Frames are proxy resolution; full-resolution source grabs are a planned option, not yet available."
+    },
+    "candidates": {
+      "basename": "candidates.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "The pre-vision working document: the same slates in pure metadata order with the compiled plan context (archetype_counts, cast_names, validated brief_amendments, spoiler_cut_sec, n_excluded_spans). Useful for reviewing what the filter did before the judge touched anything.",
+      "notes": "Internal shape, superset context of the product; prefer artwork_candidates.json for consumption."
+    },
+    "frames": {
+      "basename": "frames/",
+      "kind": "prefix",
+      "mime": "image/jpeg",
+      "description": "The grabbed candidate frames ({archetype}_shot{NNNN}.jpg, proxy resolution, middle frame of the shot's archive) — referenced by uri from both JSON products."
+    }
+  }
+}

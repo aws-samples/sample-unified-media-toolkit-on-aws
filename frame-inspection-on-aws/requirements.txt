@@ -1,0 +1,4 @@
+# The one reason this stack ships a container instead of a flat zip:
+# pyvips[binary] bundles libvips (like sharp does in Node) — no system
+# install. Same pin discipline as face-recognition-on-aws.
+pyvips[binary]==3.0.0

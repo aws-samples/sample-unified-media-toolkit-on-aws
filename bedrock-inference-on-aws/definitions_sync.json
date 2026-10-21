@@ -1,0 +1,135 @@
+{
+    "Comment": "SYNC inference child (README.md §M1). Takes a concurrency lease from this stack's own sync-infer-quotas semaphore, runs the serial Converse loop under it, releases, and summarizes. Standalone and independently startable: given a plan (the orchestrator's Validate & plan output, i.e. $.data with workflow_id / config / quota / output / keys populated) this machine needs nothing else, and it ends with its own Summarize so it returns a complete summary.json + response.jsonl. NO Catch anywhere, deliberately — see 'Acquire lease'. Input: {\"uuid\":\"<correlation>\",\"input\":{...},\"data\":{<plan>}}",
+    "StartAt": "Acquire lease",
+    "States": {
+        "Acquire lease": {
+            "Comment": "In-stack now: targets this image's own 2-cores tier, not a foreign quota stack's function (README.md §M2.4 — the workflow role therefore holds states:SendTask*, and the cost of that is recorded there). Acquired LATE by construction: all S3 reads, record parsing and planning happened in the orchestrator's Validate & plan, so queued work still makes progress while this waits. TimeoutSeconds must exceed the guarded span of everything else contending for this scope; a token that times out while queued is a dead waiter the drain has to reap.\n\nNO Catch, and that is a deliberate change from the pre-merge ASL. Every post-acquire state used to Catch to a 'Release lease on failure' state; the four holder-disappearance triggers are now (1) normal release below, (3) the terminal-state EventBridge rule, and (4) the holder's own TTL — trigger 2 is gone, matching face-recognition, whose ASL has no Catch on its semaphore states either. The window this costs is named: try_acquire can succeed and the SendTaskSuccess that follows it can fail, leaving a live holder on a token nobody will redeem. That execution now sits here for the full TimeoutSeconds before the terminal rule reclaims the slot. The in-band release only ever SHORTENED that window — the slot was unusable to the drain either way — so this is a latency regression on the rarest failure path, not a leak.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+            "ResultPath": null,
+            "Parameters": {
+                "FunctionName": "${InferenceLambdaArn}",
+                "Payload": {
+                    "operation": "StateAcquireLease",
+                    "service.$": "$.data.quota.service",
+                    "resource.$": "$.data.quota.resource",
+                    "max_concurrent.$": "$.data.quota.max_concurrent",
+                    "execution_arn.$": "$$.Execution.Id",
+                    "task_token.$": "$$.Task.Token"
+                }
+            },
+            "TimeoutSeconds": 86400,
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Run inference"
+        },
+        "Run inference": {
+            "Comment": "The serial Converse loop. ONE in-flight call per lease (§10 item 1) — parallelising inside the held span would turn a cap of 3 into 3×N with no error anywhere. Forty serial calls do not fit in one 15-minute invocation, so the loop checkpoints per record in S3 and raises LambdaResourceTimeoutException; the Retry below is what re-enters it. MaxAttempts 10 × 15 min ≈ 2.5 h of wall clock, which is why 'auto' sends large sets to batch. BackoffRate 1 because the raise is a deliberate yield, not a failure to back off from — an exponential delay would idle a held lease.\n\nNo Catch: a failure here propagates to the parent, and the holder is reclaimed by the terminal-state rule on this execution's own FAILED event.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${RunInferenceLambdaArn}",
+                "Payload": {
+                    "operation": "StateRunInference",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "data.$": "$.data",
+                    "execution_arn.$": "$$.Execution.Id"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "LambdaResourceTimeoutException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 10,
+                    "BackoffRate": 1
+                },
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 1.5
+                }
+            ],
+            "Next": "Release lease"
+        },
+        "Release lease": {
+            "Comment": "Trigger 1 of the three remaining holder-disappearance paths. Deletes the holder ONLY; the counter is decremented by this stack's own stream handler on the holder's REMOVE record, which is what makes all three paths converge on one decrement and one drain. This handler never raises — a release failure is reported in $.data.lease, and the holder TTL plus the terminal-state rule are the backstops.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${InferenceLambdaArn}",
+                "Payload": {
+                    "operation": "StateReleaseLease",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "data.$": "$.data",
+                    "execution_arn.$": "$$.Execution.Id"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 1.5
+                }
+            ],
+            "Next": "Summarize"
+        },
+        "Summarize": {
+            "Comment": "This child's own terminal state, and the only state that sees the whole result set — which is why the all-records-failed decision lives here (§7). Duplicated with the batch child by design (README.md §M decision 1): both call the same lib/response.build_summary, and each child returning a complete summary.json is what makes it independently startable and independently useful. Partial success IS success: 39 of 40 ends SUCCEEDED with one FAILED line and its reason in summary.failures[]. Only EVERY record failing raises BedrockInferenceFailed, and summary.json is written first so the per-record reasons survive the failure.\n\nNote this runs AFTER the lease is released: summarizing is S3 and arithmetic, and holding a Bedrock concurrency slot through it would cap throughput on work that needs no slot.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${InferenceLambdaArn}",
+                "Payload": {
+                    "operation": "StateSummarize",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 1.5
+                }
+            ],
+            "End": true
+        }
+    }
+}

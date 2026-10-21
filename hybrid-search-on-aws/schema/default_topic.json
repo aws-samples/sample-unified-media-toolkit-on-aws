@@ -1,0 +1,46 @@
+{
+    "doc_type": "topic",
+    "embedding_model": "cohere.embed-v4:0",
+    "dims": 1024,
+    "vector_store": "s3vectors",
+    "language": "en",
+    "mappings": {
+        "doc_id": {
+            "type": "keyword",
+            "required": true
+        },
+        "asset_id": {
+            "type": "keyword",
+            "required": true
+        },
+        "start_ms": {
+            "type": "long",
+            "required": true
+        },
+        "end_ms": {
+            "type": "long",
+            "required": true
+        },
+        "text": {
+            "type": "text",
+            "required": true,
+            "fts": true
+        },
+        "vector": {
+            "type": "float32_vector",
+            "required": true,
+            "ann": true
+        },
+        "named_entities": {
+            "type": "text",
+            "fts": {
+                "stem": false,
+                "remove_stop_words": false
+            }
+        }
+    },
+    "result_fields": [
+        "text",
+        "named_entities"
+    ]
+}

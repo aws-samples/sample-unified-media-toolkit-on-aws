@@ -1,0 +1,179 @@
+{
+  "Comment": "artwork-selection: sibling run prefixes in, a ranked diverse artwork slate out. SIX linear states, the family shape: every wait is ONE held waitForTaskToken state completed by bedrock-inference's waker, NO polling and NO Choice states \u2014 skips are SELF-COMPLETED tokens carrying the reason as data. Code decides (eligibility, archetype queries, ranking, dedup); the model only ORDERS pre-qualified candidates: the brief translation can re-weight within the closed vocabulary but never reach eligibility, and the vision rerank can reorder and flag within a slate but never add to it. Both held rounds submit one record each (tiny text; one staged vision record via records_s3uri \u2014 base64 frames blow the 256 KB invoke payload); use_batch is a CALLER flag (default false = sync). Timeouts are deadmen sized for the worst legitimate case: held states 93600s (the batch SLA ceiling, since use_batch=true parks a round on a batch job), machine 108000s. Readability copy of the template's inline DefinitionString; edit BOTH, the build fails on drift.",
+  "StartAt": "Validate sources and compile plan",
+  "TimeoutSeconds": 108000,
+  "States": {
+    "Validate sources and compile plan": {
+      "Type": "Task",
+      "Comment": "Everything that can refuse refuses HERE: input shape, own-bucket rule, sibling artifact existence (shots + shot metadata required; cast persons + program structure optional), the provenance pin, flag normalization, archetype plan compilation (explicit list, else genre profile), prompt binding (degrades \u2014 the held states skip with a named reason). Persists _plan/plan.json; states pass URIs, never bodies.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "ValidateAndCompilePlan",
+          "uuid.$": "$.uuid",
+          "input.$": "$.input"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "Translate brief to plan amendments"
+    },
+    "Translate brief to plan amendments": {
+      "Type": "Task",
+      "Comment": "HELD: the one editorial seat. The free-text selection_brief goes to bedrock-inference (one text record, caller-flagged batch/sync) for translation into the closed vocabulary; the filter state validates the result \u2014 amendments re-weight, they never reach eligibility. Self-completed skips: no brief, no bedrock gateway, prompts not bound, submit failure \u2014 every path reaches the filter.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "TranslateBriefToPlanAmendments",
+          "plan_s3uri.$": "$.plan_s3uri",
+          "task_token.$": "$$.Task.Token"
+        }
+      },
+      "ResultPath": "$.brief_result",
+      "TimeoutSeconds": 93600,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "Filter and rank candidate shots"
+    },
+    "Filter and rank candidate shots": {
+      "Type": "Task",
+      "Comment": "THE selection, pure code, one retry unit: Layer A eligibility (hard filter, genre-independent \u2014 slates, on-screen text, brands, screen-in-screen, short shots, spoiler cut, program-structure spans), archetype queries over the closed vocabulary, stability ranking, cross-archetype dedup. Brief amendments are validated against the closed vocabulary before use. WRITES candidates.json.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "FilterRankCandidateShots",
+          "plan_s3uri.$": "$.plan_s3uri",
+          "brief_result.$": "$.brief_result"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "Grab candidate frames"
+    },
+    "Grab candidate frames": {
+      "Type": "Task",
+      "Comment": "Pure code, stdlib only: middle JPEG of each candidate shot's frame archive (shot-segmentation per-shot tar.gz, proxy resolution) -> frames/ under the run prefix. A broken archive drops the frame, never the run. full_res source extraction is a fast-follow \u2014 the parameter is refused at the gateway until then.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "GrabCandidateFrames",
+          "plan_s3uri.$": "$.plan_s3uri",
+          "candidates_s3uri.$": "$.candidates_s3uri"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "Rerank frames by vision"
+    },
+    "Rerank frames by vision": {
+      "Type": "Task",
+      "Comment": "HELD: the ONE model seat, judging only what metadata cannot see (sharpness, blur, eyes, composition). ONE staged vision record over every grabbed frame (records_s3uri \u2014 the frames cannot ride the invoke payload), all archetype groups in one request, ranked WITHIN each; the judge cannot add a frame, pick a slate, or violate the spoiler policy \u2014 it never saw those. Self-completed skips: no frames, no bedrock gateway, prompts not bound, submit failure.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "RerankFramesByVision",
+          "plan_s3uri.$": "$.plan_s3uri",
+          "candidates_s3uri.$": "$.candidates_s3uri",
+          "task_token.$": "$$.Task.Token"
+        }
+      },
+      "ResultPath": "$.rerank_result",
+      "TimeoutSeconds": 93600,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "Assemble artwork candidates"
+    },
+    "Assemble artwork candidates": {
+      "Type": "Task",
+      "Comment": "The product writer, AMENDS ONLY: vision ranking reorders within each archetype, unusable flags attach, the top reason is recorded \u2014 never adds, never re-qualifies. A skipped/failed rerank ships the metadata order with the reason on record: the slate is always delivered. WRITES artwork_candidates.json.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "AssembleArtworkCandidates",
+          "plan_s3uri.$": "$.plan_s3uri",
+          "candidates_s3uri.$": "$.candidates_s3uri",
+          "rerank_result.$": "$.rerank_result"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    }
+  }
+}

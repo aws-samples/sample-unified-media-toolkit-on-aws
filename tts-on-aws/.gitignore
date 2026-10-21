@@ -1,0 +1,41 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+venv*/
+.venv/
+
+# Claude Code session data
+.claude/
+
+# ── Build output ──────────────────────────────────────────────────────────
+# build-deploy-s3-dist.sh's staged zips/template — regenerable, not source
+dist/
+
+# ── Large local artifacts (never committed) ──────────────────────────────────
+# Model artefacts and voice-catalog seed bundle are hosted on CloudFront
+# (uploaded by package_models.sh / package_catalog.sh) — never committed
+# to this repo, only their producing scripts are.
+catalog_seed.tar.gz
+voice_catalog.tar.gz
+artefacts/
+
+# Real FLEURS/LibriSpeech source audio for the default voice catalog —
+# regenerable via catalog_sources/download_sources.py; keep the script,
+# not the ~18 MB of downloaded WAVs/manifests, in git history.
+catalog_sources/fleurs/*.wav
+catalog_sources/fleurs/manifest.json
+catalog_sources/librispeech/*.wav
+catalog_sources/librispeech/manifest.json
+
+# One-off verification-test result dumps (test/*.py) — regenerable by
+# re-running the script, not the finding itself (findings are recorded
+# in README.md).
+test/register_all_results.json
+test/reliability_test_results.json
+test/recheck_flippers_results.json
+
+# NOTE: assets/*.npy (mel filterbanks, ~400 KB) ARE committed — they are
+# build inputs baked into the Docker image, not caches.

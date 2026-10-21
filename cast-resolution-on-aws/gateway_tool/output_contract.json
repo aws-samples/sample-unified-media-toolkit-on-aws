@@ -1,0 +1,332 @@
+{
+ "contract_version": 1,
+ "target": "cast-resolution",
+ "stability": "Labels and basenames are stable API. speaker-map and face-map are CONDITIONAL: an absent source makes its map ABSENT (not empty) — three-state semantics. Anything not listed here (_plan/ internals) may change without notice.",
+ "outputs": {
+  "persons": {
+   "basename": "persons.json",
+   "kind": "file",
+   "mime": "application/json",
+   "description": "THE product: resolved person entities with types, names (only from independent naming mechanisms — never co-occurrence alone), per-binding evidence, critic vetoes, unresolved residue, and the provenance pin naming the exact sibling workflow_ids the binding is valid against.",
+   "example": {
+    "sources": {
+     "speech_diarization": "s3://…",
+     "face_recognition": "s3://…"
+    },
+    "persons": [
+     {
+      "person_id": 3,
+      "type": "on_camera_speaker",
+      "name": "Miriam Okafor",
+      "role": "anchor",
+      "aliases": [],
+      "speaker_ids": [
+       "SPEAKER_02"
+      ],
+      "face_ids": [
+       5
+      ],
+      "speech_sec": 412.5,
+      "screen_sec": 388.2,
+      "appearances": [
+       {
+        "begin_ms": 12400,
+        "end_ms": 31800
+       }
+      ],
+      "appearances_basis": "face",
+      "name_mechanisms": [
+       "celebrity",
+       "transcript_cue"
+      ],
+      "evidence": [
+       {
+        "speaker_id": "SPEAKER_02",
+        "face_person_id": 5,
+        "status": "confirmed",
+        "mechanism": "cooccurrence",
+        "share": 0.71,
+        "turns_together": 23,
+        "lead": 6.4
+       },
+       {
+        "kind": "self_id",
+        "name": "Miriam Okafor",
+        "speaker_id": "SPEAKER_02",
+        "sentence_id": 4,
+        "t": 12.4,
+        "confidence": "high"
+       }
+      ]
+     },
+     {
+      "person_id": 7,
+      "type": "on_camera_speaker",
+      "name": "Tomas Vega",
+      "character_name": "Det. Rios",
+      "aliases": [],
+      "speaker_ids": [
+       "SPEAKER_05"
+      ],
+      "face_ids": [
+       9
+      ],
+      "speech_sec": 96.4,
+      "screen_sec": 121.7,
+      "appearances": [
+       {
+        "begin_ms": 84200,
+        "end_ms": 99500
+       }
+      ],
+      "appearances_basis": "face",
+      "name_mechanisms": [
+       "collection"
+      ],
+      "evidence": [
+       {
+        "mechanism": "credits_cast",
+        "actor": "Tomas Vega",
+        "character": "Det. Rios"
+       }
+      ]
+     }
+    ],
+    "bindings": [
+     {
+      "speaker_id": "SPEAKER_07",
+      "face_person_id": 9,
+      "status": "proposed",
+      "mechanism": "cooccurrence",
+      "share": 0.31,
+      "turns_together": 3,
+      "lead": 1.4
+     }
+    ],
+    "cues": [
+     {
+      "kind": "vocative_resolved",
+      "name": "Tom",
+      "speaker_id": "SPEAKER_01",
+      "votes": 4,
+      "addressers": [
+       "SPEAKER_00",
+       "SPEAKER_02"
+      ],
+      "confidence": "high"
+     }
+    ],
+    "vetoes": [
+     {
+      "check": "face_self_overlap",
+      "overlap_sec": 192.8,
+      "face_ids": [
+       3,
+       4
+      ],
+      "name": "nora vane",
+      "action": "merge_blocked"
+     }
+    ],
+    "unresolved": {
+     "speakers": [
+      "SPEAKER_11"
+     ],
+     "faces": [
+      14,
+      15
+     ]
+    },
+    "provenance": {
+     "tool_version": "…",
+     "inputs": {
+      "speech_diarization_s3uri": "s3://…"
+     },
+     "sibling_workflow_ids": {
+      "speech_diarization": "cab8dc1f-…",
+      "face_recognition": "95f8d5c1-…"
+     },
+     "generated_at": "2026-09-04T12:00:00Z"
+    },
+    "class1": {
+     "speakers": [
+      "SPEAKER_02",
+      "SPEAKER_05"
+     ],
+     "faces": [
+      0,
+      3
+     ],
+     "matches": [
+      {
+       "speaker_id": "SPEAKER_02",
+       "face_person_id": 0,
+       "status": "confirmed",
+       "mechanism": "class1_assignment",
+       "score": 2.1,
+       "margin": 1.4,
+       "lift": 3.2,
+       "solo_sec": 24.5,
+       "name_join": true,
+       "f0": {
+        "f0_hz": 118.2,
+        "gender": "Male",
+        "n_sentences": 41,
+        "verdict": "compatible"
+       },
+       "onset_share": 0.71,
+       "tier": 1,
+       "floor_share": 0.44
+      }
+     ],
+     "abstentions": [
+      {
+       "speaker_id": "SPEAKER_05",
+       "reason": "thin_margin",
+       "candidates": [
+        {
+         "face_person_id": 3,
+         "score": 0.62,
+         "lift": 1.9,
+         "solo_sec": 0.0,
+         "name_join": false,
+         "f0": {
+          "verdict": "unassessed"
+         },
+         "onset_share": 0.18,
+         "floor_share": 0.05
+        }
+       ],
+       "eliminated": [
+        {
+         "face_person_id": 5,
+         "eliminated": "f0_gender",
+         "f0": {
+          "f0_hz": 226.1,
+          "gender": "Male",
+          "n_sentences": 40,
+          "verdict": "veto"
+         }
+        }
+       ]
+      }
+     ],
+     "unmatched_faces": [
+      3
+     ]
+    },
+    "critic_review": [
+     {
+      "person_id": 7,
+      "verdict": "suspect",
+      "suspect_field": "binding",
+      "conflicts": [
+       "e2",
+       "q1"
+      ],
+      "reason": "self-id in the quotes names a different person than the bound face's registry name",
+      "action": "flag_only"
+     }
+    ]
+   },
+   "notes": "Person types: on_camera_speaker | voice_only | silent_face | depicted_only | uncertain (depicted_only = every face track majority-inside displayed media — photo/monitor/file footage; the name may be true, the presence is not physical). name=null with non-empty aliases means the pipeline ABSTAINED (conflict or critic veto) — a wrong name is worse than none. character_name is additive and present only when a credits card paired this actor with a character (kind:character pairing, mechanism credits_cast) — name stays the actor. bindings[] holds PROPOSED pairings the evidence could not confirm; consumers must not treat them as facts. appearances is the person's presence timeline and appearances_basis says what carried it: `face` (member clusters' screen spans) or `speech` (merged speaker turn spans — the honest degrade on a faceless run). class1 is the hierarchical tier-one record: the programme-carrying voices and faces (each >= 4% of total speech / screen time), matched one-to-one in two angles: eliminations first (what it is NOT: F0-x-gender contradiction, zero co-presence — struck pairs carry an `eliminated` reason), then assertion evidence (what it IS: onset following — the edit cutting to the speaker at turn starts — presence-lift, solo cutaways, name joins). A match's `tier` says which round made it: 1 = the programme-carrying heads, 2 = the same machinery over the residue (smaller voices vs unmatched named faces, same confident bar). The matcher is the ONE binding engine: co-occurrence emits proposals and the narrator classification only, never confirms; matches appear in the persons' evidence as mechanism class1_assignment, and every unmatched class-1 voice carries a recorded abstention with its top candidates (a lead is never silently unbound). A class-1 person whose merged cluster collected other names keeps the sole registry name; the rest demote to aliases (mechanism class1_name_precedence). A class-1-matched person with NO registry name takes a DOMINANT repeated attached name (mechanism dominant_name, the vocative votes+lead bars): a host's chyron repeats across the programme, a guest's shows once; a genuine two-way repeat abstains. critic_review is the tooth-2 LLM reviewer's suspicion list (REPORT-ONLY — it never renames or demotes): per-flag {person_id, verdict: suspect, suspect_field: name|binding|character|type, conflicts: [cited evidence/quote ids], reason}; the same flag rides the flagged person's evidence with action flag_only. Reviewed persons are SUSPICION-ONLY (abstained names, mixed-voice clusters, coherence repairs, tooth-1 vetoes, speech-inferred characters) — a flag means the machine already doubts this person; start reviews there."
+  },
+  "speaker-map": {
+   "basename": "speaker_map.json",
+   "kind": "file",
+   "mime": "application/json",
+   "description": "Flat remap table SPEAKER_ID -> {person_id, name, type}, pinned to the diarization run it was computed from. Only valid joined to THAT run's transcript — a diarization re-run renumbers its clusters.",
+   "example": {
+    "sibling_workflow_ids": {
+     "speech_diarization": "cab8dc1f-…"
+    },
+    "speakers": {
+     "SPEAKER_02": {
+      "person_id": 3,
+      "name": "Miriam Okafor",
+      "type": "on_camera_speaker"
+     }
+    }
+   },
+   "notes": "ABSENT when the run had no speech_diarization_s3uri input (not assessed, not empty)."
+  },
+  "face-map": {
+   "basename": "face_map.json",
+   "kind": "file",
+   "mime": "application/json",
+   "description": "Flat remap table face person_id -> {person_id, name, type}, pinned to the face-recognition run it was computed from.",
+   "example": {
+    "sibling_workflow_ids": {
+     "face_recognition": "95f8d5c1-…"
+    },
+    "faces": {
+     "5": {
+      "person_id": 3,
+      "name": "Miriam Okafor",
+      "type": "on_camera_speaker"
+     }
+    }
+   },
+   "notes": "ABSENT when the run had no face_recognition_s3uri input (not assessed, not empty)."
+  },
+  "credits": {
+   "basename": "credits.json",
+   "kind": "file",
+   "mime": "application/json",
+   "description": "CONDITIONAL — present only when this run performed a credits read (frame-inspection is internal; this workflow is the only way to order one). The witness product VERBATIM: card text per nondiegetic block, cards in display order with programme-second timestamps — evidence only; which cards deserve voice is the consumer's judgment (audio-description reads it for closing-credits narration).",
+   "example": {
+    "blocks": [
+     {
+      "start": 1642.5,
+      "end": 1762.3,
+      "kinds": [
+       "credit_roll",
+       "logo_bumper"
+      ],
+      "shot_ids": [
+       385,
+       386
+      ],
+      "cards": [
+       {
+        "t": 1642.5,
+        "lines": [
+         "Directed by",
+         "Mira Santos"
+        ]
+       },
+       {
+        "t": 1658.4,
+        "lines": [
+         "and",
+         "Jane Smith"
+        ],
+        "pairings": []
+       },
+       {
+        "t": 1699.0,
+        "lines": [
+         "In Loving Memory of",
+         "Lena Voss"
+        ]
+       }
+      ]
+     }
+    ],
+    "gaps": []
+   }
+  },
+  "usage": {
+   "basename": "usage_tracking.json",
+   "kind": "file",
+   "mime": "application/json",
+   "description": "Run cost record. P0 binds from free evidence — zero model spend, stated explicitly (cost_is_complete discipline).",
+   "example": {
+    "pipeline_wall_sec": 4.2,
+    "total_estimated_cost": 0.0,
+    "cost_is_complete": true,
+    "note": "P0 free-evidence binding — no Bedrock calls, no OCR reads"
+   }
+  }
+ }
+}

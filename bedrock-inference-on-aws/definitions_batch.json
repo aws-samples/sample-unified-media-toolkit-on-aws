@@ -1,0 +1,146 @@
+{
+    "Comment": "BATCH inference child (README.md §M1). Submits one Bedrock batch job for all N records, parks on a task token until the job finishes, collects the output, and summarizes. No lease on the SUBMISSION path: the in-progress-job limit is account-level and service-enforced, so a local cap would serialize submissions Bedrock is willing to accept in parallel (§1.1). Standalone and independently startable given a plan whose $.data.batch.can_batch is true. Input: {\"uuid\":\"<correlation>\",\"input\":{...},\"data\":{<plan>}}\n\nFOUR states, and the repair tail is a NESTED CALL rather than a copied spine (README.md §P8). Repairing failed records IS sync inference — lease, chain walk, checkpoint, release — so this machine invokes the sync CHILD MACHINE for it instead of duplicating four of its states here. What that buys: run_inference and the sync ASL are untouched, there is exactly one lease/checkpoint/release spine in the stack, and 'either child is startable on its own given a plan' still holds because the repair lives here and not in the orchestrator. What it costs: the start graph gains an edge, so it is stated as an invariant — orchestrator → {sync, batch}, batch → sync, sync → nothing, ACYCLIC, and a test pins it. A machine that could reach itself is a recursion with a real Bedrock bill.\n\nThe route into the repair is a Catch on 'Collect batch output', not a Choice. collect_batch RAISES BatchRecordsIncompleteException over already-committed S3 state, and the exception is control flow rather than a fault: the caught path summarizes normally and this execution SUCCEEDS. The cost is deliberate and accepted — a partial batch renders as a red state in the console and emits a LambdaFunctionsFailed datapoint — because a run that had a problem SHOULD be legible in the execution graph months later, where a boolean on a payload has to be dug out of the history. It is also the only mechanism that can discriminate: a .sync:2 child failure reaches its parent as States.TaskFailed, never as the child's own error name, so an equivalent Catch one level up in the orchestrator could not tell a repairable batch from any other failure.",
+    "StartAt": "Submit batch",
+    "States": {
+        "Submit batch": {
+            "Comment": "One job, all N records, parked on a task token. The row is written status=SUBMITTING before CreateModelInvocationJob, so a Lambda death in between still leaves a record of the attempt (§6.2). A quota-shaped refusal returns normally with status=PENDING and the task stays parked — a drain submits it when capacity frees, which is why TimeoutSeconds is a full day rather than sized to a job's runtime. There is no Catch: no lease was taken, and NotifyFunction reports a failed job through SendTaskFailure, so the failure surfaces as itself.\n\nResultPath (not OutputPath) is what makes the repair tail possible: it MERGES the resumed token's payload under $.batch_result and leaves $.data — the plan — intact for every state after this one, including the caught path, which needs the plan to start the repair child with.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+            "ResultPath": "$.batch_result",
+            "Parameters": {
+                "FunctionName": "${SubmitBatchLambdaArn}",
+                "Payload": {
+                    "operation": "StateSubmitBatch",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "data.$": "$.data",
+                    "task_token.$": "$$.Task.Token"
+                }
+            },
+            "TimeoutSeconds": 86400,
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 1.5
+                }
+            ],
+            "Next": "Collect batch output"
+        },
+        "Collect batch output": {
+            "Comment": "$.batch_result is the SendTaskSuccess payload from NotifyFunction, and it carries job_arn for a reason: the notifier DELETES the row after sending, so by the time this state runs the table lookup is usually a miss. Records are mapped from the job output by record_id, never by position — Bedrock does not guarantee output order and interleaves padding records.\n\nThe Catch is the fork into the repair tail (§8). collect_batch writes response.jsonl AND seeds _progress.json with the successful lines, and only THEN raises BatchRecordsIncompleteException — write-then-raise, so the raise is a routing signal over durable state rather than a lost result. Everything this state returned on that path is discarded, which is by design and not a leak: Summarize recomputes every count from response.jsonl, and the repair's own numbers come back through the repair state's ResultSelector.\n\nThe Catch carries an EXPLICIT ResultPath because the default is '$', which would replace the whole input with the error object and leave the repair with no plan, no keys and no workflow_id. $.data.batch_incomplete merges instead, and $.data is still there to merge into because a caught error replaces the state's RESULT, not its INPUT — see Submit batch's ResultPath.\n\nThe Retry ladder names only Lambda.* integration errors, and must never name States.ALL: Step Functions evaluates Retry before Catch, so a ladder that swallowed BatchRecordsIncompleteException would re-read the whole batch output three times before the repair it exists to trigger ever fired. A Python class name can never collide with the Lambda. prefix, so the ladder is self-enforcing; a test pins it anyway.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${InferenceLambdaArn}",
+                "Payload": {
+                    "operation": "StateCollectBatch",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "data.$": "$.data",
+                    "batch_result.$": "$.batch_result"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 1.5
+                }
+            ],
+            "Catch": [
+                {
+                    "ErrorEquals": [
+                        "BatchRecordsIncompleteException"
+                    ],
+                    "ResultPath": "$.data.batch_incomplete",
+                    "Next": "Run repair inference"
+                }
+            ],
+            "Next": "Summarize"
+        },
+        "Run repair inference": {
+            "Comment": "The repair pass IS the sync child machine, started with this machine's own plan (§8). run_inference resumes from the _progress.json that collect_batch seeded with the successful batch lines, so it infers exactly the gaps — through the normal chain walk, with the primary model keeping first shot, which is what restores chain-fallback semantics to batch (a single-model job has nothing to fall back to; a batch miss was transient flakiness rather than a model verdict, and even a refusal deserves the primary's second look before the chain escalates it, because refusals are not deterministic). It re-writes response.jsonl in request order over the collect pass's copy. Repaired records price at the ON-DEMAND rate, which is truthful: a run that needed repair costs visibly more than a clean batch run.\n\nNAMED {workflow_id}-repair, so it cannot collide with the -sync sibling a mode flip on the same workflow_id would create, and so the console shows which pass an execution was. It runs EXACTLY ONCE by construction: the Catch that routes here is on Collect batch output, and this state's only exits are Summarize and its own degrade-to-Summarize Catch, so there is no edge back. A record that fails the repair too stays a FAILED line.\n\nResultSelector takes two fields and no more. records_resumed is the repair child's own count of records the seeded checkpoint made it SKIP — i.e. the batch successes — and Summarize turns it into records_repaired as succeeded minus resumed, which is what the repair RECOVERED rather than what it attempted. ResultPath is a NESTED path, so it merges under $.data rather than replacing it.\n\nThe Catch on States.ALL degrades rather than fails, and the reason is a perverse incentive: with repair OFF a 95/100 batch is a SUCCEEDED execution with five FAILED lines, so a failed repair must not turn that same run into a FAILED execution — response.jsonl is already complete and correct on S3 either way. The reason lands in summary.repair_error, which is the only trace of a caught error a caller can read. Retry is transport-only for the same reason the orchestrator's branches are: States.TaskFailed would re-issue startExecution under this fixed name and return ExecutionAlreadyExists, so the caller would see a name collision instead of the real error.\n\nTimeoutSeconds matches the orchestrator's sync branch because the child is the same child: up to 24 h queued for a lease plus ~2.5 h of checkpoint/re-enter retries.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::states:startExecution.sync:2",
+            "Parameters": {
+                "StateMachineArn": "${SyncInferenceStateMachineArn}",
+                "Name.$": "States.Format('{}-repair', $.data.workflow_id)",
+                "Input": {
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "data.$": "$.data"
+                }
+            },
+            "ResultSelector": {
+                "execution_arn.$": "$.ExecutionArn",
+                "records_resumed.$": "$.Output.data.records_resumed"
+            },
+            "ResultPath": "$.data.repair",
+            "TimeoutSeconds": 100800,
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "StepFunctions.SdkClientException",
+                        "StepFunctions.ThrottlingException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 2
+                }
+            ],
+            "Catch": [
+                {
+                    "ErrorEquals": [
+                        "States.ALL"
+                    ],
+                    "ResultPath": "$.data.repair_error",
+                    "Next": "Summarize"
+                }
+            ],
+            "Next": "Summarize"
+        },
+        "Summarize": {
+            "Comment": "This child's own terminal state — the same handler and the same lib/response.build_summary as the sync child's Summarize (README.md §M decision 1). Two call sites for one builder rather than a shared post-join state, which is what makes each child return a complete summary.json + response.jsonl on its own. Partial success IS success: 39 of 40 ends SUCCEEDED with one FAILED line and its reason in summary.failures[]. Only EVERY record failing raises BedrockInferenceFailed, and summary.json is written first so the per-record reasons survive the failure.\n\nThe SINGLE terminal state for all three paths — clean batch, repaired batch, failed repair — and that is safe because it is a pure idempotent function of response.jsonl plus the plan. The repair child writes summary.json too, from its own Summarize; this one runs after it, over the same response.jsonl, and is the only one of the two that can see $.data.repair. Last writer wins, and both writers agree on everything but the repair fields.\n\nsummary.quota_table is empty on a clean batch run, which is the accurate answer: batch takes no lease, so no cap governed it. On a repaired run it names the table, because the repair took a lease like any sync run.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${InferenceLambdaArn}",
+                "Payload": {
+                    "operation": "StateSummarize",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 1.5
+                }
+            ],
+            "End": true
+        }
+    }
+}

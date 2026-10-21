@@ -1,0 +1,1619 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Build and deploy tts-on-aws (CosyVoice3 ONNX) container to ECR, seed model artefacts to S3, deploy synthesis + register-voice state machines. Version %%VERSION%%
+
+Mappings:
+    CodeBuild:
+        Source:
+            Package: "%%PKG_TTS_ON_AWS%%"
+            GatewayToolPackage: "%%PKG_GATEWAY_TOOL%%"
+            Bucket: "%%BUCKET_NAME%%"
+            KeyPrefix: "%%KEY_PREFIX%%"
+        Project:
+            Type: ARM_CONTAINER
+            ComputeType: BUILD_GENERAL1_LARGE
+            Image: aws/codebuild/amazonlinux2-aarch64-standard:3.0
+    ECR:
+        Repository:
+            Name: tts-on-aws
+            ImageTag: "%%VERSION%%"
+    Lambda:
+        Function:
+            Name: tts
+            Description: CosyVoice3 TTS (ONNX Runtime, zero-shot voice cloning)
+        GatewayTool:
+            Name: gateway-tool
+            Description: AgentCore Gateway dispatcher — synthesize_speech + register_voice + voice catalog
+            Memory: 256
+            Timeout: 30
+        # Memory tiers — the full house set of seven
+        # (896 / 1792 / 3584 / 5376 / 7168 / 8960 / 10240 MB), so a state can
+        # be re-pointed at a different tier during testing without a template
+        # change. media-processing, speech-diarization and audiostem-separation
+        # declare all seven; shot-segmentation declares five and
+        # face-recognition two, but no workflow declares a tier at a DIFFERENT
+        # memory or name, so the seven pairs below are the house vocabulary.
+        # Declaring a tier no state routes to is likewise already the norm —
+        # media-processing routes to 3 of its 7, audiostem 4 of 7,
+        # speech-diarization 5 of 7. Each tier costs a Function + a LogGroup +
+        # an InvokeFunction grant at deploy time and nothing at runtime,
+        # because an unrouted function is never invoked.
+        #
+        # Which tiers the state machines actually route to today is MEASURED
+        # on live runs (README.md §9), not projected. Real Max Memory Used:
+        #   HalfCore  — usage tracking (94 MB), write-record
+        #   OneCore   — preprocess (86 MB), QC whisper (704 MB)
+        #   TwoCores  — LLM INT4 (peak 2873/2938 MB), speech-tokenizer
+        #               extraction (peak 3179 MB)
+        #   FourCores — Flow+HiFT, FP32 estimator (peak 4998 MB)
+        # ThreeCores, FiveCores and SixCores are declared-but-unrouted, and
+        # that is deliberate: Flow+HiFT is NOT on the 5376 MB tier despite
+        # fitting it, because 5376 was adequate but tight at a 5029 MB peak
+        # and 3→4 vCPU cut cold synthesis ~43% (7.4→4.2 s per audio-second)
+        # for ~14% more cost — README.md §9 settles it as "keep Flow+HiFT on
+        # 7168 MB (4 vCPU); return the LLM to 3584 MB". Re-point a state at
+        # 5376 to re-measure that; do not delete the tier.
+        HalfCore:
+            Memory: 896
+            Name: half-core
+        OneCore:
+            Memory: 1792
+            Name: 1-core
+        TwoCores:
+            Memory: 3584
+            Name: 2-cores
+        ThreeCores:
+            Memory: 5376
+            Name: 3-cores
+        FourCores:
+            Memory: 7168
+            Name: 4-cores
+        FiveCores:
+            Memory: 8960
+            Name: 5-cores
+        SixCores:
+            Memory: 10240
+            Name: 6-cores
+    DynamoDB:
+        Table:
+            Suffix: voice-registry
+    Models:
+        CloudFront:
+            BaseUrl: https://dx2y1cac29mt3.cloudfront.net
+        S3:
+            Prefix: _model_artefacts
+
+Parameters:
+    ResourcePrefix:
+        Type: String
+        Description: Prefix for resource names
+    ProxyBucket:
+        Type: String
+        Description: S3 proxy bucket for model artefacts, voice conditioning blobs, and synthesized output
+
+Resources:
+
+    # =========================================================================
+    # Proxy bucket validator — same custom-resource pattern as the sibling
+    # workflows (creates the bucket if absent, verifies ownership).
+    # =========================================================================
+    ProxyBucketValidatorRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: ProxyBucketValidation
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # Scoped to the declared group, and deliberately NOT
+                          # AWSLambdaBasicExecutionRole: that managed policy
+                          # grants logs:CreateLogGroup on every group, which
+                          # lets a function that cannot reach its declared
+                          # group silently create an unmanaged one instead of
+                          # failing visibly.
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt ProxyBucketValidatorLogGroup.Arn
+                          - Effect: Allow
+                            Action:
+                                - s3:ListBucket
+                                - s3:CreateBucket
+                                - s3:PutBucketPublicAccessBlock
+                            Resource: !Sub "arn:aws:s3:::${ProxyBucket}"
+
+    ProxyBucketValidatorFunction:
+        Type: AWS::Lambda::Function
+        Properties:
+            FunctionName: !Sub ${ResourcePrefix}-tts-bucket-check
+            Description: Validates/creates the proxy bucket at stack create/update
+            Runtime: python3.12
+            Handler: bucket_validator.handler
+            Timeout: 60
+            MemorySize: 128
+            Role: !GetAtt ProxyBucketValidatorRole.Arn
+            Code:
+                S3Bucket: !FindInMap [CodeBuild, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${package}
+                    - keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                      package: !FindInMap [CodeBuild, Source, GatewayToolPackage]
+
+    # Declared explicitly so retention is 30 days and the group dies with the
+    # stack. Lambda auto-creates /aws/lambda/<fn> on first invocation with
+    # never-expire retention and no stack ownership, which orphans the group
+    # on stack delete — and then makes the NEXT create fail with
+    # "already exists". Both custom-resource functions shipped that way once.
+    #
+    # This name tracks the function's -bucket-check rename. LogGroupName is a
+    # createOnlyProperty, so the rename REPLACES the resource and CFN deletes
+    # the old -tts-proxy-bucket-validator group with everything in it. That was
+    # acceptable exactly once, here, because the deployed group held 0 bytes
+    # (checked before renaming). Never rename a stack-owned group that holds
+    # logs you want.
+    ProxyBucketValidatorLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub /aws/lambda/${ResourcePrefix}-tts-bucket-check
+            RetentionInDays: 30
+
+    # Logical id and Type both match the five sibling workflows
+    # (ProxyBucketValidator / Custom::ProxyBucketValidator). Renaming BOTH is
+    # a replacement, which CFN performs create-before-delete — safe here only
+    # because this resource has no explicit physical name and its Delete is a
+    # documented no-op that never touches the bucket. Contrast the log groups
+    # below, where an explicit LogGroupName makes the same rename fail at
+    # pre-flight; see StartBuildLambdaLogGroup.
+    ProxyBucketValidator:
+        Type: Custom::ProxyBucketValidator
+        # The log group must exist BEFORE the function is first invoked, or
+        # Lambda wins the race and creates the unmanaged one anyway.
+        DependsOn: ProxyBucketValidatorLogGroup
+        Properties:
+            ServiceToken: !GetAtt ProxyBucketValidatorFunction.Arn
+            BucketName: !Ref ProxyBucket
+            AccountId: !Ref AWS::AccountId
+            Region: !Ref AWS::Region
+
+    # =========================================================================
+    # Voice registry table (README.md §5 — modeled on face-recognition's
+    # FaceTable). catalog-index: catalog_created = "{catalog}#{epoch:015d}".
+    # =========================================================================
+    VoiceTable:
+        Type: AWS::DynamoDB::Table
+        Metadata:
+            checkov:
+                skip:
+                    - id: CKV_AWS_119
+                      comment: >-
+                        sample posture: table holds rebuildable derived state; default SSE is deliberate (see README.md DeletionPolicy decision)
+        Properties:
+            TableName: !Sub
+                - ${ResourcePrefix}-${suffix}
+                - suffix: !FindInMap [DynamoDB, Table, Suffix]
+            BillingMode: PAY_PER_REQUEST
+            AttributeDefinitions:
+                - { AttributeName: pk, AttributeType: S }
+                - { AttributeName: sk, AttributeType: S }
+                - { AttributeName: catalog, AttributeType: S }
+                - { AttributeName: catalog_created, AttributeType: S }
+            KeySchema:
+                - { AttributeName: pk, KeyType: HASH }
+                - { AttributeName: sk, KeyType: RANGE }
+            GlobalSecondaryIndexes:
+                - IndexName: catalog-index
+                  KeySchema:
+                      - { AttributeName: catalog, KeyType: HASH }
+                      - { AttributeName: catalog_created, KeyType: RANGE }
+                  Projection:
+                      ProjectionType: ALL
+            TimeToLiveSpecification:
+                AttributeName: ttl
+                Enabled: true
+            PointInTimeRecoverySpecification:
+                PointInTimeRecoveryEnabled: true
+
+    # =========================================================================
+    # CodeBuild — builds the container image, pushes to ECR, seeds model
+    # artefacts to S3 (idempotent: skip-if-exists at image and model level).
+    # Model archives are produced by package_models.sh and hosted on the
+    # house CloudFront under opensource_models/cosyvoice3/…
+    # =========================================================================
+    CodeBuildRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: codebuild.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: CodeBuildAccess
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild*
+                          - Effect: Allow
+                            Action:
+                                - ecr:GetAuthorizationToken
+                            Resource: "*"
+                          - Effect: Allow
+                            Action:
+                                - ecr:CreateRepository
+                                - ecr:DescribeImages
+                                - ecr:BatchCheckLayerAvailability
+                                - ecr:CompleteLayerUpload
+                                - ecr:InitiateLayerUpload
+                                - ecr:PutImage
+                                - ecr:UploadLayerPart
+                            Resource: !Sub
+                                - arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${repositoryName}
+                                - repositoryName: !FindInMap [ECR, Repository, Name]
+                          - Effect: Allow
+                            Action:
+                                - s3:GetObject
+                            Resource: !Sub
+                                - arn:aws:s3:::${bucket}/*
+                                - bucket: !FindInMap [CodeBuild, Source, Bucket]
+                          - Effect: Allow
+                            Action:
+                                - s3:GetObject
+                                - s3:PutObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/*
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:BatchWriteItem
+                            Resource: !GetAtt VoiceTable.Arn
+
+    CodeBuildProject:
+        Type: AWS::CodeBuild::Project
+        Properties:
+            Name: !Sub
+                - ${ResourcePrefix}-${repositoryName}
+                - repositoryName: !FindInMap [ECR, Repository, Name]
+            Description: !Sub
+                - Build and publish ${desc} docker image to ECR; seed model artefacts to S3
+                - desc: !FindInMap [Lambda, Function, Description]
+            ServiceRole: !GetAtt CodeBuildRole.Arn
+            Source:
+                Type: S3
+                Location: !Sub
+                    - ${bucket}/${keyPrefix}/${package}
+                    - bucket: !FindInMap [CodeBuild, Source, Bucket]
+                      keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                      package: !FindInMap [CodeBuild, Source, Package]
+                BuildSpec: |
+                    version: 0.2
+                    phases:
+                        pre_build:
+                            commands:
+                                - echo "== Logging in to Amazon ECR =="
+                                - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+                                - |
+                                    echo "== Creating ECR repository if it does not exist =="
+                                    aws ecr create-repository --region $AWS_REGION --repository-name $IMAGE_REPO_NAME --image-scanning-configuration scanOnPush=true --encryption-configuration encryptionType=AES256; EXITCODE=$?
+                                    if [ $EXITCODE -ne 0 ] && [ $EXITCODE -ne 254 ]; then
+                                        echo "ECR create-repository failed with exit code $EXITCODE"
+                                        exit $EXITCODE
+                                    fi
+                                - |
+                                    echo "== Checking if $IMAGE_REPO_NAME:$IMAGE_TAG already exists =="
+                                    if aws ecr describe-images --region $AWS_REGION --repository-name $IMAGE_REPO_NAME --image-ids imageTag=$IMAGE_TAG 2>/dev/null; then
+                                        echo "Image $IMAGE_REPO_NAME:$IMAGE_TAG already exists — skipping build"
+                                        touch /tmp/skip_build
+                                    else
+                                        echo "Image not found — proceeding with build"
+                                    fi
+                                - |
+                                    echo "== Seeding model artefacts to s3://$MODEL_BUCKET/$MODEL_PREFIX =="
+                                    seed_model() {
+                                        local cf_path=$1
+                                        local s3_key=$2
+                                        local dest="s3://$MODEL_BUCKET/$s3_key"
+                                        if aws s3api head-object --bucket "$MODEL_BUCKET" --key "$s3_key" 2>/dev/null; then
+                                            echo "SKIP: $dest already exists"
+                                        else
+                                            echo "DOWNLOAD: $CF_BASE_URL/$cf_path"
+                                            curl -fsSL "$CF_BASE_URL/$cf_path" -o /tmp/model.tar.gz
+                                            echo "UPLOAD: $dest"
+                                            aws s3 cp /tmp/model.tar.gz "$dest"
+                                            rm -f /tmp/model.tar.gz
+                                            echo "DONE: $dest"
+                                        fi
+                                    }
+                                    seed_model "opensource_models/cosyvoice3/llm/model.tar.gz"              "$MODEL_PREFIX/cosyvoice3/llm/model.tar.gz"
+                                    seed_model "opensource_models/cosyvoice3/flow_hift/model.tar.gz"        "$MODEL_PREFIX/cosyvoice3/flow_hift/model.tar.gz"
+                                    seed_model "opensource_models/cosyvoice3/speech_tokenizer/model.tar.gz" "$MODEL_PREFIX/cosyvoice3/speech_tokenizer/model.tar.gz"
+                                    seed_model "opensource_models/cosyvoice3/campplus/model.tar.gz"         "$MODEL_PREFIX/cosyvoice3/campplus/model.tar.gz"
+                                    seed_model "opensource_models/whisper/base/model.tar.gz"                "$MODEL_PREFIX/faster-whisper-base/model.tar.gz"
+                                - |
+                                    echo "== Seeding default voice catalog to s3://$MODEL_BUCKET and $VOICE_TABLE_NAME =="
+                                    echo "DOWNLOAD: $CF_BASE_URL/opensource_models/voice_catalog/voice_catalog.tar.gz"
+                                    curl -fsSL "$CF_BASE_URL/opensource_models/voice_catalog/voice_catalog.tar.gz" -o /tmp/voice_catalog.tar.gz
+                                    mkdir -p /tmp/voice_catalog && tar -xzf /tmp/voice_catalog.tar.gz -C /tmp/voice_catalog
+                                    echo "== Copying conditioning/preview blobs to $MODEL_BUCKET (unconditional overwrite — small, idempotent data) =="
+                                    # Bundle layout is {catalog}/{voice_id}/{conditioning.npz,preview.wav}
+                                    # (see package_catalog.sh), flattened directly under
+                                    # _model_artefacts/voice_catalog/ — a single recursive copy
+                                    # lands every blob at the exact key the manifest's own
+                                    # s3_conditioning_key/s3_preview_key already reference
+                                    # (rewritten at export time to this destination, not the
+                                    # export's own source bucket layout).
+                                    aws s3 cp /tmp/voice_catalog/ "s3://$MODEL_BUCKET/_model_artefacts/voice_catalog/" --recursive --no-progress
+                                    echo "== Batch-writing voice records into $VOICE_TABLE_NAME =="
+                                    # Each {catalog}/manifest.json is already DynamoDB's Item
+                                    # wire format (from the export's `aws dynamodb scan` output)
+                                    # — BatchWriteItem accepts it directly, no reshaping. 25
+                                    # items/call is BatchWriteItem's own hard limit; pure
+                                    # bash+jq (no embedded Python — a leading-whitespace-
+                                    # preserving YAML block scalar is not a safe place for
+                                    # indentation-sensitive Python).
+                                    for manifest in /tmp/voice_catalog/*/manifest.json; do
+                                        CATALOG_N=$(jq 'length' "$manifest")
+                                        ci=0
+                                        while [ "$ci" -lt "$CATALOG_N" ]; do
+                                            jq -c --argjson i "$ci" --argjson chunk 25 --arg table "$VOICE_TABLE_NAME" \
+                                                '{($table): [.[$i:($i+$chunk)][] | {PutRequest: {Item: .}}]}' \
+                                                "$manifest" > /tmp/batch.json
+                                            aws dynamodb batch-write-item --request-items file:///tmp/batch.json
+                                            ci=$((ci + 25))
+                                            echo "wrote $(( ci < CATALOG_N ? ci : CATALOG_N ))/$CATALOG_N voice records from $manifest"
+                                        done
+                                    done
+                                    rm -rf /tmp/voice_catalog /tmp/voice_catalog.tar.gz /tmp/batch.json
+                        build:
+                            commands:
+                                - |
+                                    if [ -f /tmp/skip_build ]; then
+                                        echo "== Skipping docker build — image already exists =="
+                                    else
+                                        echo "== Building $IMAGE_REPO_NAME:$IMAGE_TAG [$(date)] =="
+                                        docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+                                        docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                                        echo "== Pushing $IMAGE_REPO_NAME:$IMAGE_TAG [$(date)] =="
+                                        docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                                        echo "== Push complete [$(date)] =="
+                                    fi
+                        post_build:
+                            commands:
+                                - |
+                                    echo "=== post_build CODEBUILD_BUILD_SUCCEEDING=$CODEBUILD_BUILD_SUCCEEDING ==="
+                                    if [ -n "$CFN_ResponseURL" ]; then
+                                        if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then
+                                            echo "== Sending SUCCESS to CloudFormation =="
+                                            curl -s -X PUT -H "Content-Type:" \
+                                                --data-binary "{\"Status\":\"SUCCESS\",\"Reason\":\"Docker image ready and models seeded\",\"PhysicalResourceId\":\"$CFN_PhysicalResourceId\",\"StackId\":\"$CFN_StackId\",\"RequestId\":\"$CFN_RequestId\",\"LogicalResourceId\":\"$CFN_LogicalResourceId\",\"Data\":{\"ImageUri\":\"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG\"}}" \
+                                                "$CFN_ResponseURL"
+                                        else
+                                            echo "== Sending FAILED to CloudFormation =="
+                                            curl -s -X PUT -H "Content-Type:" \
+                                                --data-binary "{\"Status\":\"FAILED\",\"Reason\":\"Build or model seeding failed — see CodeBuild logs\",\"PhysicalResourceId\":\"$CFN_PhysicalResourceId\",\"StackId\":\"$CFN_StackId\",\"RequestId\":\"$CFN_RequestId\",\"LogicalResourceId\":\"$CFN_LogicalResourceId\",\"Data\":{}}" \
+                                                "$CFN_ResponseURL"
+                                        fi
+                                    fi
+            Environment:
+                Type: !FindInMap [CodeBuild, Project, Type]
+                ComputeType: !FindInMap [CodeBuild, Project, ComputeType]
+                Image: !FindInMap [CodeBuild, Project, Image]
+                PrivilegedMode: true
+                EnvironmentVariables:
+                    - Name: AWS_REGION
+                      Value: !Ref AWS::Region
+                    - Name: AWS_ACCOUNT_ID
+                      Value: !Ref AWS::AccountId
+                    - Name: IMAGE_REPO_NAME
+                      Value: !FindInMap [ECR, Repository, Name]
+                    - Name: IMAGE_TAG
+                      Value: !FindInMap [ECR, Repository, ImageTag]
+                    - Name: MODEL_BUCKET
+                      Value: !Ref ProxyBucket
+                    - Name: MODEL_PREFIX
+                      Value: !FindInMap [Models, S3, Prefix]
+                    - Name: CF_BASE_URL
+                      Value: !FindInMap [Models, CloudFront, BaseUrl]
+                    - Name: VOICE_TABLE_NAME
+                      Value: !Ref VoiceTable
+            Artifacts:
+                Type: NO_ARTIFACTS
+            EncryptionKey: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3
+            TimeoutInMinutes: 90
+            QueuedTimeoutInMinutes: 60
+            LogsConfig:
+                CloudWatchLogs:
+                    GroupName: /aws/codebuild
+                    StreamName: !Sub
+                        - ${ResourcePrefix}-${repositoryName}
+                        - repositoryName: !FindInMap [ECR, Repository, Name]
+                    Status: ENABLED
+
+    # =========================================================================
+    # StartBuild custom resource — kicks CodeBuild at stack create and waits
+    # for the CFN callback from the buildspec's post_build phase.
+    # =========================================================================
+    StartBuildLambdaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}StartBuildPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # Scoped to the declared group, and deliberately NOT
+                          # AWSLambdaBasicExecutionRole: that managed policy
+                          # grants logs:CreateLogGroup on every group, which
+                          # lets a function that cannot reach its declared
+                          # group silently create an unmanaged one instead of
+                          # failing visibly.
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt StartBuildLambdaLogGroup.Arn
+                          - Effect: Allow
+                            Action:
+                                - codebuild:StartBuild
+                                - codebuild:BatchGetBuilds
+                            Resource: !GetAtt CodeBuildProject.Arn
+
+    # UNNAMED, matching the six siblings. CFN generates the physical name, so
+    # /aws/lambda/{FunctionName} is unknowable at author time and LoggingConfig
+    # below is the only way an unnamed function reaches a declared, stack-owned
+    # group. Dropping the old FunctionName REPLACES the function, which is what
+    # frees the canonical /aws/lambda/${ResourcePrefix}-tts-start-build name
+    # that the group keeps using.
+    StartBuildLambda:
+        Type: AWS::Lambda::Function
+        DependsOn: StartBuildLambdaLogGroup
+        Properties:
+            Description: Custom resource — starts the CodeBuild project, passes CFN callback env
+            Runtime: python3.12
+            Handler: index.lambda_handler
+            Timeout: 300
+            MemorySize: 128
+            Role: !GetAtt StartBuildLambdaRole.Arn
+            LoggingConfig:
+                LogGroup: !Ref StartBuildLambdaLogGroup
+            Code:
+                ZipFile: |
+                    import json
+                    import urllib.request
+                    import boto3
+
+                    def send_cfn(event, status, reason="", data=None):
+                        body = json.dumps({
+                            "Status": status, "Reason": reason,
+                            "PhysicalResourceId": event.get("PhysicalResourceId",
+                                                            event["LogicalResourceId"]),
+                            "StackId": event["StackId"],
+                            "RequestId": event["RequestId"],
+                            "LogicalResourceId": event["LogicalResourceId"],
+                            "Data": data or {},
+                        }).encode()
+                        req = urllib.request.Request(event["ResponseURL"], data=body,
+                                                     method="PUT",
+                                                     headers={"Content-Type": ""})
+                        urllib.request.urlopen(req)
+
+                    def lambda_handler(event, context):
+                        print('Event keys:', sorted(event))
+                        if event["RequestType"] == "Delete":
+                            send_cfn(event, "SUCCESS", "delete no-op")
+                            return
+                        try:
+                            cb = boto3.client("codebuild")
+                            cb.start_build(
+                                projectName=event["ResourceProperties"]["ProjectName"],
+                                environmentVariablesOverride=[
+                                    {"name": "CFN_ResponseURL", "value": event["ResponseURL"]},
+                                    {"name": "CFN_StackId", "value": event["StackId"]},
+                                    {"name": "CFN_RequestId", "value": event["RequestId"]},
+                                    {"name": "CFN_LogicalResourceId",
+                                     "value": event["LogicalResourceId"]},
+                                    {"name": "CFN_PhysicalResourceId",
+                                     "value": event.get("PhysicalResourceId",
+                                                        event["LogicalResourceId"])},
+                                ])
+                            # buildspec post_build sends the final CFN response
+                        except Exception as exc:
+                            send_cfn(event, "FAILED", str(exc))
+
+    # Renamed from StartBuildLogGroup to match the siblings. A logical-id
+    # rename that KEEPS an explicit LogGroupName cannot be applied in one
+    # update: CFN replaces create-before-delete, so the new id tries to create
+    # a name the old id still owns and the stack fails at PRE-FLIGHT —
+    # "Validation failed with 1 error(s)" with no per-resource event naming the
+    # culprit, then UPDATE_ROLLBACK_COMPLETE. Measured live 2026-08-05 on a
+    # throwaway stack with two log groups differing only in logical id.
+    #
+    # The live eu-west-1 tts stack holds 1913 bytes in this group, so migrating
+    # it is a TWO-STEP deploy (drop the resource, then re-add it under the new
+    # id) and the logs do not survive. See README.md §12 item 12.
+    StartBuildLambdaLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub /aws/lambda/${ResourcePrefix}-tts-start-build
+            RetentionInDays: 30
+
+    # Type matches the six siblings (Custom::StartBuildDelayResponse) — the
+    # CodeBuild buildspec's post_build phase, not this Lambda, sends the final
+    # CFN response, which is what the name records. The logical id stays
+    # BuildAndSeedModels rather than the siblings' StartBuild: this stack's
+    # build ALSO seeds six model archives to S3 (see the CodeBuild project),
+    # so the id is load-bearing documentation and the deploy-time model
+    # seeding is deliberately out of scope for the naming sweep.
+    BuildAndSeedModels:
+        Type: Custom::StartBuildDelayResponse
+        # ProxyBucketValidator: the bucket must exist before CodeBuild seeds
+        # models into it. StartBuildLambdaLogGroup: see the note there.
+        DependsOn:
+            - ProxyBucketValidator
+            - StartBuildLambdaLogGroup
+        Properties:
+            ServiceToken: !GetAtt StartBuildLambda.Arn
+            ProjectName: !Ref CodeBuildProject
+            Version: "%%VERSION%%"
+
+    # =========================================================================
+    # Log groups — one per Lambda tier + gateway, all seven tiers including the
+    # three no state routes to yet. The two custom-resource functions declare
+    # theirs next to the function itself, because they also need a DependsOn to
+    # beat Lambda's auto-creation. Every AWS::Lambda::Function in this template
+    # must have a group here or there; enforced by
+    # test_units.py::TestEveryLambdaHasADeclaredLogGroup.
+    # =========================================================================
+    TtsLambdaHalfCoreLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, HalfCore, Name]
+            RetentionInDays: 30
+
+    TtsLambda1CoreLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, OneCore, Name]
+            RetentionInDays: 30
+
+    TtsLambda2CoresLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, TwoCores, Name]
+            RetentionInDays: 30
+
+    TtsLambda3CoresLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, ThreeCores, Name]
+            RetentionInDays: 30
+
+    TtsLambda4CoresLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, FourCores, Name]
+            RetentionInDays: 30
+
+    TtsLambda5CoresLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, FiveCores, Name]
+            RetentionInDays: 30
+
+    TtsLambda6CoresLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, SixCores, Name]
+            RetentionInDays: 30
+
+    GatewayToolLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-tts-${fn}
+                - fn: !FindInMap [Lambda, GatewayTool, Name]
+            RetentionInDays: 30
+
+    # =========================================================================
+    # Workflow Lambda execution role — shared by all three tiers
+    # =========================================================================
+    TtsLambdaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+            Policies:
+                - PolicyName: TtsWorkflowAccess
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - s3:GetObject
+                                - s3:PutObject
+                                - s3:DeleteObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/*
+                          - Effect: Allow
+                            Action:
+                                - s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:GetItem
+                                - dynamodb:PutItem
+                                - dynamodb:DeleteItem
+                                - dynamodb:Query
+                            Resource:
+                                - !GetAtt VoiceTable.Arn
+                                - !Sub ${VoiceTable.Arn}/index/catalog-index
+                          - Effect: Allow
+                            Action:
+                                - states:GetExecutionHistory
+                            Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${ResourcePrefix}-*:*
+                          - Effect: Allow
+                            Action:
+                                - lambda:GetFunctionConfiguration
+                            Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ResourcePrefix}-*
+
+    # =========================================================================
+    # Workflow Lambda functions — one container image, seven memory tiers.
+    # All seven are declared so a state can be re-pointed at another tier
+    # without a template change; only four are routed to today. EphemeralStorage
+    # follows the routed tiers: 4096 MB at half/1-core, 6144 MB from 2-cores up
+    # (the model artefacts land on /tmp).
+    # =========================================================================
+    TtsLambdaHalfCore:
+        Type: AWS::Lambda::Function
+        DependsOn: BuildAndSeedModels
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, HalfCore, Name]
+            Description: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            Architectures: [arm64]
+            MemorySize: !FindInMap [Lambda, HalfCore, Memory]
+            Timeout: 900
+            EphemeralStorage:
+                Size: 4096
+            Role: !GetAtt TtsLambdaRole.Arn
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    MODEL_BUCKET: !Ref ProxyBucket
+                    VOICE_TABLE_NAME: !Ref VoiceTable
+
+    TtsLambda1Core:
+        Type: AWS::Lambda::Function
+        DependsOn: BuildAndSeedModels
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, OneCore, Name]
+            Description: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            Architectures: [arm64]
+            MemorySize: !FindInMap [Lambda, OneCore, Memory]
+            Timeout: 900
+            EphemeralStorage:
+                Size: 4096
+            Role: !GetAtt TtsLambdaRole.Arn
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    MODEL_BUCKET: !Ref ProxyBucket
+                    VOICE_TABLE_NAME: !Ref VoiceTable
+
+    TtsLambda2Cores:
+        Type: AWS::Lambda::Function
+        DependsOn: BuildAndSeedModels
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, TwoCores, Name]
+            Description: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            Architectures: [arm64]
+            MemorySize: !FindInMap [Lambda, TwoCores, Memory]
+            Timeout: 900
+            EphemeralStorage:
+                Size: 6144
+            Role: !GetAtt TtsLambdaRole.Arn
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    MODEL_BUCKET: !Ref ProxyBucket
+                    VOICE_TABLE_NAME: !Ref VoiceTable
+
+    TtsLambda3Cores:
+        Type: AWS::Lambda::Function
+        DependsOn: BuildAndSeedModels
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, ThreeCores, Name]
+            Description: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            Architectures: [arm64]
+            MemorySize: !FindInMap [Lambda, ThreeCores, Memory]
+            Timeout: 900
+            EphemeralStorage:
+                Size: 6144
+            Role: !GetAtt TtsLambdaRole.Arn
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    MODEL_BUCKET: !Ref ProxyBucket
+                    VOICE_TABLE_NAME: !Ref VoiceTable
+
+    TtsLambda4Cores:
+        Type: AWS::Lambda::Function
+        DependsOn: BuildAndSeedModels
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, FourCores, Name]
+            Description: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            Architectures: [arm64]
+            MemorySize: !FindInMap [Lambda, FourCores, Memory]
+            Timeout: 900
+            EphemeralStorage:
+                Size: 6144
+            Role: !GetAtt TtsLambdaRole.Arn
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    MODEL_BUCKET: !Ref ProxyBucket
+                    VOICE_TABLE_NAME: !Ref VoiceTable
+
+    TtsLambda5Cores:
+        Type: AWS::Lambda::Function
+        DependsOn: BuildAndSeedModels
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, FiveCores, Name]
+            Description: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            Architectures: [arm64]
+            MemorySize: !FindInMap [Lambda, FiveCores, Memory]
+            Timeout: 900
+            EphemeralStorage:
+                Size: 6144
+            Role: !GetAtt TtsLambdaRole.Arn
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    MODEL_BUCKET: !Ref ProxyBucket
+                    VOICE_TABLE_NAME: !Ref VoiceTable
+
+    TtsLambda6Cores:
+        Type: AWS::Lambda::Function
+        DependsOn: BuildAndSeedModels
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, SixCores, Name]
+            Description: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            Architectures: [arm64]
+            MemorySize: !FindInMap [Lambda, SixCores, Memory]
+            Timeout: 900
+            EphemeralStorage:
+                Size: 6144
+            Role: !GetAtt TtsLambdaRole.Arn
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    MODEL_BUCKET: !Ref ProxyBucket
+                    VOICE_TABLE_NAME: !Ref VoiceTable
+
+    # =========================================================================
+    # Step Functions — synthesis pipeline + register-voice pipeline
+    # =========================================================================
+    StateMachineLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub /aws/states/${ResourcePrefix}-tts
+            RetentionInDays: 30
+
+    StateMachineRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: states.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: InvokeWorkflowLambdas
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource:
+                                - !GetAtt TtsLambdaHalfCore.Arn
+                                - !GetAtt TtsLambda1Core.Arn
+                                - !GetAtt TtsLambda2Cores.Arn
+                                - !GetAtt TtsLambda3Cores.Arn
+                                - !GetAtt TtsLambda4Cores.Arn
+                                - !GetAtt TtsLambda5Cores.Arn
+                                - !GetAtt TtsLambda6Cores.Arn
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogDelivery
+                                - logs:GetLogDelivery
+                                - logs:UpdateLogDelivery
+                                - logs:DeleteLogDelivery
+                                - logs:ListLogDeliveries
+                                - logs:PutResourcePolicy
+                                - logs:DescribeResourcePolicies
+                                - logs:DescribeLogGroups
+                            Resource: "*"
+
+    SynthesisStateMachine:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            StateMachineName: !Sub ${ResourcePrefix}-tts-synthesis
+            RoleArn: !GetAtt StateMachineRole.Arn
+            LoggingConfiguration:
+                Level: ERROR
+                IncludeExecutionData: true
+                Destinations:
+                    - CloudWatchLogsLogGroup:
+                          LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+            DefinitionString:
+                !Sub |-
+                    {
+                        "Comment": "CosyVoice3 TTS synthesis - batch text-to-speech with voice cloning, per-clip ASR QC.",
+                        "StartAt": "Check and preprocess",
+                        "States": {
+                            "Check and preprocess": {
+                                "Type": "Task",
+                                "Resource": "arn:aws:states:::lambda:invoke",
+                                "OutputPath": "$.Payload",
+                                "Parameters": {
+                                    "FunctionName": "${TtsLambda1Core.Arn}",
+                                    "Payload": {
+                                        "operation": "StateCheckAndPreprocess",
+                                        "uuid.$": "$.uuid",
+                                        "input.$": "$.input",
+                                        "data.$": "$.data"
+                                    }
+                                },
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [
+                                            "Lambda.ServiceException",
+                                            "Lambda.AWSLambdaException",
+                                            "Lambda.SdkClientException",
+                                            "Lambda.TooManyRequestsException"
+                                        ],
+                                        "IntervalSeconds": 1,
+                                        "MaxAttempts": 2,
+                                        "BackoffRate": 1.2
+                                    }
+                                ],
+                                "Next": "Map batch synthesis"
+                            },
+                            "Map batch synthesis": {
+                                "Comment": "MaxConcurrency MUST equal MAP_MAX_CONCURRENCY in states/check_and_preprocess — that state splits the caller's transcripts into at most this many iterators, balanced by estimated work, so a lower value here queues the surplus into a second serial wave that pays every cold model load again while a higher one leaves slots idle. It can exceed this only when one invocation could not hold an iterator's Flow+HiFT work, where an extra iterator (parallel) beats an extra checkpoint resume (serial). Raised 10 -> 40 on 2026-08-10, after execution 630f729f ran 73 transcripts for 52 min at concurrency 1 because one caller batch was one iterator.",
+                                "Type": "Map",
+                                "MaxConcurrency": 40,
+                                "ItemsPath": "$.data.iterators",
+                                "ItemSelector": {
+                                    "operation": "StateSynthesizeLLM",
+                                    "item_id.$": "$$.Map.Item.Index",
+                                    "item_data.$": "$$.Map.Item.Value"
+                                },
+                                "ItemProcessor": {
+                                    "ProcessorConfig": {
+                                        "Mode": "INLINE"
+                                    },
+                                    "StartAt": "Synthesize LLM",
+                                    "States": {
+                                        "Synthesize LLM": {
+                                            "Type": "Task",
+                                            "Resource": "arn:aws:states:::lambda:invoke",
+                                            "OutputPath": "$.Payload",
+                                            "Parameters": {
+                                                "FunctionName": "${TtsLambda2Cores.Arn}",
+                                                "Payload.$": "$"
+                                            },
+                                            "Retry": [
+                                                {
+                                                    "ErrorEquals": [
+                                                        "LambdaResourceTimeoutException"
+                                                    ],
+                                                    "IntervalSeconds": 2,
+                                                    "MaxAttempts": 10,
+                                                    "BackoffRate": 1
+                                                },
+                                                {
+                                                    "ErrorEquals": [
+                                                        "Lambda.ClientExecutionTimeoutException",
+                                                        "Lambda.ServiceException",
+                                                        "Lambda.AWSLambdaException",
+                                                        "Lambda.SdkClientException"
+                                                    ],
+                                                    "IntervalSeconds": 6,
+                                                    "MaxAttempts": 4,
+                                                    "BackoffRate": 2
+                                                },
+                                                {
+                                                    "ErrorEquals": [
+                                                        "Lambda.TooManyRequestsException"
+                                                    ],
+                                                    "IntervalSeconds": 1,
+                                                    "MaxAttempts": 6,
+                                                    "BackoffRate": 1.5
+                                                },
+                                                {
+                                                    "ErrorEquals": [
+                                                        "Sandbox.Timedout",
+                                                        "Lambda.Unknown"
+                                                    ],
+                                                    "MaxAttempts": 0
+                                                }
+                                            ],
+                                            "Next": "Synthesize Flow HiFT"
+                                        },
+                                        "Synthesize Flow HiFT": {
+                                            "Type": "Task",
+                                            "Resource": "arn:aws:states:::lambda:invoke",
+                                            "OutputPath": "$.Payload",
+                                            "Parameters": {
+                                                "FunctionName": "${TtsLambda4Cores.Arn}",
+                                                "Payload": {
+                                                    "operation": "StateSynthesizeFlowHift",
+                                                    "item_id.$": "$.item_id",
+                                                    "item_data.$": "$.item_data"
+                                                }
+                                            },
+                                            "Retry": [
+                                                {
+                                                    "ErrorEquals": [
+                                                        "LambdaResourceTimeoutException"
+                                                    ],
+                                                    "IntervalSeconds": 2,
+                                                    "MaxAttempts": 10,
+                                                    "BackoffRate": 1
+                                                },
+                                                {
+                                                    "ErrorEquals": [
+                                                        "Lambda.ClientExecutionTimeoutException",
+                                                        "Lambda.ServiceException",
+                                                        "Lambda.AWSLambdaException",
+                                                        "Lambda.SdkClientException"
+                                                    ],
+                                                    "IntervalSeconds": 6,
+                                                    "MaxAttempts": 4,
+                                                    "BackoffRate": 2
+                                                },
+                                                {
+                                                    "ErrorEquals": [
+                                                        "Lambda.TooManyRequestsException"
+                                                    ],
+                                                    "IntervalSeconds": 1,
+                                                    "MaxAttempts": 6,
+                                                    "BackoffRate": 1.5
+                                                },
+                                                {
+                                                    "ErrorEquals": [
+                                                        "Sandbox.Timedout",
+                                                        "Lambda.Unknown"
+                                                    ],
+                                                    "MaxAttempts": 0
+                                                }
+                                            ],
+                                            "Next": "Verify output"
+                                        },
+                                        "Verify output": {
+                                            "Type": "Task",
+                                            "Resource": "arn:aws:states:::lambda:invoke",
+                                            "OutputPath": "$.Payload",
+                                            "Parameters": {
+                                                "FunctionName": "${TtsLambda1Core.Arn}",
+                                                "Payload": {
+                                                    "operation": "StateVerifyOutput",
+                                                    "item_id.$": "$.item_id",
+                                                    "item_data.$": "$.item_data"
+                                                }
+                                            },
+                                            "Retry": [
+                                                {
+                                                    "ErrorEquals": [
+                                                        "LambdaResourceTimeoutException"
+                                                    ],
+                                                    "IntervalSeconds": 2,
+                                                    "MaxAttempts": 10,
+                                                    "BackoffRate": 1
+                                                },
+                                                {
+                                                    "ErrorEquals": [
+                                                        "Lambda.ServiceException",
+                                                        "Lambda.AWSLambdaException",
+                                                        "Lambda.SdkClientException",
+                                                        "Lambda.TooManyRequestsException"
+                                                    ],
+                                                    "IntervalSeconds": 2,
+                                                    "MaxAttempts": 3,
+                                                    "BackoffRate": 1.5
+                                                }
+                                            ],
+                                            "End": true
+                                        }
+                                    }
+                                },
+                                "ResultPath": "$.data.iterators",
+                                "Next": "Usage tracking"
+                            },
+                            "Usage tracking": {
+                                "Type": "Task",
+                                "Resource": "arn:aws:states:::lambda:invoke",
+                                "OutputPath": "$.Payload",
+                                "Parameters": {
+                                    "FunctionName": "${TtsLambdaHalfCore.Arn}",
+                                    "Payload": {
+                                        "operation": "StateUsageTracking",
+                                        "execution_arn.$": "$$.Execution.Id",
+                                        "uuid.$": "$.uuid",
+                                        "input.$": "$.input",
+                                        "data.$": "$.data"
+                                    }
+                                },
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [
+                                            "Lambda.ServiceException",
+                                            "Lambda.AWSLambdaException",
+                                            "Lambda.SdkClientException",
+                                            "Lambda.TooManyRequestsException"
+                                        ],
+                                        "IntervalSeconds": 1,
+                                        "MaxAttempts": 2,
+                                        "BackoffRate": 1.2
+                                    }
+                                ],
+                                "End": true
+                            }
+                        }
+                    }
+
+    RegisterVoiceStateMachine:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            StateMachineName: !Sub ${ResourcePrefix}-tts-register-voice
+            RoleArn: !GetAtt StateMachineRole.Arn
+            LoggingConfiguration:
+                Level: ERROR
+                IncludeExecutionData: true
+                Destinations:
+                    - CloudWatchLogsLogGroup:
+                          LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+            DefinitionString:
+                !Sub |-
+                    {
+                        "Comment": "CosyVoice3 voice registration — validate reference (format + ASR transcript match), extract conditioning in parallel, write registry record.",
+                        "StartAt": "Validate reference",
+                        "States": {
+                            "Validate reference": {
+                                "Type": "Task",
+                                "Resource": "arn:aws:states:::lambda:invoke",
+                                "OutputPath": "$.Payload",
+                                "Parameters": {
+                                    "FunctionName": "${TtsLambda1Core.Arn}",
+                                    "Payload": {
+                                        "operation": "StateValidateReference",
+                                        "uuid.$": "$.uuid",
+                                        "input.$": "$.input",
+                                        "data.$": "$.data"
+                                    }
+                                },
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [
+                                            "Lambda.ServiceException",
+                                            "Lambda.AWSLambdaException",
+                                            "Lambda.SdkClientException",
+                                            "Lambda.TooManyRequestsException"
+                                        ],
+                                        "IntervalSeconds": 1,
+                                        "MaxAttempts": 2,
+                                        "BackoffRate": 1.2
+                                    }
+                                ],
+                                "Next": "Extract conditioning"
+                            },
+                            "Extract conditioning": {
+                                "Type": "Parallel",
+                                "ResultPath": "$.branches",
+                                "Branches": [
+                                    {
+                                        "StartAt": "Extract speech tokens",
+                                        "States": {
+                                            "Extract speech tokens": {
+                                                "Type": "Task",
+                                                "Resource": "arn:aws:states:::lambda:invoke",
+                                                "OutputPath": "$.Payload",
+                                                "Parameters": {
+                                                    "FunctionName": "${TtsLambda2Cores.Arn}",
+                                                    "Payload": {
+                                                        "operation": "StateExtractSpeechToken",
+                                                        "uuid.$": "$.uuid",
+                                                        "input.$": "$.input"
+                                                    }
+                                                },
+                                                "Retry": [
+                                                    {
+                                                        "ErrorEquals": [
+                                                            "Lambda.ClientExecutionTimeoutException",
+                                                            "Lambda.ServiceException",
+                                                            "Lambda.AWSLambdaException",
+                                                            "Lambda.SdkClientException",
+                                                            "Lambda.TooManyRequestsException"
+                                                        ],
+                                                        "IntervalSeconds": 3,
+                                                        "MaxAttempts": 3,
+                                                        "BackoffRate": 2
+                                                    }
+                                                ],
+                                                "End": true
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "StartAt": "Extract speaker embedding",
+                                        "States": {
+                                            "Extract speaker embedding": {
+                                                "Type": "Task",
+                                                "Resource": "arn:aws:states:::lambda:invoke",
+                                                "OutputPath": "$.Payload",
+                                                "Parameters": {
+                                                    "FunctionName": "${TtsLambdaHalfCore.Arn}",
+                                                    "Payload": {
+                                                        "operation": "StateExtractSpeakerEmbedding",
+                                                        "uuid.$": "$.uuid",
+                                                        "input.$": "$.input"
+                                                    }
+                                                },
+                                                "Retry": [
+                                                    {
+                                                        "ErrorEquals": [
+                                                            "Lambda.ServiceException",
+                                                            "Lambda.AWSLambdaException",
+                                                            "Lambda.SdkClientException",
+                                                            "Lambda.TooManyRequestsException"
+                                                        ],
+                                                        "IntervalSeconds": 2,
+                                                        "MaxAttempts": 3,
+                                                        "BackoffRate": 1.5
+                                                    }
+                                                ],
+                                                "End": true
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "StartAt": "Extract speech features",
+                                        "States": {
+                                            "Extract speech features": {
+                                                "Type": "Task",
+                                                "Resource": "arn:aws:states:::lambda:invoke",
+                                                "OutputPath": "$.Payload",
+                                                "Parameters": {
+                                                    "FunctionName": "${TtsLambdaHalfCore.Arn}",
+                                                    "Payload": {
+                                                        "operation": "StateExtractSpeechFeat",
+                                                        "uuid.$": "$.uuid",
+                                                        "input.$": "$.input"
+                                                    }
+                                                },
+                                                "Retry": [
+                                                    {
+                                                        "ErrorEquals": [
+                                                            "Lambda.ServiceException",
+                                                            "Lambda.AWSLambdaException",
+                                                            "Lambda.SdkClientException",
+                                                            "Lambda.TooManyRequestsException"
+                                                        ],
+                                                        "IntervalSeconds": 2,
+                                                        "MaxAttempts": 3,
+                                                        "BackoffRate": 1.5
+                                                    }
+                                                ],
+                                                "End": true
+                                            }
+                                        }
+                                    }
+                                ],
+                                "Next": "Write voice record"
+                            },
+                            "Write voice record": {
+                                "Type": "Task",
+                                "Resource": "arn:aws:states:::lambda:invoke",
+                                "OutputPath": "$.Payload",
+                                "Parameters": {
+                                    "FunctionName": "${TtsLambdaHalfCore.Arn}",
+                                    "Payload": {
+                                        "operation": "StateWriteVoiceRecord",
+                                        "uuid.$": "$.uuid",
+                                        "input.$": "$.input",
+                                        "data.$": "$.data",
+                                        "branches.$": "$.branches"
+                                    }
+                                },
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [
+                                            "Lambda.ServiceException",
+                                            "Lambda.AWSLambdaException",
+                                            "Lambda.SdkClientException",
+                                            "Lambda.TooManyRequestsException"
+                                        ],
+                                        "IntervalSeconds": 1,
+                                        "MaxAttempts": 2,
+                                        "BackoffRate": 1.2
+                                    }
+                                ],
+                                "End": true
+                            }
+                        }
+                    }
+
+    # =========================================================================
+    # AgentCore Gateway tool Lambda (zip-packaged, no Docker) — thin
+    # dispatcher: synthesize_speech, register_voice, get_job_status,
+    # list_voice_collection, get_voice, describe_tool
+    # =========================================================================
+    GatewayToolRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+            Policies:
+                - PolicyName: GatewayToolAccess
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - states:StartExecution
+                            Resource:
+                                - !Ref SynthesisStateMachine
+                                - !Ref RegisterVoiceStateMachine
+                          - Effect: Allow
+                            Action:
+                                - states:DescribeExecution
+                            Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${ResourcePrefix}-tts*:*
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:GetItem
+                                - dynamodb:Query
+                            Resource:
+                                - !GetAtt VoiceTable.Arn
+                                - !Sub ${VoiceTable.Arn}/index/catalog-index
+                          - Effect: Allow
+                            Action:
+                                - s3:GetObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/*
+                          # callback support (2026-08-31): register/clean
+                          # waiter tokens; complete a token synchronously
+                          # on an absorbed-terminal submit; persist
+                          # outputs.json on that same path
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:PutItem
+                                - dynamodb:DeleteItem
+                            Resource: !GetAtt CallbackTokensTable.Arn
+                          - Effect: Allow
+                            Action:
+                                - states:SendTaskSuccess
+                            # any machine in THIS account+region — the token's machine is the
+                            # caller's (ours or a customer's own), never known at deploy time
+                            Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*
+                          - Effect: Allow
+                            Action:
+                                - s3:PutObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/tts-on-aws/*
+
+    GatewayToolFunction:
+        Type: AWS::Lambda::Function
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-tts-${fn}
+                - fn: !FindInMap [Lambda, GatewayTool, Name]
+            Description: !FindInMap [Lambda, GatewayTool, Description]
+            Runtime: python3.12
+            Handler: lambda_function.lambda_handler
+            Timeout: !FindInMap [Lambda, GatewayTool, Timeout]
+            MemorySize: !FindInMap [Lambda, GatewayTool, Memory]
+            Role: !GetAtt GatewayToolRole.Arn
+            Code:
+                S3Bucket: !FindInMap [CodeBuild, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${package}
+                    - keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                      package: !FindInMap [CodeBuild, Source, GatewayToolPackage]
+            Environment:
+                Variables:
+                    SYNTHESIS_STATE_MACHINE_ARN: !Ref SynthesisStateMachine
+                    REGISTER_VOICE_STATE_MACHINE_ARN: !Ref RegisterVoiceStateMachine
+                    VOICE_TABLE_NAME: !Ref VoiceTable
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    CALLBACK_TABLE: !Ref CallbackTokensTable
+                    TOOL_VERSION: "%%VERSION%%"
+                    # Must equal the GatewayTarget Name in media-toolkit-gateway/cfnstack.yaml
+                    TARGET_NAME: "text-to-speech"
+
+    ################################################################################
+    # Lambda Resource-Based Policy
+    # Allows the AgentCore service principal to invoke the gateway tool Lambda.
+    # bedrock-agentcore.amazonaws.com is the service principal for AgentCore Gateway.
+    ################################################################################
+    GatewayToolPermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !GetAtt GatewayToolFunction.Arn
+            Action: lambda:InvokeFunction
+            Principal: bedrock-agentcore.amazonaws.com
+            SourceAccount: !Ref AWS::AccountId
+
+    ############################################################################
+    # Push completion (2026-08-31) — bedrock-inference's callback mechanism,
+    # ported for audio-description's synth/repair loops: a consumer submits
+    # synthesize_speech with callback_task_token and sleeps on ONE
+    # waitForTaskToken state; the waker completes every registered token at
+    # the SYNTHESIS machine's terminal event, persisting outputs.json at the
+    # run prefix FIRST (the callback is a signal; S3 is the data channel).
+    # Rows are written by the gateway (registered ONLY when a token is
+    # supplied — agent-submitted runs cost one Query miss) and TTL-collected.
+    ############################################################################
+    CallbackTokensTable:
+        Type: AWS::DynamoDB::Table
+        Metadata:
+            checkov:
+                skip:
+                    - id: CKV_AWS_119
+                      comment: >-
+                        sample posture: table holds rebuildable derived state; default SSE is deliberate (see README.md DeletionPolicy decision)
+                    - id: CKV_AWS_28
+                      comment: >-
+                        sample posture: table is rebuildable derived state designed to delete with the stack; PITR protects nothing irreplaceable here
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W74
+                      reason: Ephemeral task-token rows with a TTL on every item — no customer data, nothing worth a CMK's key-management cost
+                    - id: W78
+                      reason: Point-in-time recovery is pointless — a restored row's task token belongs to a wait state that has already timed out
+                    - id: W28
+                      reason: The explicit name is how the gateway and the waker agree on one table without a CFN import; the TTL is the recovery mechanism
+        Properties:
+            TableName: !Sub ${ResourcePrefix}-tts-callback-tokens
+            BillingMode: PAY_PER_REQUEST
+            AttributeDefinitions:
+                - { AttributeName: execution_arn, AttributeType: S }
+                - { AttributeName: token_hash, AttributeType: S }
+            KeySchema:
+                - { AttributeName: execution_arn, KeyType: HASH }
+                - { AttributeName: token_hash, KeyType: RANGE }
+            TimeToLiveSpecification:
+                AttributeName: ttl
+                Enabled: true
+
+    CallbackWakerLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub /aws/lambda/${ResourcePrefix}-tts-callback-waker
+            RetentionInDays: 30
+
+    CallbackWakerRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: CallbackWakerAccess
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # no AWSLambdaBasicExecutionRole (house rule): its
+                          # account-wide logs:CreateLogGroup lets a function
+                          # that can't reach its declared group silently make
+                          # an unmanaged one; logs are scoped to the declared
+                          # group's ARN instead.
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt CallbackWakerLogGroup.Arn
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:Query
+                                - dynamodb:DeleteItem
+                            Resource: !GetAtt CallbackTokensTable.Arn
+                          - Effect: Allow
+                            Action:
+                                - states:SendTaskSuccess
+                            # any machine in THIS account+region — the token's machine is the
+                            # caller's (ours or a customer's own), never known at deploy time
+                            Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*
+                          - Effect: Allow
+                            Action:
+                                - states:DescribeExecution
+                            Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${ResourcePrefix}-tts*:*
+                          - Effect: Allow
+                            Action:
+                                - s3:PutObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/tts-on-aws/*
+
+    CallbackWakerFunction:
+        Type: AWS::Lambda::Function
+        # DependsOn: event-driven, so an in-flight synthesis terminating
+        # mid-update could invoke it before its declared group exists —
+        # without the edge, Lambda auto-creates the group and the stack
+        # dies on the LogGroup create (the documented orphaned-group
+        # gotcha). The scoped-logs role above makes the auto-create
+        # impossible too; the edge makes the first invocation's logs land.
+        DependsOn: CallbackWakerLogGroup
+        Properties:
+            FunctionName: !Sub ${ResourcePrefix}-tts-callback-waker
+            Description: Completes waiting consumers' task tokens at the synthesis machine's terminal event; persists outputs.json first
+            Runtime: python3.12
+            Handler: callback_waker.lambda_handler
+            Timeout: 60
+            MemorySize: 256
+            Role: !GetAtt CallbackWakerRole.Arn
+            Code:
+                S3Bucket: !FindInMap [CodeBuild, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${package}
+                    - keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                      package: !FindInMap [CodeBuild, Source, GatewayToolPackage]
+            Environment:
+                Variables:
+                    CALLBACK_TABLE: !Ref CallbackTokensTable
+                    PROXY_BUCKET: !Ref ProxyBucket
+
+    CallbackTerminalRule:
+        Type: AWS::Events::Rule
+        Properties:
+            Name: !Sub ${ResourcePrefix}-tts-callback-terminal
+            Description: Complete registered consumer task tokens when a synthesis execution terminates
+            EventPattern:
+                source: [aws.states]
+                detail-type: ["Step Functions Execution Status Change"]
+                detail:
+                    status: [SUCCEEDED, FAILED, ABORTED, TIMED_OUT]
+                    stateMachineArn:
+                        - !Ref SynthesisStateMachine
+            State: ENABLED
+            Targets:
+                - Id: TtsCallbackWaker
+                  Arn: !GetAtt CallbackWakerFunction.Arn
+
+    CallbackTerminalRulePermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !GetAtt CallbackWakerFunction.Arn
+            Action: lambda:InvokeFunction
+            Principal: events.amazonaws.com
+            SourceArn: !GetAtt CallbackTerminalRule.Arn
+
+Outputs:
+    SynthesisStateMachineArn:
+        Value: !Ref SynthesisStateMachine
+    RegisterVoiceStateMachineArn:
+        Value: !Ref RegisterVoiceStateMachine
+    VoiceTableName:
+        Value: !Ref VoiceTable
+    GatewayToolLambdaArn:
+        Description: >
+            ARN of the AgentCore Gateway tool Lambda.
+            Pass this as TextToSpeechToolLambdaArn when deploying media-toolkit-gateway/cfnstack.yaml.
+        Value: !GetAtt GatewayToolFunction.Arn

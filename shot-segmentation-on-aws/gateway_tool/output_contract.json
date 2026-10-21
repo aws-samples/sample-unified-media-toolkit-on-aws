@@ -1,0 +1,161 @@
+{
+  "contract_version": 1,
+  "target": "shot-segmentation",
+  "stability": "Every entry in `outputs` is stable API: labels, basenames, and the field names/nesting shown in each example. Removing or renaming any of them is a breaking change and requires a TOOL_VERSION bump plus a changelog note here. Files NOT listed here (per-window intermediates under embeddings/, proxy/ segments, anything under ephemeral paths) are internal and may change or vanish without notice. `description` is one line by design — it is joined verbatim into each get_job_status outputs[] entry as `desc`.",
+  "outputs": {
+    "shot-list": {
+      "basename": "shots.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Global shot list (frame/time/timecode bounds per shot) — use for cut timings, timeline lanes, per-shot frame picks via frames_key; embeddings live in shot-centroids (row == shot_id)",
+      "example": {
+        "uuid": "<workflow_id>",
+        "n_shots": 412,
+        "actual_frame_count": 91750,
+        "actual_duration_sec": 3670.0,
+        "shot_boundary_threshold": 0.2,
+        "validation": { "passed": true },
+        "programme_tail": {
+          "separator_shot_id": 525,
+          "separator_start_time": 1803.0,
+          "separator_end_time": 1866.2,
+          "separator_black_sec": 63.2,
+          "tail_content_sec": 138.2,
+          "match_fraction": 0.96,
+          "match_duration_fraction": 0.96,
+          "match_monotone": 0.98,
+          "match_fraction_duration_corroborated": 0.96
+        },
+        "burst_runs": [
+          {"start_shot_id": 3, "end_shot_id": 37}
+        ],
+        "shots": [
+          {
+            "shot_id": 0,
+            "shot_type": "content",
+            "start_frame": 0,
+            "end_frame": 299,
+            "start_time": 0.0,
+            "end_time": 11.96,
+            "start_timecode": "09:59:43:14",
+            "end_timecode": "10:00:00:05",
+            "frame_count": 50,
+            "sync_pop": null,
+            "flash_frame": null,
+            "entropy_mean": 4.21,
+            "entropy_min": 3.1,
+            "entropy_max": 5.87,
+            "frame_coherence": 0.9412,
+            "frame_dispersion_max": 0.1837,
+            "frame_motion_mean": 0.0264,
+            "frame_motion_max": 0.1102,
+            "selected_frames": [0, 45, 120, 299],
+            "frames_key": "<prefix>/shot_frames/shot_0000_frames.tar.gz"
+          }
+        ]
+      },
+      "notes": "shot_type is `content` or `black`. sync_pop / flash_frame are a frame number or null. Times are seconds from asset start; timecodes carry the source start timecode (`;` separator = drop-frame). Each entry's frames_key points at a per-shot tar.gz of its selected JPEG frames at proxy resolution. The four frame_* fields describe how much the shot's OWN frames vary, which the centroid (a mean) discards: frame_coherence is ||mean of the unit frame embeddings|| in [0,1] (1.0 = every frame identical, and the mean frame-to-centroid cosine distance is exactly 1 - this); frame_dispersion_max is the furthest single frame from the centroid; frame_motion_* are cosine distances between ADJACENT frames — an embedding-space proxy for motion, not optical flow. All four are null where undefined: all of them for a shot with no embedded frames, the two motion fields for a single-frame shot. Null means unmeasurable, never `measured, and perfectly still`. programme_tail is EVIDENCE about material after the last long black RUN (a maximal run of consecutive black shots spanning >= 30 s, starting in the second half, with any content after — null when the programme runs to end of file; segmentation may split one physical black, so the run is the unit and separator_end_time / separator_black_sec publish its extent): match_fraction is the share of tail content shots whose nearest pre-separator shot sits within cosine 0.05; match_duration_fraction is the share of those matches whose durations agree within 1 s — a textless element is the SAME CUT as its source, so durations agree frame-exactly (measured median delta 0.00 s), while a same-set look-alike match will not; match_monotone is the share of matched sources advancing in order; match_fraction_duration_corroborated widens the distance band to 0.10 but demands the 1 s duration agreement — heavy burned graphics (a credit roll) push a clean copy past 0.05 where subtitles do not, and it measures 0.0 on every non-textless tail in the corpus. The duration and monotone stats are null with no / < 2 matches. Reading, measured on a 31-asset corpus with n=10 firing: matched (or corroborated) AND duration-agreeing AND ordered = a TEXTLESS block — clean copies appended for localisation, the programme effectively ends at separator_start_time and actual_duration_sec overstates the runtime by the tail; a PARTIAL textless block reads low match_fraction with duration-agreement ~1.0 (a serial's textless reel partially sourced from this episode); unmatched with duration-disagreement = a promo/recap or a further programme PART; a seconds-long tail_content_sec with match ~0 is a distributor end board. No verdict field on purpose: the numbers are the contract, so apply the reading yourself and check frames when the call matters. burst_runs lists contiguous intervals of very short shots (each < 1 s, runs of >= 6; shot TYPE ignored so a jingle's black micro-separators ride along) — empty when none. The boundaries inside a run are real cuts, correctly detected; the field exists so you can FOLD each run into one analysis (sample a few frames across the interval) instead of paying per member — measured on the development corpus: a 35 s jingle is 94.8% burst shots, ordinary content <= 8.5%. Character is derivable from the members' frame_* fields: a jingle's cards are internally frozen (coherence ~0.99, motion ~0.005), an action montage is not. Intervals are evidence, not a genre verdict."
+    },
+    "recurrence": {
+      "basename": "recurrence.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Recurring shot groups (idents, bumpers, stings) — use for act/ad-break candidates and de-duping repeats; shot_id joins shot-list",
+      "example": {
+        "uuid": "<workflow_id>",
+        "actual_duration_sec": 3670.0,
+        "max_recurrence_threshold": 0.07,
+        "min_recurrence_count": 3,
+        "min_occurrence_gap_sec": 60.0,
+        "max_recurrence_count": 8,
+        "total_groups": 4,
+        "total_recurring_shots": 14,
+        "gates": {
+          "content_shots": 812,
+          "excluded_non_content": 43,
+          "components": 37,
+          "min_members_dropped": 24,
+          "occurrence_gate_dropped": 4,
+          "groups": 4
+        },
+        "recurrence_groups": [
+          {
+            "group_id": 0,
+            "recurrence_count": 4,
+            "occurrence_count": 4,
+            "max_distance": 0.032,
+            "hash_confirmed": true,
+            "shots": [
+              {"shot_id": 4, "position": "act_boundary"}
+            ]
+          }
+        ]
+      },
+      "notes": "Member entries are {shot_id, position} ONLY — join with shot-list by shot_id for times, durations, timecodes, entropy and the frame_* dispersion fields; the two files are a pair. NOTHING IS SILENTLY DROPPED: the only deleting gates are content-only, minimum members, and temporal separation, all attributed in `gates` (counts are GROUPS except content_shots/excluded_non_content, which are shots), and `gates.groups == total_groups` is an invariant. recurrence_count is raw members; occurrence_count is how many are temporally separated (>= min_occurrence_gap_sec end-to-start) and is what min_recurrence_count applies to; max_distance is the group's embedding diameter, <= max_recurrence_threshold by construction. YOU decide what a group IS, from two published verdicts plus the join: (1) recurrence_count > max_recurrence_count = exceeds the set-recurrence reference ceiling, the anchor-desk/confessional shape rather than structural furniture. Member count alone is a weak discriminator (as a hard drop it destroyed verified title cards, and on audited ground truth it is the weakest signal measured), so corroborate with entropy range (mean per-member entropy_max - entropy_min — high for cards/idents/animated slates, low for locked-off cameras; the best single scalar on the audited corpus) and coverage (sum of member durations / actual_duration_sec). Coverage needs care: cards/idents/wipes measured <= ~0.007, but one furniture class is HIGH-coverage — ad-break countdown slates (a branded teaser plate with a ticking 'will return in N:NN', ~15 s per commercial break) measure 0.018-0.021, overlapping recurring sets. No scalar separates that class, but the hash gate does: the slate plate is the same render every break, so break slates measure hash_confirmed true while ordinary sets over the ceiling are the shape 9.6 exists to refuse — treat hash_confirmed: true on an over-ceiling group as a strong ad-break-slate candidate, and confirm with member frames via frames_key. All thresholds were measured on a small audited corpus; treat them as starting points. (2) hash_confirmed: true = the same rendered image genuinely recurs, the strongest furniture evidence; false = same set/place, or animated furniture re-composited per airing; null = unverifiable (members too dark or untextured to hash — could-not-check, not checked-and-failed). GENRE POSTURE: on scripted episodic content these groups are trustworthy structural evidence (act-break cards, idents). On news and reality, set-recurrence groups pass every gate because they genuinely are near-identical content; treat `interior` groups on such assets as candidates, not verdicts, and prefer `act_boundary`/`head`/`tail` positions when acting automatically."
+    },
+    "frame-embeddings": {
+      "basename": "embeddings.npz",
+      "kind": "file",
+      "mime": "application/octet-stream",
+      "description": "Per-frame DINOv2 vectors (.npz float16 — cast up before matmuls) — use for frame-level similarity search or custom clustering",
+      "example": null,
+      "contents": {
+        "embeddings": "[N, 384] float16 — L2-normalised DINOv2 CLS vectors; cast to float32 before matmuls",
+        "frame_number": "[N] int — exact source frame numbers",
+        "source_time": "[N] float — seconds from asset start",
+        "entropy": "[N] float — per-frame luma entropy (bits)"
+      },
+      "notes": "Black frames carry the sentinel embedding np.full(384, 1/sqrt(384)), not a real DINOv2 vector."
+    },
+    "shot-centroids": {
+      "basename": "shot_centroids.npy",
+      "kind": "file",
+      "mime": "application/octet-stream",
+      "description": "Per-shot centroid vectors (.npy [n_shots, 384] float16, row == shot_id) — use for shot-level similarity, matching, dedup",
+      "example": null,
+      "contents": {
+        "array": "[n_shots, 384] float16 — row index == shot_id from shots.json; cast to float32 before matmuls"
+      }
+    },
+    "usage": {
+      "basename": "usage_tracking.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Per-state durations and estimated cost — use for reporting what this run cost",
+      "example": {
+        "execution_arn": "arn:aws:states:...",
+        "uuid": "<workflow_id>",
+        "proxy_bucket": "<bucket>",
+        "proxy_prefix": "<prefix>",
+        "pipeline_wall_sec": 142.3,
+        "total_estimated_cost": 0.00412,
+        "actual_frame_count": 91750,
+        "actual_duration_sec": 3670.0,
+        "cost_per_minute": 0.000067,
+        "cost_per_frame": 4.5e-8,
+        "states": [
+          {
+            "state_name": "Usage tracking",
+            "operation": "StateUsageTracking",
+            "lambda_arn": "arn:aws:lambda:...",
+            "architecture": "arm64",
+            "memory_mb": 896,
+            "invocations": 1,
+            "wall_sec": 3.2,
+            "total_billed_sec": 3.2,
+            "estimated_cost": 1.2e-5
+          }
+        ]
+      },
+      "notes": "Costs are us-east-1 arm64 estimates, not billing data."
+    },
+    "debug-grids": {
+      "basename": "shot_{NNNNNN}.jpg",
+      "kind": "prefix",
+      "mime": "image/jpeg",
+      "description": "Per-shot frame-grid JPEGs for human QC — browse to eyeball a shot's content; not a rendering input",
+      "example": null,
+      "notes": "Filenames are shot_{NNNNNN}.jpg (zero-padded shot_id). Each grid composes the shot's archived frames at 112x112 cells. Debug aid, not a rendering input."
+    }
+  }
+}

@@ -1,0 +1,105 @@
+{
+  "operation": "StateChunkTranscode",
+  "item_id": 0,
+  "item_data": {
+    "function_arn": "arn:aws:lambda:us-east-1:123456789:function:media2cloud-chunk-transcode",
+    "uuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "item_id": 0,
+    "input": {
+      "bucket": "<your-ingest-bucket>",
+      "key": "uploads/my_video.mxf"
+    },
+    "output": {
+      "bucket": "<your-proxy-bucket>",
+      "prefix": "a1b2c3d4"
+    },
+    "type": "chunk",
+    "nominal_start_sec": 599.999400, // float(Fraction(17982) / Fraction(30000, 1001))
+    "nominal_end_sec": 1200.032167, // float(Fraction(35965) / Fraction(30000, 1001))
+    "nominal_start_frame": 17982, // math.floor(Fraction(nominal_start_sec).limit_denominator(...) * fps)
+    "nominal_end_frame": 35965, // math.ceil( Fraction(nominal_end_sec).limit_denominator(...)   * fps)
+    "fps": "30000/1001",
+    "interlaced": true,
+    "is_all_intra": false, // false → run ffprobe -read_intervals to find keyframe before nominal_start_sec; true → no keyframe search
+    "frame_interval": 30, // used by ChunkTranscode: S3 frame name = nominal_start_frame + local_idx * frame_interval
+    "sampling_rate": 48000, // FLAC intermediate rate; start_sample / end_sample computed at this rate
+    // filter_complex: vfilters + afilters are joined with ";" to form the full -filter_complex string.
+    // Template variables resolved by ChunkTranscode at runtime (require keyframe search):
+    //   {{start_frame}}  — preroll_frames (keyframe_frame_number - nominal_start_frame; 0 for all-intra or first chunk)
+    //   {{end_frame}}    — preroll_frames + (nominal_end_frame - nominal_start_frame)
+    //   {{start_sample}} — math.floor(Fraction(preroll_frames) / fps * sampling_rate)
+    //   {{end_sample}}   — math.ceil( Fraction(preroll_frames + nominal_end_frame - nominal_start_frame) / fps * sampling_rate)
+    "filter_complex": {
+      // ProbeMediaFile generates vfilters conditionally:
+      //   - crop   only when coded_crop_w > 0 or coded_crop_h > 0
+      //   - yadif  only when interlaced=true
+      //   - PAR normalisation (scale=iw*sar_num/sar_den:ih,setsar=1/1) only when sar != 1:1
+      //   - split + vjpeg + jout only when a jpeg output group exists
+      //
+      // scale ow:oh is pre-computed by ProbeMediaFile via scale_dimension():
+      //   - post-crop display dimensions as input (NOT coded, NOT raw)
+      //   - fit within reference box (960x540 for landscape, 540x960 for portrait)
+      //   - factor = min(box_w / dsp_w, box_h / dsp_h)  → no upscale if source is smaller
+      //   - ow = round_even(dsp_w * factor), oh = round_even(dsp_h * factor)
+      //
+      // This example: interlaced=true, non-1:1 PAR (coded 720x576, SAR 16:15 → display 768x576, AR 4:3)
+      //   crop_x=8 display px → coded_crop_w=round_even(8*15/16)=8, crop_y=4 → coded_crop_h=4
+      //   post-crop coded: 704x572, post-crop display: round_even(704*16/15)x572 = 750x572
+      //   factor = min(960/750, 540/572) = min(1.28, 0.944) = 0.944
+      //   ow = round_even(750*0.944) = 708, oh = round_even(572*0.944) = 540
+      //
+      // Filter order: trim → setpts → crop → yadif → PAR normalise → scale
+      //   crop before yadif: removes dirty interlaced edges before deinterlace
+      //   PAR normalise before scale: ensures scale operates in square-pixel space
+      "vfilters": [
+        "[0:v]trim=start_frame={{start_frame}}:end_frame={{end_frame}},setpts=PTS-STARTPTS,crop=iw-16:ih-8:8:4,yadif,scale=iw*16/15:ih,setsar=1/1,scale=708:540[vscaled]",
+        "[vscaled]split=2[vts][vjpeg]",
+        "[vjpeg]select='not(mod(n\\,30))'[jout]"
+      ],
+      // afilters: ProbeMediaFile selects exactly one path based on audio_streams.
+      // This example: two mono tracks → Path B (amerge).
+      //
+      // Path A — single mono track:
+      //   [0:a:0]aresample=48000:async=1,apad,aformat=sample_fmts=s16:channel_layouts=mono[_ax]
+      //
+      // Path B — two mono tracks (this example):
+      //   [0:a:0]aresample=48000:async=1,apad,aformat=sample_fmts=s16:channel_layouts=mono[_a0]
+      //   [0:a:1]aresample=48000:async=1,apad,aformat=sample_fmts=s16:channel_layouts=mono[_a1]
+      //   [_a0][_a1]amerge=inputs=2[_ax]
+      //
+      // Path C — single stereo or multichannel track (ffmpeg downmixes via aformat):
+      //   [0:a:0]aresample=48000:async=1,apad,aformat=sample_fmts=s16:channel_layouts=stereo[_ax]
+      //
+      // All paths converge at [_ax] → atrim → [aout]
+      "afilters": [
+        "[0:a:0]aresample=48000:async=1,apad,aformat=sample_fmts=s16:channel_layouts=mono[_a0]",
+        "[0:a:1]aresample=48000:async=1,apad,aformat=sample_fmts=s16:channel_layouts=mono[_a1]",
+        "[_a0][_a1]amerge=inputs=2[_ax]",
+        "[_ax]atrim=start_sample={{start_sample}}:end_sample={{end_sample}},asetpts=PTS-STARTPTS[aout]"
+      ]
+    },
+    // chunk_outputs: each entry describes one ffmpeg output.
+    // s3_prefix is relative to output.prefix: s3://{output.bucket}/{output.prefix}/{s3_prefix}/{s3_name}
+    // s3_name is pre-resolved by ProbeMediaFile using item_id (not a template variable for ChunkTranscode).
+    // multi=true: ffmpeg produces N local files matching local_pattern (0-based via -start_number 0).
+    //   S3 key per frame: {s3_prefix}/frame_{nominal_start_frame + local_idx * frame_interval:07d}.jpg
+    "chunk_outputs": [
+      {
+        "s3_prefix": "segment_video",
+        "s3_name": "video_0.ts",
+        "map": "[vts] -c:v libopenh264 -b:v 2130000 -g 60 -f mpegts"
+      },
+      {
+        "s3_prefix": "segment_audio",
+        "s3_name": "audio_0.flac",
+        "map": "[aout] -c:a flac -ar 48000 -ac 2"
+      },
+      {
+        "s3_prefix": "frames",
+        "local_pattern": "frame_%07d.jpg",
+        "multi": true,
+        "map": "[jout] -fps_mode passthrough -start_number 0 -q:v 2 -f image2"
+      }
+    ]
+  }
+}

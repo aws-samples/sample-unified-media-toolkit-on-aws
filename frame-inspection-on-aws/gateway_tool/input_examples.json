@@ -1,0 +1,38 @@
+{
+  "comment": "Per tool: `required` names the fields the gateway refuses without (a prose entry like 'a OR b' states a one-of rule the schema cannot express); `example` is a minimal VALID request including recommended optionals; every other accepted parameter is declared, with type and description, in the tool's InputSchema (delivered via tools/list). The shapes and field names are the contract; every s3 uri, ARN, and id value is an invented placeholder — substitute your deployment's own. Each submit example passes this gateway's full input validation (pinned by a unit test), so an example that drifts from the real contract fails the build. Where a one-of rule exists, `alternatives` holds one valid example of each other form, keyed by the field that selects it; alternatives round-trip the same validation.",
+  "tools": {
+    "inspect_frames": {
+      "required": ["assets OR (shot_segmentation_s3uri + category)"],
+      "example": {
+        "shot_segmentation_s3uri": "s3://my-proxy-bucket/micro-workflow/shot-segmentation/00000000-0000-5000-8000-000000000001",
+        "category": "credits-read",
+        "spans": [{"start": 0.0, "end": 12.0}],
+        "idempotency_token": "my-run-2026-10-07"
+      },
+      "alternatives": {
+        "assets": {
+          "assets": [
+            {
+              "shot_segmentation_s3uri": "s3://my-proxy-bucket/micro-workflow/shot-segmentation/00000000-0000-5000-8000-000000000001",
+              "requests": [
+                {"category": "credits-read",
+                 "spans": [{"start": 0.0, "end": 12.0}]}
+              ]
+            }
+          ],
+          "idempotency_token": "my-run-2026-10-07"
+        }
+      }
+    },
+    "get_job_status": {
+      "required": ["job_id"],
+      "example": {
+        "job_id": "arn:aws:states:eu-west-1:111111111111:execution:myprefix-frame-inspection:00000000-0000-5000-8000-000000000002"
+      }
+    },
+    "describe_tool": {
+      "required": [],
+      "example": {}
+    }
+  }
+}

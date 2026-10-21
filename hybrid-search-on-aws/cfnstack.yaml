@@ -1,0 +1,2483 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Build and deploy Hybrid Search container to ECR; provision DynamoDB, Lambda, Step Functions, and EventBridge for LanceDB-based hybrid search. Version %%VERSION%%
+
+Mappings:
+    CodeBuild:
+        Source:
+            Package: "%%PKG_HYBRID_SEARCH%%"
+            Bucket: "%%BUCKET_NAME%%"
+            KeyPrefix: "%%KEY_PREFIX%%"
+        Project:
+            Type: ARM_CONTAINER
+            ComputeType: BUILD_GENERAL1_LARGE
+            Image: aws/codebuild/amazonlinux2-aarch64-standard:3.0
+    CopySchema:
+        Lambda:
+            Package: "%%PKG_COPY_SCHEMA%%"
+            Bucket: "%%BUCKET_NAME%%"
+            KeyPrefix: "%%KEY_PREFIX%%"
+    ECR:
+        Repository:
+            Name: hybrid-search-on-aws
+            ImageTag: "%%VERSION%%"
+    DynamoDB:
+        Index:
+            Name: lancedb-index-state
+        Dedup:
+            Name: lancedb-dedup-state
+        SearchHistory:
+            Name: lancedb-search-history
+        Collections:
+            Name: lancedb-collections
+    GatewayTool:
+        Lambda:
+            Package: "%%PKG_GATEWAY_TOOL%%"
+            Bucket: "%%BUCKET_NAME%%"
+            KeyPrefix: "%%KEY_PREFIX%%"
+    Lambda:
+        Function:
+            Name: hybrid-search
+            Description: Hybrid Search (LanceDB + Cohere Embed)
+        Indexer:
+            Memory: 3008
+            Timeout: 900
+            Name: indexer
+        Rebuild:
+            Memory: 3008
+            Timeout: 900
+            Name: rebuild
+        Search:
+            Memory: 1769
+            Timeout: 120
+            Name: search
+        StreamHandler:
+            Memory: 256
+            Timeout: 120
+            Name: stream-handler
+        HandleExecutionFailure:
+            Memory: 256
+            Timeout: 60
+            Name: handle-execution-failure
+    Workflow:
+        HybridSearchIndexer:
+            Name: hybrid-search-indexer
+        HybridSearchRebuild:
+            Name: hybrid-search-rebuild
+        HybridSearchSearch:
+            Name: hybrid-search-search
+
+Parameters:
+    ResourcePrefix:
+        Type: String
+        Description: Prefix for resource names
+    ProxyBucket:
+        Type: String
+        Description: S3 proxy bucket where LanceDB index files are stored (under _lancedb_index/)
+
+Resources:
+
+    ################################################################################
+    # CodeBuild IAM Role
+    ################################################################################
+    CodeBuildRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W11
+                        reason: GetAuthorizationToken requires a wildcard resource (no ARN exists for it)
+        Properties:
+            Path: /
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service: codebuild.amazonaws.com
+                        Action: sts:AssumeRole
+            Policies:
+                -
+                    PolicyName: !Sub ${ResourcePrefix}HybridSearchCodeBuildPolicy
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                            -
+                                Effect: Allow
+                                Action:
+                                    - logs:CreateLogGroup
+                                    - logs:CreateLogStream
+                                    - logs:PutLogEvents
+                                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild:*
+                            -
+                                Effect: Allow
+                                Action: s3:ListBucket
+                                Resource: !Sub
+                                    - arn:aws:s3:::${bucket}
+                                    - bucket: !FindInMap [CodeBuild, Source, Bucket]
+                            # Scoped to the staging BUCKET, not the versioned
+                            # key: a key-pinned grant is rewritten on every
+                            # version bump, and whatever reads the new key runs
+                            # seconds later — losing that race against IAM
+                            # propagation fails the deploy with AccessDenied on
+                            # an object that exists and is readable. Bucket-wide
+                            # is also already the ListBucket scope above.
+                            -
+                                Effect: Allow
+                                Action: s3:GetObject
+                                Resource: !Sub
+                                    - arn:aws:s3:::${bucket}/*
+                                    - bucket: !FindInMap [CodeBuild, Source, Bucket]
+                            -
+                                Effect: Allow
+                                # GetAuthorizationToken is the ONLY ECR action
+                                # that requires "*" (no resource ARN exists);
+                                # repo-scoped actions live in the next statement
+                                # (CSR scan 2026-10-08)
+                                Action:
+                                    - ecr:GetAuthorizationToken
+                                Resource: "*"
+                            -
+                                Effect: Allow
+                                Action:
+                                    - ecr:CreateRepository
+                                    - ecr:DescribeImages
+                                    - ecr:BatchCheckLayerAvailability
+                                    - ecr:CompleteLayerUpload
+                                    - ecr:InitiateLayerUpload
+                                    - ecr:PutImage
+                                    - ecr:UploadLayerPart
+                                Resource: !Sub
+                                    - arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${repoName}
+                                    - repoName: !FindInMap [ECR, Repository, Name]
+
+    ################################################################################
+    # CodeBuild Project
+    ################################################################################
+    CodeBuildProject:
+        Type: AWS::CodeBuild::Project
+        Properties:
+            Name: !Sub
+                - ${ResourcePrefix}-${repositoryName}
+                - repositoryName: !FindInMap [ECR, Repository, Name]
+            Description: !Sub
+                - Build and publish ${desc} docker image to Amazon ECR
+                - desc: !FindInMap [Lambda, Function, Description]
+            ServiceRole: !GetAtt CodeBuildRole.Arn
+            Source:
+                Type: S3
+                Location: !Sub
+                    - ${bucket}/${keyPrefix}/${package}
+                    - bucket: !FindInMap [CodeBuild, Source, Bucket]
+                      keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                      package: !FindInMap [CodeBuild, Source, Package]
+                BuildSpec: |
+                    version: 0.2
+                    phases:
+                        pre_build:
+                            commands:
+                                - echo "== Logging in to Amazon ECR =="
+                                - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+                                - |
+                                    echo "== Creating ECR repository if it does not exist =="
+                                    aws ecr create-repository --region $AWS_REGION --repository-name $IMAGE_REPO_NAME --image-scanning-configuration scanOnPush=true --encryption-configuration encryptionType=AES256; EXITCODE=$?
+                                    if [ $EXITCODE -ne 0 ] && [ $EXITCODE -ne 254 ]; then
+                                        echo "ECR create-repository failed with exit code $EXITCODE"
+                                        exit $EXITCODE
+                                    fi
+                                - |
+                                    echo "== Checking if $IMAGE_REPO_NAME:$IMAGE_TAG already exists =="
+                                    if aws ecr describe-images --region $AWS_REGION --repository-name $IMAGE_REPO_NAME --image-ids imageTag=$IMAGE_TAG 2>/dev/null; then
+                                        echo "Image $IMAGE_REPO_NAME:$IMAGE_TAG already exists — skipping build"
+                                        touch /tmp/skip_build
+                                    else
+                                        echo "Image not found — proceeding with build"
+                                    fi
+                        build:
+                            commands:
+                                - |
+                                    if [ -f /tmp/skip_build ]; then
+                                        echo "== Skipping docker build — image already exists =="
+                                    else
+                                        echo "== Building $IMAGE_REPO_NAME:$IMAGE_TAG [$(date)] =="
+                                        docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+                                        docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                                        echo "== Pushing $IMAGE_REPO_NAME:$IMAGE_TAG [$(date)] =="
+                                        docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                                        echo "== Push complete [$(date)] =="
+                                    fi
+                        post_build:
+                            commands:
+                                - |
+                                    echo "=== post_build CODEBUILD_BUILD_SUCCEEDING=$CODEBUILD_BUILD_SUCCEEDING ==="
+                                    if [ -n "$CFN_ResponseURL" ]; then
+                                        if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then
+                                            echo "== Sending SUCCESS to CloudFormation =="
+                                            curl -s -X PUT -H "Content-Type:" \
+                                                --data-binary "{\"Status\":\"SUCCESS\",\"Reason\":\"Docker image ready\",\"PhysicalResourceId\":\"$CFN_PhysicalResourceId\",\"StackId\":\"$CFN_StackId\",\"RequestId\":\"$CFN_RequestId\",\"LogicalResourceId\":\"$CFN_LogicalResourceId\",\"Data\":{\"ImageUri\":\"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG\"}}" \
+                                                "$CFN_ResponseURL"
+                                        else
+                                            echo "== Sending FAILED to CloudFormation =="
+                                            curl -s -X PUT -H "Content-Type:" \
+                                                --data-binary "{\"Status\":\"FAILED\",\"Reason\":\"Docker build failed — see CodeBuild logs\",\"PhysicalResourceId\":\"$CFN_PhysicalResourceId\",\"StackId\":\"$CFN_StackId\",\"RequestId\":\"$CFN_RequestId\",\"LogicalResourceId\":\"$CFN_LogicalResourceId\",\"Data\":{}}" \
+                                                "$CFN_ResponseURL"
+                                        fi
+                                    fi
+            Environment:
+                Type: !FindInMap [CodeBuild, Project, Type]
+                ComputeType: !FindInMap [CodeBuild, Project, ComputeType]
+                Image: !FindInMap [CodeBuild, Project, Image]
+                PrivilegedMode: true
+                EnvironmentVariables:
+                    -
+                        Name: AWS_REGION
+                        Value: !Ref AWS::Region
+                    -
+                        Name: AWS_ACCOUNT_ID
+                        Value: !Ref AWS::AccountId
+                    -
+                        Name: IMAGE_REPO_NAME
+                        Value: !FindInMap [ECR, Repository, Name]
+                    -
+                        Name: IMAGE_TAG
+                        Value: !FindInMap [ECR, Repository, ImageTag]
+            Artifacts:
+                Type: NO_ARTIFACTS
+            EncryptionKey: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3
+            TimeoutInMinutes: 60
+            QueuedTimeoutInMinutes: 60
+            LogsConfig:
+                CloudWatchLogs:
+                    GroupName: /aws/codebuild
+                    StreamName: !Sub
+                        - ${ResourcePrefix}-${repositoryName}
+                        - repositoryName: !FindInMap [ECR, Repository, Name]
+                    Status: ENABLED
+
+    ################################################################################
+    # StartBuild Lambda IAM Role
+    ################################################################################
+    StartBuildLambdaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: /
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service: lambda.amazonaws.com
+                        Action: sts:AssumeRole
+            Policies:
+                -
+                    PolicyName: !Sub ${ResourcePrefix}HybridSearchStartBuildPolicy
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                            # Scoped to the declared group. No logs:CreateLogGroup —
+                            # the group is a stack resource, so the function must
+                            # never create one; withholding the permission is what
+                            # makes "it silently logged somewhere else" impossible.
+                            -
+                                Effect: Allow
+                                Action:
+                                    - logs:CreateLogStream
+                                    - logs:PutLogEvents
+                                Resource: !GetAtt StartBuildLambdaLogGroup.Arn
+                            -
+                                Effect: Allow
+                                Action: codebuild:StartBuild
+                                Resource: !GetAtt CodeBuildProject.Arn
+
+    ################################################################################
+    # StartBuild Lambda — inlined
+    ################################################################################
+    StartBuildLambda:
+        Type: AWS::Lambda::Function
+        DependsOn: StartBuildLambdaLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W89
+                        reason: Not using VPC
+                    -
+                        id: W92
+                        reason: Single-execution custom resource; reserved concurrency unnecessary
+        Properties:
+            Description: !Sub
+                - (${ResourcePrefix} ${repositoryName}) Start CodeBuild; CodeBuild signals CloudFormation on completion
+                - repositoryName: !FindInMap [ECR, Repository, Name]
+            Runtime: python3.13
+            MemorySize: 128
+            Timeout: 60
+            Handler: index.handler
+            Role: !GetAtt StartBuildLambdaRole.Arn
+            LoggingConfig:
+                LogGroup: !Ref StartBuildLambdaLogGroup
+            Code:
+                ZipFile: |
+                    import json
+                    import urllib.request
+                    import boto3
+
+                    def send_cfn_response(event, status, data, reason=''):
+                        body = json.dumps({
+                            'Status': status,
+                            'Reason': reason or 'See CloudWatch Logs',
+                            'PhysicalResourceId': event.get('PhysicalResourceId') or event['LogicalResourceId'],
+                            'StackId': event['StackId'],
+                            'RequestId': event['RequestId'],
+                            'LogicalResourceId': event['LogicalResourceId'],
+                            'Data': data,
+                        }).encode()
+                        req = urllib.request.Request(
+                            event['ResponseURL'], data=body, method='PUT',
+                            headers={'Content-Type': ''})
+                        urllib.request.urlopen(req)
+
+                    def handler(event, context):
+                        print('Event keys:', sorted(event))
+                        try:
+                            if event['RequestType'] == 'Delete':
+                                send_cfn_response(event, 'SUCCESS', {'Status': 'SKIPPED'})
+                                return
+
+                            env_overrides = [
+                                {'name': 'CFN_ResponseURL',        'value': event['ResponseURL'],                                        'type': 'PLAINTEXT'},
+                                {'name': 'CFN_PhysicalResourceId', 'value': event.get('PhysicalResourceId') or context.log_stream_name,  'type': 'PLAINTEXT'},
+                                {'name': 'CFN_StackId',            'value': event['StackId'],                                            'type': 'PLAINTEXT'},
+                                {'name': 'CFN_RequestId',          'value': event['RequestId'],                                          'type': 'PLAINTEXT'},
+                                {'name': 'CFN_LogicalResourceId',  'value': event['LogicalResourceId'],                                  'type': 'PLAINTEXT'},
+                            ]
+
+                            boto3.client('codebuild').start_build(
+                                projectName=event['ResourceProperties']['ProjectName'],
+                                environmentVariablesOverride=env_overrides,
+                            )
+                        except Exception as exc:
+                            print(f'ERROR: {exc}')
+                            send_cfn_response(event, 'FAILED', {}, str(exc))
+
+    ################################################################################
+    # Custom Resource — triggers CodeBuild
+    ################################################################################
+    StartBuild:
+        Type: Custom::StartBuildDelayResponse
+        Properties:
+            ServiceToken: !GetAtt StartBuildLambda.Arn
+            ProjectName: !Ref CodeBuildProject
+            ImageTag: !FindInMap [ECR, Repository, ImageTag]
+
+    ################################################################################
+    # CopySchemaRole — IAM role for the CopySchemaLambda custom resource
+    ################################################################################
+    CopySchemaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: /
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service: lambda.amazonaws.com
+                        Action: sts:AssumeRole
+            Policies:
+                -
+                    PolicyName: !Sub ${ResourcePrefix}CopySchemaPolicy
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                            # Scoped to the declared group; no logs:CreateLogGroup.
+                            -
+                                Effect: Allow
+                                Action:
+                                    - logs:CreateLogStream
+                                    - logs:PutLogEvents
+                                Resource: !GetAtt CopySchemaLambdaLogGroup.Arn
+                            # Read the deployment zip. Scoped to the staging
+                            # BUCKET, not the versioned key — a key-pinned grant
+                            # is rewritten on every version bump and this Lambda
+                            # reads the new key seconds later, racing IAM
+                            # propagation (a lost race denies an object that
+                            # exists and is readable). Bucket-scoped, the policy
+                            # is identical across deploys and never re-propagates.
+                            -
+                                Effect: Allow
+                                Action: s3:GetObject
+                                Resource: !Sub
+                                    - arn:aws:s3:::${bucket}/*
+                                    - bucket: !FindInMap [CodeBuild, Source, Bucket]
+                            # HeadObject on non-existent keys returns 403 without ListBucket
+                            -
+                                Effect: Allow
+                                Action: s3:ListBucket
+                                Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            # Write schema files to the proxy bucket
+                            -
+                                Effect: Allow
+                                Action:
+                                    - s3:GetObject
+                                    - s3:PutObject
+                                Resource: !Sub arn:aws:s3:::${ProxyBucket}/_lancedb_index/schema/*
+                            # Write workflow config to the proxy bucket
+                            -
+                                Effect: Allow
+                                Action:
+                                    - s3:GetObject
+                                    - s3:PutObject
+                                Resource: !Sub arn:aws:s3:::${ProxyBucket}/_workflowconfig/*
+                            # Write prompt config to the proxy bucket
+                            -
+                                Effect: Allow
+                                Action:
+                                    - s3:GetObject
+                                    - s3:PutObject
+                                Resource: !Sub arn:aws:s3:::${ProxyBucket}/_promptconfig/*
+                            # Seed the "default" collection record (skip-if-exists)
+                            -
+                                Effect: Allow
+                                Action: dynamodb:PutItem
+                                Resource: !GetAtt LanceDBCollectionTable.Arn
+
+    ################################################################################
+    # CopySchemaLambda — extracts files from the deployment zip and copies them to
+    # the proxy bucket. Handles three distinct copy strategies, each expressed as an
+    # entry in the Files list passed via ResourceProperties:
+    #
+    #   { "src_prefix": "schema/",      "dest_key_prefix": "_lancedb_index/schema",
+    #     "filter": "*.json",           "on_update": "skip",
+    #     "content_type": "application/json" }
+    #
+    #   { "src_prefix": "prompt_config/", "dest_key_prefix": "_promptconfig/baseline/hybrid-search",
+    #     "filter": "*",                "on_update": "overwrite",
+    #     "content_type": "text/markdown" }
+    #
+    #   { "src_prefix": "workflow_config/", "dest_key_prefix": "_workflowconfig",
+    #     "filter": "*.json",           "on_update": "skip",
+    #     "content_type": "application/json" }
+    #
+    # on_update strategies:
+    #   skip      — skip files that already exist in S3 (preserves operator edits)
+    #   overwrite — always write (file resets to packaged version on every deploy)
+    #
+    # On Create: all strategies write unconditionally (merge writes the packaged file).
+    # On Delete: no-op — these files are user data, not stack-owned resources.
+    ################################################################################
+    CopySchemaLambda:
+        Type: AWS::Lambda::Function
+        DependsOn: CopySchemaLambdaLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W89
+                        reason: Not using VPC
+                    -
+                        id: W92
+                        reason: Single-execution custom resource; reserved concurrency unnecessary
+        Properties:
+            Description: !Sub (${ResourcePrefix}) Seed schema, prompt, and workflow config files from deployment zip
+            Runtime: python3.13
+            MemorySize: 128
+            Timeout: 60
+            Handler: lambda_function.handler
+            Role: !GetAtt CopySchemaRole.Arn
+            LoggingConfig:
+                LogGroup: !Ref CopySchemaLambdaLogGroup
+            Code:
+                S3Bucket: !FindInMap [CopySchema, Lambda, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${package}
+                    - keyPrefix: !FindInMap [CopySchema, Lambda, KeyPrefix]
+                      package: !FindInMap [CopySchema, Lambda, Package]
+
+    ################################################################################
+    # CopySchema — seeds schema, prompt config, and workflow config from the
+    # deployment zip to the proxy bucket.
+    ################################################################################
+    CopySchema:
+        Type: Custom::CopySchema
+        Properties:
+            ServiceToken: !GetAtt CopySchemaLambda.Arn
+            SrcBucket: !FindInMap [CodeBuild, Source, Bucket]
+            SrcKey: !Sub
+                - ${keyPrefix}/${package}
+                - keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                  package: !FindInMap [CodeBuild, Source, Package]
+            DestBucket: !Ref ProxyBucket
+            # After copying files, seeds the "default" collection record from
+            # the workflow config (skip-if-exists — operator edits survive).
+            CollectionTable: !Ref LanceDBCollectionTable
+            WorkflowConfigKey: "_workflowconfig/hybrid-search.json"
+            Files:
+                # schema/*.json — skip on update (preserve operator edits)
+                -
+                    src_prefix: "schema/"
+                    dest_key_prefix: "_lancedb_index/schema"
+                    filter: "*.json"
+                    on_update: "skip"
+                    content_type: "application/json"
+                # prompt_config/default.md — always overwrite (reset to packaged version)
+                -
+                    src_prefix: "prompt_config/"
+                    dest_key_prefix: "_promptconfig/baseline/hybrid-search"
+                    filter: "*"
+                    on_update: "overwrite"
+                    content_type: "text/markdown"
+                # workflow_config/hybrid-search.json — skip if exists (operator controls retrieval settings)
+                -
+                    src_prefix: "workflow_config/"
+                    dest_key_prefix: "_workflowconfig"
+                    filter: "*.json"
+                    on_update: "skip"
+                    content_type: "application/json"
+
+    ################################################################################
+    # DynamoDB — LanceDBIndexState
+    # pk/sk are the primary key.
+    # Stream enabled: KEYS_ONLY — StreamHandler Lambda listens for lock DELETE events.
+    # No dedup records here — those live in LanceDBDedupTable to avoid hot partitions.
+    ################################################################################
+    LanceDBIndexStateTable:
+        Type: AWS::DynamoDB::Table
+        Metadata:
+            checkov:
+                skip:
+                    - id: CKV_AWS_119
+                      comment: >-
+                        sample posture: table holds rebuildable derived state; default SSE is deliberate (see README.md DeletionPolicy decision)
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W28
+                        reason: Explicit table name required for cross-stack env var reference
+                    -
+                        id: W74
+                        reason: Using default AWS-managed encryption key
+        Properties:
+            TableName: !Sub
+                - ${ResourcePrefix}-${suffix}
+                - suffix: !FindInMap [DynamoDB, Index, Name]
+            BillingMode: PAY_PER_REQUEST
+            AttributeDefinitions:
+                -
+                    AttributeName: pk
+                    AttributeType: S
+                -
+                    AttributeName: sk
+                    AttributeType: S
+                -
+                    AttributeName: title
+                    AttributeType: S
+            KeySchema:
+                -
+                    AttributeName: pk
+                    KeyType: HASH
+                -
+                    AttributeName: sk
+                    KeyType: RANGE
+            GlobalSecondaryIndexes:
+                -
+                    IndexName: title-index
+                    KeySchema:
+                        -
+                            AttributeName: pk
+                            KeyType: HASH
+                        -
+                            AttributeName: title
+                            KeyType: RANGE
+                    Projection:
+                        ProjectionType: KEYS_ONLY
+            TimeToLiveSpecification:
+                AttributeName: ttl
+                Enabled: true
+            StreamSpecification:
+                StreamViewType: KEYS_ONLY
+            PointInTimeRecoverySpecification:
+                PointInTimeRecoveryEnabled: true
+
+    ################################################################################
+    # DynamoDB — LanceDBDedupTable
+    # Dedicated table for per-document dedup records. Isolated from LanceDBIndexState
+    # to prevent hot-partition throttling at scale (10M+ doc records, pk="doc" in a
+    # shared table would hit the 1,000 WCU/s single-partition cap).
+    # doc_id is the hash key (no sort key — doc_id is globally unique).
+    # GSI: asset_id (hash) + table_name (range) — per-table refresh queries.
+    ################################################################################
+    LanceDBDedupTable:
+        Type: AWS::DynamoDB::Table
+        Metadata:
+            checkov:
+                skip:
+                    - id: CKV_AWS_119
+                      comment: >-
+                        sample posture: table holds rebuildable derived state; default SSE is deliberate (see README.md DeletionPolicy decision)
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W28
+                        reason: Explicit table name required for cross-stack env var reference
+                    -
+                        id: W74
+                        reason: Using default AWS-managed encryption key
+        Properties:
+            TableName: !Sub
+                - ${ResourcePrefix}-${suffix}
+                - suffix: !FindInMap [DynamoDB, Dedup, Name]
+            BillingMode: PAY_PER_REQUEST
+            AttributeDefinitions:
+                -
+                    AttributeName: doc_id
+                    AttributeType: S
+                -
+                    AttributeName: asset_id
+                    AttributeType: S
+                -
+                    AttributeName: table_name
+                    AttributeType: S
+            KeySchema:
+                -
+                    AttributeName: doc_id
+                    KeyType: HASH
+            GlobalSecondaryIndexes:
+                -
+                    IndexName: asset_id-table_name-index
+                    KeySchema:
+                        -
+                            AttributeName: asset_id
+                            KeyType: HASH
+                        -
+                            AttributeName: table_name
+                            KeyType: RANGE
+                    Projection:
+                        ProjectionType: KEYS_ONLY
+            TimeToLiveSpecification:
+                AttributeName: ttl
+                Enabled: true
+            PointInTimeRecoverySpecification:
+                PointInTimeRecoveryEnabled: true
+
+    ################################################################################
+    # DynamoDB — LanceDBSearchHistoryTable
+    # Per-request search history: decomposition, results, timing.
+    # TTL controlled by SEARCH_HISTORY_TTL_DAYS env var (default 7 days).
+    # GSI created_at-index: sk="search" (hash) + created_at (range) for time-range queries.
+    ################################################################################
+    LanceDBSearchHistoryTable:
+        Type: AWS::DynamoDB::Table
+        Metadata:
+            checkov:
+                skip:
+                    - id: CKV_AWS_119
+                      comment: >-
+                        sample posture: table holds rebuildable derived state; default SSE is deliberate (see README.md DeletionPolicy decision)
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W28
+                        reason: Explicit table name required for cross-stack env var reference
+                    -
+                        id: W74
+                        reason: Using default AWS-managed encryption key
+        Properties:
+            TableName: !Sub
+                - ${ResourcePrefix}-${suffix}
+                - suffix: !FindInMap [DynamoDB, SearchHistory, Name]
+            BillingMode: PAY_PER_REQUEST
+            AttributeDefinitions:
+                -
+                    AttributeName: request_id
+                    AttributeType: S
+                -
+                    AttributeName: sk
+                    AttributeType: S
+                -
+                    AttributeName: created_at
+                    AttributeType: N
+            KeySchema:
+                -
+                    AttributeName: request_id
+                    KeyType: HASH
+                -
+                    AttributeName: sk
+                    KeyType: RANGE
+            GlobalSecondaryIndexes:
+                -
+                    IndexName: created_at-index
+                    KeySchema:
+                        -
+                            AttributeName: sk
+                            KeyType: HASH
+                        -
+                            AttributeName: created_at
+                            KeyType: RANGE
+                    Projection:
+                        ProjectionType: ALL
+            TimeToLiveSpecification:
+                AttributeName: ttl
+                Enabled: true
+            PointInTimeRecoverySpecification:
+                PointInTimeRecoveryEnabled: true
+
+    ################################################################################
+    # DynamoDB — LanceDBCollectionTable (NEW, Phase 2)
+    # Collection registry: one item per collection (news, sport, ...).
+    # pk = collection_id (hash only). Holds active_scopes, schema_map,
+    # per-collection retrieval weights, weights_locked flag.
+    # The "default" collection is seeded by the CopySchema custom resource.
+    ################################################################################
+    LanceDBCollectionTable:
+        Type: AWS::DynamoDB::Table
+        Metadata:
+            checkov:
+                skip:
+                    - id: CKV_AWS_119
+                      comment: >-
+                        sample posture: table holds rebuildable derived state; default SSE is deliberate (see README.md DeletionPolicy decision)
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W28
+                        reason: Explicit table name required for cross-stack env var reference
+                    -
+                        id: W74
+                        reason: Using default AWS-managed encryption key
+        Properties:
+            TableName: !Sub
+                - ${ResourcePrefix}-${suffix}
+                - suffix: !FindInMap [DynamoDB, Collections, Name]
+            BillingMode: PAY_PER_REQUEST
+            AttributeDefinitions:
+                -
+                    AttributeName: collection_id
+                    AttributeType: S
+            KeySchema:
+                -
+                    AttributeName: collection_id
+                    KeyType: HASH
+            PointInTimeRecoverySpecification:
+                PointInTimeRecoveryEnabled: true
+
+    ################################################################################
+    # S3 Vectors bucket (NEW, Phase 2) — ONE per deployment.
+    # Vector INDEXES are created at runtime (CreateIndex, first-write-wins),
+    # one per (collection, table_key), for schemas with vector_store=s3vectors.
+    #
+    # Named ${ResourcePrefix}-${AccountId}-${Region}-vectors, mirroring how m2c
+    # names its ingest/proxy buckets. S3 Vectors names are scoped per
+    # account+region (unlike S3, which is global), so account+region is strictly
+    # redundant for uniqueness — it is there for OPERATOR legibility: one string
+    # identifies the bucket in a cross-account console, a CUR line item, and a
+    # support case.
+    #
+    # Retain (both policies): re-embedding a corpus costs real Bedrock spend, so
+    # the bucket deliberately outlives the stack. Note the interaction with
+    # ResourcePrefix, which is derived from the STACK ID in both deployment paths
+    # (m2c: deployment/media2cloud.yaml; bundle: micro-workflow-bundle) — so a
+    # delete + re-create produces a NEW stack id, a NEW bucket name, and a
+    # retained orphan holding the old vectors. That is the accepted trade: an
+    # orphan is recoverable, a deleted vector corpus is not. Sweep stale
+    # *-vectors buckets manually.
+    #
+    # Only VectorBucketArn and CreationTime are GetAtt-able — VectorBucketName is
+    # NOT a readOnlyProperty on this type, so !GetAtt ...VectorBucketName does not
+    # exist (and !Ref returns the ARN, not the name). Consumers that need the
+    # NAME slice it out of the ARN; see VectorBucketName in Outputs.
+    ################################################################################
+    HybridSearchVectorBucket:
+        Type: AWS::S3Vectors::VectorBucket
+        DeletionPolicy: Retain
+        UpdateReplacePolicy: Retain
+        Properties:
+            VectorBucketName: !Sub ${ResourcePrefix}-${AWS::AccountId}-${AWS::Region}-vectors
+
+    ################################################################################
+    # Lambda CloudWatch Log Groups
+    #
+    # EVERY Lambda in this stack has a declared log group, because otherwise
+    # Lambda auto-creates one with retentionInDays=None (logs kept and billed
+    # forever) that survives stack deletion.
+    #
+    # Four of them (StartBuild, CopySchema, GatewayTool, AdminTool) reach their
+    # group through LoggingConfig.LogGroup, which DECOUPLES the group name from
+    # the function name. Two different reasons, same mechanism:
+    #
+    #   StartBuild / CopySchema are UNNAMED — CFN generates the function name,
+    #   so /aws/lambda/{name} is unknowable at author time.
+    #
+    #   GatewayTool / AdminTool are NAMED, but their /aws/lambda/{FunctionName}
+    #   groups ALREADY EXIST in deployed stacks, auto-created by Lambda before
+    #   this template ever declared them. Declaring the canonical name fails the
+    #   update at pre-flight validation ("Validation failed with 2 error(s)",
+    #   with no per-resource event naming the culprit — measured on m2cv4). CFN
+    #   cannot skip a resource that already exists: Conditions evaluate from
+    #   parameters and pseudo-parameters only, never a runtime lookup. So these
+    #   two use a "-log" SUFFIXED group and leave the auto-created ones to be
+    #   swept by hand. The alternative — a custom resource that deletes the old
+    #   group on update — would destroy real logs and put a deletion path in
+    #   every future update.
+    #
+    # The remaining five (Indexer, Rebuild, Search, StreamHandler,
+    # HandleExecutionFailure) declare /aws/lambda/{FunctionName} directly and
+    # MUST KEEP IT. Their groups were already stack-owned before this pattern
+    # existed, and LogGroupName is a createOnlyProperty — so renaming them for
+    # uniformity REPLACES the resource and CFN deletes the old group with all
+    # its logs. Measured: renaming a stack-owned group leaves nothing behind.
+    # Consistency is not worth deleting production logs for.
+    #
+    # Every Lambda, whichever pattern, needs DependsOn its group, or Lambda's
+    # first invocation races CFN and creates an unmanaged group.
+    ################################################################################
+    StartBuildLambdaLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub /aws/lambda/${ResourcePrefix}-hybrid-search-start-build
+            RetentionInDays: 7
+
+    CopySchemaLambdaLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub /aws/lambda/${ResourcePrefix}-hybrid-search-copy-schema
+            RetentionInDays: 7
+
+    GatewayToolLambdaLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            # NOT /aws/lambda/{FunctionName} — that name already exists as a
+            # Lambda-auto-created group in deployed stacks and fails the update.
+            # Reached via LoggingConfig, so it only has to be unique.
+            LogGroupName: !Sub /aws/lambda/${ResourcePrefix}-hybrid-search-gateway-tool-log
+            RetentionInDays: 7
+
+    AdminToolLambdaLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            # NOT /aws/lambda/{FunctionName} — that name already exists as a
+            # Lambda-auto-created group in deployed stacks and fails the update.
+            # Reached via LoggingConfig, so it only has to be unique.
+            LogGroupName: !Sub /aws/lambda/${ResourcePrefix}-hybrid-search-admin-tool-log
+            RetentionInDays: 7
+
+    IndexerLambdaLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${name}-${variant}
+                - name: !FindInMap [Lambda, Function, Name]
+                  variant: !FindInMap [Lambda, Indexer, Name]
+            RetentionInDays: 7
+
+    RebuildLambdaLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${name}-${variant}
+                - name: !FindInMap [Lambda, Function, Name]
+                  variant: !FindInMap [Lambda, Rebuild, Name]
+            RetentionInDays: 7
+
+    SearchLambdaLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${name}-${variant}
+                - name: !FindInMap [Lambda, Function, Name]
+                  variant: !FindInMap [Lambda, Search, Name]
+            RetentionInDays: 7
+
+    StreamHandlerLambdaLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${name}-${variant}
+                - name: !FindInMap [Lambda, Function, Name]
+                  variant: !FindInMap [Lambda, StreamHandler, Name]
+            RetentionInDays: 7
+
+    HandleExecutionFailureLambdaLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${name}-${variant}
+                - name: !FindInMap [Lambda, Function, Name]
+                  variant: !FindInMap [Lambda, HandleExecutionFailure, Name]
+            RetentionInDays: 7
+
+    ################################################################################
+    # Lambda Execution Role (shared)
+    ################################################################################
+    HybridSearchLambdaRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W76
+                        reason: Fine-grained permissions for hybrid search workflow
+                    -
+                        id: W11
+                        reason: >
+                            Two statements require wildcard resources by AWS service design:
+                            (1) dynamodb:ListStreams — resource-level permissions not supported by the DynamoDB Streams API.
+                            (2) bedrock:ListFoundationModels — account-level operation, resource-level permissions not supported.
+                            All other statements use specific ARNs.
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service: lambda.amazonaws.com
+                        Action: sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+            Policies:
+                -
+                    PolicyName: HybridSearchLambdaPolicy
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                            # CloudWatch Logs — the groups are stack resources, so
+                            # no logs:CreateLogGroup: these functions must never
+                            # create one. GetAtt on a LogGroup already yields the
+                            # "...:*" ARN form PutLogEvents requires (verified
+                            # against the live deployed policy).
+                            -
+                                Effect: Allow
+                                Action:
+                                    - logs:CreateLogStream
+                                    - logs:PutLogEvents
+                                Resource:
+                                    - !GetAtt IndexerLambdaLogGroup.Arn
+                                    - !GetAtt RebuildLambdaLogGroup.Arn
+                                    - !GetAtt SearchLambdaLogGroup.Arn
+                                    - !GetAtt StreamHandlerLambdaLogGroup.Arn
+                                    - !GetAtt HandleExecutionFailureLambdaLogGroup.Arn
+                            # S3 — read/write LanceDB index files on proxy bucket
+                            -
+                                Effect: Allow
+                                Action:
+                                    - s3:ListBucket
+                                    - s3:ListBucketMultipartUploads
+                                Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            -
+                                Effect: Allow
+                                Action:
+                                    - s3:GetObject
+                                    - s3:PutObject
+                                    - s3:DeleteObject
+                                    - s3:ListMultipartUploadParts
+                                    - s3:AbortMultipartUpload
+                                Resource: !Sub arn:aws:s3:::${ProxyBucket}/*
+                            # DynamoDB — LanceDBIndexState CRUD + streams
+                            -
+                                Effect: Allow
+                                Action:
+                                    - dynamodb:GetItem
+                                    - dynamodb:PutItem
+                                    - dynamodb:UpdateItem
+                                    - dynamodb:DeleteItem
+                                    - dynamodb:Query
+                                    - dynamodb:BatchGetItem
+                                    - dynamodb:BatchWriteItem
+                                Resource:
+                                    - !GetAtt LanceDBIndexStateTable.Arn
+                                    - !Sub ${LanceDBIndexStateTable.Arn}/index/*
+                            # DynamoDB — LanceDBDedupTable CRUD (dedup records, no stream)
+                            -
+                                Effect: Allow
+                                Action:
+                                    - dynamodb:GetItem
+                                    - dynamodb:PutItem
+                                    - dynamodb:DeleteItem
+                                    - dynamodb:Query
+                                    - dynamodb:BatchGetItem
+                                    - dynamodb:BatchWriteItem
+                                Resource:
+                                    - !GetAtt LanceDBDedupTable.Arn
+                                    - !Sub ${LanceDBDedupTable.Arn}/index/*
+                            # DynamoDB — LanceDBSearchHistoryTable (write initial record + update with results)
+                            -
+                                Effect: Allow
+                                Action:
+                                    - dynamodb:PutItem
+                                    - dynamodb:UpdateItem
+                                    - dynamodb:GetItem
+                                Resource:
+                                    - !GetAtt LanceDBSearchHistoryTable.Arn
+                                    - !Sub ${LanceDBSearchHistoryTable.Arn}/index/*
+                            # DynamoDB — LanceDBCollectionTable (resolve collection records)
+                            -
+                                Effect: Allow
+                                Action:
+                                    - dynamodb:GetItem
+                                    - dynamodb:PutItem
+                                    - dynamodb:UpdateItem
+                                    - dynamodb:Scan
+                                Resource: !GetAtt LanceDBCollectionTable.Arn
+                            # S3 Vectors — runtime index create + vector CRUD, scoped
+                            # to the ONE deployment vector bucket
+                            -
+                                Effect: Allow
+                                Action:
+                                    - s3vectors:CreateIndex
+                                    - s3vectors:GetIndex
+                                    - s3vectors:ListIndexes
+                                    - s3vectors:PutVectors
+                                    - s3vectors:QueryVectors
+                                    - s3vectors:GetVectors
+                                    - s3vectors:DeleteVectors
+                                    - s3vectors:DeleteIndex
+                                Resource:
+                                    - !GetAtt HybridSearchVectorBucket.VectorBucketArn
+                                    - !Sub ${HybridSearchVectorBucket.VectorBucketArn}/index/*
+                            -
+                                Effect: Allow
+                                Action: dynamodb:ListStreams
+                                Resource: "*"
+                            -
+                                Effect: Allow
+                                Action:
+                                    - dynamodb:GetRecords
+                                    - dynamodb:GetShardIterator
+                                    - dynamodb:DescribeStream
+                                Resource: !GetAtt LanceDBIndexStateTable.StreamArn
+                            # Step Functions — SendTaskSuccess/Failure for waitForTaskToken.
+                            # Scoped to the index SFN; only IndexerLambda and StreamHandlerLambda
+                            # call these, always to resume a task in HybridSearchIndexSFN.
+                            -
+                                Effect: Allow
+                                Action:
+                                    - states:SendTaskSuccess
+                                    - states:SendTaskFailure
+                                Resource:
+                                    - !Sub
+                                        - arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ResourcePrefix}-${name}
+                                        - name: !FindInMap [Workflow, HybridSearchIndexer, Name]
+                                    - !Sub
+                                        - arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ResourcePrefix}-${name}
+                                        - name: !FindInMap [Workflow, HybridSearchRebuild, Name]
+                            # Bedrock — reserved for future embedding calls (vectors currently
+                            # arrive pre-computed from M2C; this allows future in-Lambda embedding)
+                            -
+                                Effect: Allow
+                                Action: bedrock:ListFoundationModels
+                                Resource: "*"
+                            # Bedrock models
+                            -
+                                Effect: Allow
+                                Action:
+                                    - bedrock:InvokeModel
+                                    # CreateModelInvocationJob requires access to foundation-model
+                                    - bedrock:CreateModelInvocationJob
+                                Resource:
+                                    # Amazon Titan Multimodal Embeddings G1 (No inference profile)
+                                    - arn:aws:bedrock:*::foundation-model/amazon.titan-embed-image-v1
+                                    # Amazon Nova family
+                                    - arn:aws:bedrock:*::foundation-model/amazon.nova-*
+                                    - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*.amazon.nova-*
+                                    # Anthropic Claude family
+                                    - arn:aws:bedrock:*::foundation-model/anthropic.claude-*
+                                    - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*.anthropic.claude-*
+                                    # Cohere Embed family
+                                    - arn:aws:bedrock:*::foundation-model/cohere.embed-*
+                                    - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*.cohere.embed-*
+                                    # TwelveLabs Marengo Embed family
+                                    - arn:aws:bedrock:*::foundation-model/twelvelabs.marengo-embed-*
+                                    - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*.twelvelabs.marengo-embed-*
+                                    # Mistral family
+                                    - arn:aws:bedrock:*::foundation-model/mistral.*
+                                    - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*.mistral.*
+                                    # Meta family
+                                    - arn:aws:bedrock:*::foundation-model/meta.llama*
+                                    - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*.meta.llama*
+                            # Batch invocation job
+                            -
+                                Effect: Allow
+                                Action:
+                                    - bedrock:CreateModelInvocationJob
+                                    - bedrock:GetModelInvocationJob
+                                Resource: !Sub arn:aws:bedrock:*:${AWS::AccountId}:model-invocation-job/*
+                            # Async Invoke
+                            -
+                                Effect: Allow
+                                Action: bedrock:GetAsyncInvoke
+                                Resource:
+                                    # Amazon Nova family
+                                    - !Sub arn:aws:bedrock:*:${AWS::AccountId}:async-invoke/amazon.nova-*
+                                    - !Sub arn:aws:bedrock:*:${AWS::AccountId}:async-invoke/*.amazon.nova-*
+                                    # TwelveLabs Marengo Embed familiy
+                                    - !Sub arn:aws:bedrock:*:${AWS::AccountId}:async-invoke/twelvelabs.marengo-embed-*
+                                    - !Sub arn:aws:bedrock:*:${AWS::AccountId}:async-invoke/*.twelvelabs.marengo-embed-*
+
+    ################################################################################
+    # Lambda Functions
+    # All DependsOn StartBuild to ensure the ECR image exists before creation, and
+    # on their own log group so Lambda's first invocation cannot win the race and
+    # create an unmanaged one under the same name.
+    ################################################################################
+    IndexerLambda:
+        Type: AWS::Lambda::Function
+        DependsOn:
+            - StartBuild
+            - IndexerLambdaLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W89
+                        reason: Workflow not using VPC
+                    -
+                        id: W92
+                        reason: Workflow not limiting simultaneous executions
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${name}-${variant}
+                - name: !FindInMap [Lambda, Function, Name]
+                  variant: !FindInMap [Lambda, Indexer, Name]
+            Description: !Sub
+                - (${ResourcePrefix}) ${desc} — indexer (3008 MB)
+                - desc: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Role: !GetAtt HybridSearchLambdaRole.Arn
+            MemorySize: !FindInMap [Lambda, Indexer, Memory]
+            Timeout: !FindInMap [Lambda, Indexer, Timeout]
+            Architectures:
+                - arm64
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repositoryName}:${imageTag}
+                    - repositoryName: !FindInMap [ECR, Repository, Name]
+                      imageTag: !FindInMap [ECR, Repository, ImageTag]
+            Environment:
+                Variables:
+                    INDEX_STATE_TABLE: !Ref LanceDBIndexStateTable
+                    DEDUP_TABLE: !Ref LanceDBDedupTable
+                    COLLECTION_TABLE: !Ref LanceDBCollectionTable
+                    VECTOR_BUCKET: !Select [1, !Split ["bucket/", !GetAtt HybridSearchVectorBucket.VectorBucketArn]]
+                    PROXY_BUCKET: !Ref ProxyBucket
+            TracingConfig:
+                Mode: Active
+
+    RebuildLambda:
+        Type: AWS::Lambda::Function
+        DependsOn:
+            - StartBuild
+            - RebuildLambdaLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W89
+                        reason: Workflow not using VPC
+                    -
+                        id: W92
+                        reason: Workflow not limiting simultaneous executions
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${name}-${variant}
+                - name: !FindInMap [Lambda, Function, Name]
+                  variant: !FindInMap [Lambda, Rebuild, Name]
+            Description: !Sub
+                - (${ResourcePrefix}) ${desc} — rebuild (3008 MB)
+                - desc: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Role: !GetAtt HybridSearchLambdaRole.Arn
+            MemorySize: !FindInMap [Lambda, Rebuild, Memory]
+            Timeout: !FindInMap [Lambda, Rebuild, Timeout]
+            Architectures:
+                - arm64
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repositoryName}:${imageTag}
+                    - repositoryName: !FindInMap [ECR, Repository, Name]
+                      imageTag: !FindInMap [ECR, Repository, ImageTag]
+            Environment:
+                Variables:
+                    INDEX_STATE_TABLE: !Ref LanceDBIndexStateTable
+                    DEDUP_TABLE: !Ref LanceDBDedupTable
+                    COLLECTION_TABLE: !Ref LanceDBCollectionTable
+                    VECTOR_BUCKET: !Select [1, !Split ["bucket/", !GetAtt HybridSearchVectorBucket.VectorBucketArn]]
+                    PROXY_BUCKET: !Ref ProxyBucket
+            TracingConfig:
+                Mode: Active
+
+    SearchLambda:
+        Type: AWS::Lambda::Function
+        DependsOn:
+            - StartBuild
+            - SearchLambdaLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W89
+                        reason: Workflow not using VPC
+                    -
+                        id: W92
+                        reason: Workflow not limiting simultaneous executions
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${name}-${variant}
+                - name: !FindInMap [Lambda, Function, Name]
+                  variant: !FindInMap [Lambda, Search, Name]
+            Description: !Sub
+                - (${ResourcePrefix}) ${desc} — search (1024 MB)
+                - desc: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Role: !GetAtt HybridSearchLambdaRole.Arn
+            MemorySize: !FindInMap [Lambda, Search, Memory]
+            Timeout: !FindInMap [Lambda, Search, Timeout]
+            Architectures:
+                - arm64
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repositoryName}:${imageTag}
+                    - repositoryName: !FindInMap [ECR, Repository, Name]
+                      imageTag: !FindInMap [ECR, Repository, ImageTag]
+            Environment:
+                Variables:
+                    INDEX_STATE_TABLE: !Ref LanceDBIndexStateTable
+                    DEDUP_TABLE: !Ref LanceDBDedupTable
+                    COLLECTION_TABLE: !Ref LanceDBCollectionTable
+                    VECTOR_BUCKET: !Select [1, !Split ["bucket/", !GetAtt HybridSearchVectorBucket.VectorBucketArn]]
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    SEARCH_HISTORY_TABLE: !Ref LanceDBSearchHistoryTable
+                    SEARCH_HISTORY_TTL_DAYS: "7"
+            TracingConfig:
+                Mode: Active
+
+    StreamHandlerLambda:
+        Type: AWS::Lambda::Function
+        DependsOn:
+            - StartBuild
+            - StreamHandlerLambdaLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W89
+                        reason: Workflow not using VPC
+                    -
+                        id: W92
+                        reason: Workflow not limiting simultaneous executions
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${name}-${variant}
+                - name: !FindInMap [Lambda, Function, Name]
+                  variant: !FindInMap [Lambda, StreamHandler, Name]
+            Description: !Sub
+                - (${ResourcePrefix}) ${desc} — DDB stream handler, unblocks pending index jobs on lock release
+                - desc: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Role: !GetAtt HybridSearchLambdaRole.Arn
+            MemorySize: !FindInMap [Lambda, StreamHandler, Memory]
+            Timeout: !FindInMap [Lambda, StreamHandler, Timeout]
+            Architectures:
+                - arm64
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repositoryName}:${imageTag}
+                    - repositoryName: !FindInMap [ECR, Repository, Name]
+                      imageTag: !FindInMap [ECR, Repository, ImageTag]
+            Environment:
+                Variables:
+                    INDEX_STATE_TABLE: !Ref LanceDBIndexStateTable
+                    DEDUP_TABLE: !Ref LanceDBDedupTable
+                    COLLECTION_TABLE: !Ref LanceDBCollectionTable
+                    VECTOR_BUCKET: !Select [1, !Split ["bucket/", !GetAtt HybridSearchVectorBucket.VectorBucketArn]]
+                    PROXY_BUCKET: !Ref ProxyBucket
+            TracingConfig:
+                Mode: Active
+
+    HandleExecutionFailureLambda:
+        Type: AWS::Lambda::Function
+        DependsOn:
+            - StartBuild
+            - HandleExecutionFailureLambdaLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W89
+                        reason: Workflow not using VPC
+                    -
+                        id: W92
+                        reason: Workflow not limiting simultaneous executions
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${name}-${variant}
+                - name: !FindInMap [Lambda, Function, Name]
+                  variant: !FindInMap [Lambda, HandleExecutionFailure, Name]
+            Description: !Sub
+                - (${ResourcePrefix}) ${desc} — EventBridge failure handler, releases lock on SFN FAILED/ABORTED/TIMED_OUT
+                - desc: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Role: !GetAtt HybridSearchLambdaRole.Arn
+            MemorySize: !FindInMap [Lambda, HandleExecutionFailure, Memory]
+            Timeout: !FindInMap [Lambda, HandleExecutionFailure, Timeout]
+            Architectures:
+                - arm64
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repositoryName}:${imageTag}
+                    - repositoryName: !FindInMap [ECR, Repository, Name]
+                      imageTag: !FindInMap [ECR, Repository, ImageTag]
+            Environment:
+                Variables:
+                    INDEX_STATE_TABLE: !Ref LanceDBIndexStateTable
+                    DEDUP_TABLE: !Ref LanceDBDedupTable
+                    COLLECTION_TABLE: !Ref LanceDBCollectionTable
+                    VECTOR_BUCKET: !Select [1, !Split ["bucket/", !GetAtt HybridSearchVectorBucket.VectorBucketArn]]
+                    PROXY_BUCKET: !Ref ProxyBucket
+            TracingConfig:
+                Mode: Active
+
+    ################################################################################
+    # DynamoDB Stream → StreamHandlerLambda event source mapping
+    ################################################################################
+    StreamHandlerEventSourceMapping:
+        Type: AWS::Lambda::EventSourceMapping
+        Properties:
+            EventSourceArn: !GetAtt LanceDBIndexStateTable.StreamArn
+            FunctionName: !GetAtt StreamHandlerLambda.Arn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+            BisectBatchOnFunctionError: true
+            MaximumRetryAttempts: 3
+            FilterCriteria:
+                Filters:
+                    -
+                        # Only trigger on REMOVE of the lock item (pk="lock").
+                        # Dedup records live in LanceDBDedupTable — no stream there.
+                        Pattern: '{"eventName": ["REMOVE"], "dynamodb": {"Keys": {"pk": {"S": ["lock"]}}}}'
+
+    ################################################################################
+    # Step Functions Log Groups
+    ################################################################################
+    IndexSFNLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/states/${ResourcePrefix}-${name}
+                - name: !FindInMap [Workflow, HybridSearchIndexer, Name]
+            RetentionInDays: 7
+
+    RebuildSFNLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/states/${ResourcePrefix}-${name}
+                - name: !FindInMap [Workflow, HybridSearchRebuild, Name]
+            RetentionInDays: 7
+
+    SearchSFNLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/states/${ResourcePrefix}-${name}
+                - name: !FindInMap [Workflow, HybridSearchSearch, Name]
+            RetentionInDays: 7
+
+    ################################################################################
+    # Step Functions Execution Role
+    ################################################################################
+    HybridSearchSFNRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W11
+                        reason: X-ray tracing and CloudWatch Logs delivery require wildcard resource
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -
+                        Effect: Allow
+                        Action: sts:AssumeRole
+                        Principal:
+                            Service: !Sub states.${AWS::Region}.amazonaws.com
+            Policies:
+                -
+                    PolicyName: !Sub ${ResourcePrefix}HybridSearchSFNPolicy
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                            -
+                                Effect: Allow
+                                Action: lambda:InvokeFunction
+                                Resource:
+                                    - !GetAtt IndexerLambda.Arn
+                                    - !GetAtt RebuildLambda.Arn
+                                    - !GetAtt SearchLambda.Arn
+                            -
+                                Effect: Allow
+                                Action:
+                                    - logs:CreateLogDelivery
+                                    - logs:GetLogDelivery
+                                    - logs:UpdateLogDelivery
+                                    - logs:DeleteLogDelivery
+                                    - logs:ListLogDeliveries
+                                    - logs:PutLogEvents
+                                    - logs:PutResourcePolicy
+                                    - logs:DescribeResourcePolicies
+                                    - logs:DescribeLogGroups
+                                Resource: "*"
+                            -
+                                Effect: Allow
+                                Action:
+                                    - xray:PutTraceSegments
+                                    - xray:PutTelemetryRecords
+                                    - xray:GetSamplingRules
+                                    - xray:GetSamplingTargets
+                                Resource: "*"
+
+    ################################################################################
+    # Step Functions State Machines
+    ################################################################################
+    HybridSearchIndexSFN:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            StateMachineName: !Sub
+                - ${ResourcePrefix}-${name}
+                - name: !FindInMap [Workflow, HybridSearchIndexer, Name]
+            RoleArn: !GetAtt HybridSearchSFNRole.Arn
+            LoggingConfiguration:
+                Destinations:
+                    -
+                        CloudWatchLogsLogGroup:
+                            LogGroupArn: !GetAtt IndexSFNLogGroup.Arn
+                IncludeExecutionData: true
+                Level: ALL
+            TracingConfiguration:
+                Enabled: true
+            DefinitionSubstitutions:
+                IndexerLambdaArn: !GetAtt IndexerLambda.Arn
+            DefinitionString: |-
+                {
+                    "Comment": "Hybrid search index workflow (README.md Design record). Prepare documents (contracts -> row groups, lock-free), then per-physical-table Map: acquire THAT table's lock (waitForTaskToken) -> index -> release. Writers to different tables never contend.",
+                    "StartAt": "Set input defaults",
+                    "States": {
+                        "Set input defaults": {
+                            "Type": "Pass",
+                            "Comment": "Merge optional fields with defaults so downstream JSONPath never references absent keys. Exactly one of documents | documents_s3uri must be non-empty (validated in StatePrepareDocuments).",
+                            "Parameters": {
+                                "merged.$": "States.JsonMerge(States.StringToJson('{\"collection_id\":\"\",\"documents\":[],\"documents_s3uri\":\"\",\"asset_metadata\":{},\"workflow_config_uri\":\"\"}'), $$.Execution.Input, false)"
+                            },
+                            "ResultPath": "$.input",
+                            "Next": "Prepare documents"
+                        },
+                        "Prepare documents": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                                "FunctionName": "${IndexerLambdaArn}",
+                                "Payload": {
+                                    "operation": "StatePrepareDocuments",
+                                    "request_id.$": "$$.Execution.Name",
+                                    "collection_id.$": "$.input.merged.collection_id",
+                                    "documents.$": "$.input.merged.documents",
+                                    "documents_s3uri.$": "$.input.merged.documents_s3uri",
+                                    "asset_metadata.$": "$.input.merged.asset_metadata",
+                                    "workflow_config_uri.$": "$.input.merged.workflow_config_uri"
+                                }
+                            },
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "LambdaResourceTimeoutException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 6,
+                                    "BackoffRate": 1.0
+                                },
+                                {
+                                    "ErrorEquals": [
+                                        "ThrottlingException",
+                                        "ServiceUnavailableException",
+                                        "InternalServerException",
+                                        "ModelTimeoutException",
+                                        "ModelNotReadyException",
+                                        "ServiceQuotaExceededException"
+                                    ],
+                                    "IntervalSeconds": 5,
+                                    "MaxAttempts": 4,
+                                    "BackoffRate": 2
+                                },
+                                {
+                                    "ErrorEquals": [
+                                        "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException",
+                                        "Lambda.SdkClientException",
+                                        "Lambda.TooManyRequestsException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 3,
+                                    "BackoffRate": 1.5
+                                },
+                                {
+                                    "ErrorEquals": [
+                                        "Sandbox.Timedout",
+                                        "Lambda.Unknown"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 2,
+                                    "BackoffRate": 2
+                                }
+                            ],
+                            "Next": "(Map) Index tables"
+                        },
+                        "(Map) Index tables": {
+                            "Type": "Map",
+                            "MaxConcurrency": 8,
+                            "ItemsPath": "$.map_items",
+                            "ItemSelector": {
+                                "item.$": "$$.Map.Item.Value",
+                                "execution_arn.$": "$$.Execution.Id"
+                            },
+                            "ItemProcessor": {
+                                "ProcessorConfig": {
+                                    "Mode": "INLINE"
+                                },
+                                "StartAt": "Acquire table lock",
+                                "States": {
+                                    "Acquire table lock": {
+                                        "Type": "Task",
+                                        "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                                        "ResultPath": "$.lock_result",
+                                        "Parameters": {
+                                            "FunctionName": "${IndexerLambdaArn}",
+                                            "Payload": {
+                                                "operation": "StateAcquireLock",
+                                                "index_key.$": "$.item.index_key",
+                                                "execution_arn.$": "$.execution_arn",
+                                                "task_token.$": "$$.Task.Token",
+                                                "uuid.$": "$.item.index_key"
+                                            }
+                                        },
+                                        "HeartbeatSeconds": 21600,
+                                        "Retry": [
+                                            {
+                                                "ErrorEquals": [
+                                                    "Lambda.ServiceException",
+                                                    "Lambda.AWSLambdaException",
+                                                    "Lambda.SdkClientException",
+                                                    "Lambda.TooManyRequestsException"
+                                                ],
+                                                "IntervalSeconds": 2,
+                                                "MaxAttempts": 3,
+                                                "BackoffRate": 1.5
+                                            }
+                                        ],
+                                        "Next": "Index table"
+                                    },
+                                    "Index table": {
+                                        "Type": "Task",
+                                        "Resource": "arn:aws:states:::lambda:invoke",
+                                        "ResultPath": "$.index_result",
+                                        "ResultSelector": {
+                                            "indexed.$": "$.Payload.indexed"
+                                        },
+                                        "Parameters": {
+                                            "FunctionName": "${IndexerLambdaArn}",
+                                            "Payload": {
+                                                "operation": "StateIndexDocuments",
+                                                "index_key.$": "$.item.index_key",
+                                                "rows_s3_key.$": "$.item.rows_s3_key",
+                                                "collection_id.$": "$.item.collection_id"
+                                            }
+                                        },
+                                        "Retry": [
+                                            {
+                                                "ErrorEquals": [
+                                                    "Lambda.ServiceException",
+                                                    "Lambda.AWSLambdaException",
+                                                    "Lambda.SdkClientException",
+                                                    "Lambda.TooManyRequestsException"
+                                                ],
+                                                "IntervalSeconds": 2,
+                                                "MaxAttempts": 3,
+                                                "BackoffRate": 1.5
+                                            },
+                                            {
+                                                "ErrorEquals": [
+                                                    "States.TaskFailed",
+                                                    "States.Timeout"
+                                                ],
+                                                "IntervalSeconds": 15,
+                                                "MaxAttempts": 2,
+                                                "BackoffRate": 2.0
+                                            }
+                                        ],
+                                        "Catch": [
+                                            {
+                                                "ErrorEquals": [
+                                                    "States.ALL"
+                                                ],
+                                                "ResultPath": "$.index_error",
+                                                "Next": "Release table lock (on error)"
+                                            }
+                                        ],
+                                        "Next": "Release table lock"
+                                    },
+                                    "Release table lock": {
+                                        "Type": "Task",
+                                        "Resource": "arn:aws:states:::lambda:invoke",
+                                        "ResultPath": null,
+                                        "Parameters": {
+                                            "FunctionName": "${IndexerLambdaArn}",
+                                            "Payload": {
+                                                "operation": "StateReleaseLock",
+                                                "index_key.$": "$.item.index_key",
+                                                "execution_arn.$": "$.execution_arn"
+                                            }
+                                        },
+                                        "Retry": [
+                                            {
+                                                "ErrorEquals": [
+                                                    "Lambda.ServiceException",
+                                                    "Lambda.AWSLambdaException",
+                                                    "Lambda.SdkClientException",
+                                                    "Lambda.TooManyRequestsException"
+                                                ],
+                                                "IntervalSeconds": 2,
+                                                "MaxAttempts": 3,
+                                                "BackoffRate": 1.5
+                                            }
+                                        ],
+                                        "End": true
+                                    },
+                                    "Release table lock (on error)": {
+                                        "Type": "Task",
+                                        "Resource": "arn:aws:states:::lambda:invoke",
+                                        "ResultPath": null,
+                                        "Parameters": {
+                                            "FunctionName": "${IndexerLambdaArn}",
+                                            "Payload": {
+                                                "operation": "StateReleaseLock",
+                                                "index_key.$": "$.item.index_key",
+                                                "execution_arn.$": "$.execution_arn"
+                                            }
+                                        },
+                                        "Retry": [
+                                            {
+                                                "ErrorEquals": [
+                                                    "Lambda.ServiceException",
+                                                    "Lambda.AWSLambdaException",
+                                                    "Lambda.SdkClientException",
+                                                    "Lambda.TooManyRequestsException"
+                                                ],
+                                                "IntervalSeconds": 2,
+                                                "MaxAttempts": 3,
+                                                "BackoffRate": 1.5
+                                            }
+                                        ],
+                                        "Next": "Fail table"
+                                    },
+                                    "Fail table": {
+                                        "Type": "Fail",
+                                        "Error": "IndexTableFailed",
+                                        "Cause": "StateIndexDocuments failed after releasing the table lock"
+                                    }
+                                }
+                            },
+                            "ResultPath": "$.index_results",
+                            "End": true
+                        }
+                    }
+                }
+
+    HybridSearchRebuildSFN:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            StateMachineName: !Sub
+                - ${ResourcePrefix}-${name}
+                - name: !FindInMap [Workflow, HybridSearchRebuild, Name]
+            RoleArn: !GetAtt HybridSearchSFNRole.Arn
+            LoggingConfiguration:
+                Destinations:
+                    -
+                        CloudWatchLogsLogGroup:
+                            LogGroupArn: !GetAtt RebuildSFNLogGroup.Arn
+                IncludeExecutionData: true
+                Level: ALL
+            TracingConfiguration:
+                Enabled: true
+            DefinitionSubstitutions:
+                RebuildLambdaArn: !GetAtt RebuildLambda.Arn
+            DefinitionString: |-
+                {
+                    "Comment": "Hybrid search ANN rebuild (README.md Design record). Per-physical-table Map: acquire THAT table's lock (LockHeldError retry, never queues) -> optimize + IVF_PQ rebuild -> release. Rebuilds across collections/tables run concurrently.",
+                    "StartAt": "Get indices to rebuild",
+                    "States": {
+                        "Get indices to rebuild": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "ResultSelector": {
+                                "index_keys.$": "$.Payload"
+                            },
+                            "ResultPath": "$",
+                            "Parameters": {
+                                "FunctionName": "${RebuildLambdaArn}",
+                                "Payload": {
+                                    "operation": "StateGetIndicesToRebuild",
+                                    "force.$": "$.force"
+                                }
+                            },
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException",
+                                        "Lambda.SdkClientException",
+                                        "Lambda.TooManyRequestsException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 3,
+                                    "BackoffRate": 1.5
+                                }
+                            ],
+                            "Next": "(Map) Rebuild tables"
+                        },
+                        "(Map) Rebuild tables": {
+                            "Type": "Map",
+                            "MaxConcurrency": 8,
+                            "ItemsPath": "$.index_keys",
+                            "ItemSelector": {
+                                "index_key.$": "$$.Map.Item.Value",
+                                "force.$": "$$.Execution.Input.force",
+                                "execution_arn.$": "$$.Execution.Id"
+                            },
+                            "ItemProcessor": {
+                                "ProcessorConfig": {
+                                    "Mode": "INLINE"
+                                },
+                                "StartAt": "Acquire table lock",
+                                "States": {
+                                    "Acquire table lock": {
+                                        "Type": "Task",
+                                        "Resource": "arn:aws:states:::lambda:invoke",
+                                        "ResultPath": null,
+                                        "Parameters": {
+                                            "FunctionName": "${RebuildLambdaArn}",
+                                            "Payload": {
+                                                "operation": "StateAcquireLock",
+                                                "index_key.$": "$.index_key",
+                                                "execution_arn.$": "$.execution_arn"
+                                            }
+                                        },
+                                        "Retry": [
+                                            {
+                                                "ErrorEquals": [
+                                                    "LockHeldError",
+                                                    "RuntimeError"
+                                                ],
+                                                "IntervalSeconds": 60,
+                                                "MaxAttempts": 10,
+                                                "BackoffRate": 1
+                                            },
+                                            {
+                                                "ErrorEquals": [
+                                                    "Lambda.ServiceException",
+                                                    "Lambda.AWSLambdaException",
+                                                    "Lambda.SdkClientException",
+                                                    "Lambda.TooManyRequestsException"
+                                                ],
+                                                "IntervalSeconds": 5,
+                                                "MaxAttempts": 3,
+                                                "BackoffRate": 1.5
+                                            }
+                                        ],
+                                        "Next": "Rebuild table"
+                                    },
+                                    "Rebuild table": {
+                                        "Type": "Task",
+                                        "Resource": "arn:aws:states:::lambda:invoke",
+                                        "ResultPath": "$.rebuild_result",
+                                        "ResultSelector": {
+                                            "skipped.$": "$.Payload.skipped"
+                                        },
+                                        "Parameters": {
+                                            "FunctionName": "${RebuildLambdaArn}",
+                                            "Payload": {
+                                                "operation": "StateRebuildIndex",
+                                                "index_key.$": "$.index_key",
+                                                "force.$": "$.force"
+                                            }
+                                        },
+                                        "Retry": [
+                                            {
+                                                "ErrorEquals": [
+                                                    "Lambda.ServiceException",
+                                                    "Lambda.AWSLambdaException",
+                                                    "Lambda.SdkClientException",
+                                                    "Lambda.TooManyRequestsException"
+                                                ],
+                                                "IntervalSeconds": 5,
+                                                "MaxAttempts": 3,
+                                                "BackoffRate": 1.5
+                                            }
+                                        ],
+                                        "Catch": [
+                                            {
+                                                "ErrorEquals": [
+                                                    "States.ALL"
+                                                ],
+                                                "ResultPath": "$.rebuild_error",
+                                                "Next": "Release table lock (on error)"
+                                            }
+                                        ],
+                                        "Next": "Release table lock"
+                                    },
+                                    "Release table lock": {
+                                        "Type": "Task",
+                                        "Resource": "arn:aws:states:::lambda:invoke",
+                                        "ResultPath": null,
+                                        "Parameters": {
+                                            "FunctionName": "${RebuildLambdaArn}",
+                                            "Payload": {
+                                                "operation": "StateReleaseLock",
+                                                "index_key.$": "$.index_key",
+                                                "execution_arn.$": "$.execution_arn"
+                                            }
+                                        },
+                                        "Retry": [
+                                            {
+                                                "ErrorEquals": [
+                                                    "Lambda.ServiceException",
+                                                    "Lambda.AWSLambdaException",
+                                                    "Lambda.SdkClientException",
+                                                    "Lambda.TooManyRequestsException"
+                                                ],
+                                                "IntervalSeconds": 2,
+                                                "MaxAttempts": 3,
+                                                "BackoffRate": 1.5
+                                            }
+                                        ],
+                                        "End": true
+                                    },
+                                    "Release table lock (on error)": {
+                                        "Type": "Task",
+                                        "Resource": "arn:aws:states:::lambda:invoke",
+                                        "ResultPath": null,
+                                        "Parameters": {
+                                            "FunctionName": "${RebuildLambdaArn}",
+                                            "Payload": {
+                                                "operation": "StateReleaseLock",
+                                                "index_key.$": "$.index_key",
+                                                "execution_arn.$": "$.execution_arn"
+                                            }
+                                        },
+                                        "Retry": [
+                                            {
+                                                "ErrorEquals": [
+                                                    "Lambda.ServiceException",
+                                                    "Lambda.AWSLambdaException",
+                                                    "Lambda.SdkClientException",
+                                                    "Lambda.TooManyRequestsException"
+                                                ],
+                                                "IntervalSeconds": 2,
+                                                "MaxAttempts": 3,
+                                                "BackoffRate": 1.5
+                                            }
+                                        ],
+                                        "Next": "Fail table"
+                                    },
+                                    "Fail table": {
+                                        "Type": "Fail",
+                                        "Error": "RebuildTableFailed",
+                                        "Cause": "StateRebuildIndex failed after releasing the table lock"
+                                    }
+                                }
+                            },
+                            "ResultPath": "$.rebuild_results",
+                            "End": true
+                        }
+                    }
+                }
+
+
+    ################################################################################
+    # Step Functions — Search SFN
+    ################################################################################
+    HybridSearchSearchSFN:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            StateMachineName: !Sub
+                - ${ResourcePrefix}-${name}
+                - name: !FindInMap [Workflow, HybridSearchSearch, Name]
+            RoleArn: !GetAtt HybridSearchSFNRole.Arn
+            LoggingConfiguration:
+                Destinations:
+                    -
+                        CloudWatchLogsLogGroup:
+                            LogGroupArn: !GetAtt SearchSFNLogGroup.Arn
+                IncludeExecutionData: true
+                Level: ALL
+            TracingConfiguration:
+                Enabled: true
+            DefinitionSubstitutions:
+                SearchLambdaArn: !GetAtt SearchLambda.Arn
+            DefinitionString: |-
+                {
+                    "Comment": "Hybrid search workflow. Decomposes query (operator parsing + SLM entity extraction + embedding), fans out per-index searches in parallel, reranks with weights from decomposition.",
+                    "StartAt": "Set input defaults",
+                    "States": {
+                        "Set input defaults": {
+                            "Type": "Pass",
+                            "Comment": "Merge optional fields (search_term, search_image_s3uri) with empty-string defaults so downstream states never reference absent keys.",
+                            "Parameters": {
+                                "merged.$": "States.JsonMerge(States.StringToJson('{\"collection_id\":\"\",\"workflow_config_uri\":\"\",\"search_term\":\"\",\"search_image_s3uri\":\"\",\"k\":10}'), $$.Execution.Input, false)"
+                            },
+                            "ResultPath": "$.input",
+                            "Next": "Decompose search request"
+                        },
+                        "Decompose search request": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "ResultSelector": {
+                                "decomposition.$": "$.Payload"
+                            },
+                            "ResultPath": "$.decompose_result",
+                            "Parameters": {
+                                "FunctionName": "${SearchLambdaArn}",
+                                "Payload": {
+                                    "operation": "StateDecomposeSearchRequest",
+                                    "request_id.$": "$$.Execution.Name",
+                                    "workflow_config_uri.$": "$.input.merged.workflow_config_uri",
+                                    "search_term.$": "$.input.merged.search_term",
+                                    "search_image_s3uri.$": "$.input.merged.search_image_s3uri",
+                                    "k.$": "$.input.merged.k",
+                                    "collection_id.$": "$.input.merged.collection_id"
+                                }
+                            },
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException",
+                                        "Lambda.SdkClientException",
+                                        "Lambda.TooManyRequestsException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 3,
+                                    "BackoffRate": 1.5
+                                }
+                            ],
+                            "Next": "(Map) Search indices"
+                        },
+                        "(Map) Search indices": {
+                            "Type": "Map",
+                            "MaxConcurrency": 0,
+                            "ItemsPath": "$.decompose_result.decomposition.queries",
+                            "ItemSelector": {
+                                "operation": "StateSearchIndex",
+                                "query.$": "$$.Map.Item.Value"
+                            },
+                            "ItemProcessor": {
+                                "ProcessorConfig": {
+                                    "Mode": "INLINE"
+                                },
+                                "StartAt": "Search index",
+                                "States": {
+                                    "Search index": {
+                                        "Type": "Task",
+                                        "Resource": "arn:aws:states:::lambda:invoke",
+                                        "OutputPath": "$.Payload",
+                                        "Parameters": {
+                                            "FunctionName": "${SearchLambdaArn}",
+                                            "Payload.$": "$"
+                                        },
+                                        "Retry": [
+                                            {
+                                                "ErrorEquals": [
+                                                    "Lambda.ServiceException",
+                                                    "Lambda.AWSLambdaException",
+                                                    "Lambda.SdkClientException",
+                                                    "Lambda.TooManyRequestsException"
+                                                ],
+                                                "IntervalSeconds": 1,
+                                                "MaxAttempts": 2,
+                                                "BackoffRate": 1
+                                            }
+                                        ],
+                                        "End": true
+                                    }
+                                }
+                            },
+                            "ResultPath": "$.search_results",
+                            "Next": "Rerank results"
+                        },
+                        "Rerank results": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                                "FunctionName": "${SearchLambdaArn}",
+                                "Payload": {
+                                    "operation": "StateRerankResults",
+                                    "search_term.$": "$.decompose_result.decomposition.original_query",
+                                    "k.$": "$.input.merged.k",
+                                    "decomposition.$": "$.decompose_result.decomposition",
+                                    "search_results.$": "$.search_results"
+                                }
+                            },
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException",
+                                        "Lambda.SdkClientException",
+                                        "Lambda.TooManyRequestsException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 3,
+                                    "BackoffRate": 1.5
+                                }
+                            ],
+                            "End": true
+                        }
+                    }
+                }
+
+
+    ################################################################################
+    # EventBridge — daily ANN rebuild at 02:00 UTC
+    ################################################################################
+    RebuildScheduleRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service: events.amazonaws.com
+                        Action: sts:AssumeRole
+            Policies:
+                -
+                    PolicyName: !Sub ${ResourcePrefix}HybridSearchRebuildSchedulePolicy
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                            -
+                                Effect: Allow
+                                Action: states:StartExecution
+                                Resource: !GetAtt HybridSearchRebuildSFN.Arn
+
+    DailyRebuildRule:
+        Type: AWS::Events::Rule
+        Properties:
+            Name: !Sub ${ResourcePrefix}-hybrid-search-daily-rebuild
+            Description: Trigger hybrid search ANN index rebuild daily at 02:00 UTC
+            ScheduleExpression: "cron(0 2 * * ? *)"
+            State: ENABLED
+            Targets:
+                -
+                    Id: HybridSearchRebuildSFN
+                    Arn: !GetAtt HybridSearchRebuildSFN.Arn
+                    RoleArn: !GetAtt RebuildScheduleRole.Arn
+                    Input: '{"force": false}'
+
+    ################################################################################
+    # EventBridge — SFN execution failure handler
+    # Triggers HandleExecutionFailureLambda on FAILED, ABORTED, or TIMED_OUT for
+    # either HybridSearchIndexSFN or HybridSearchRebuildSFN.
+    # The Lambda releases the distributed lock if the failed execution owns it.
+    ################################################################################
+    SFNFailureRule:
+        Type: AWS::Events::Rule
+        Properties:
+            Name: !Sub ${ResourcePrefix}-hybrid-search-sfn-failure
+            Description: Release LanceDB lock when IndexSFN or RebuildSFN fails, aborts, or times out
+            EventPattern:
+                source:
+                    - aws.states
+                detail-type:
+                    - Step Functions Execution Status Change
+                detail:
+                    status:
+                        - FAILED
+                        - ABORTED
+                        - TIMED_OUT
+                    stateMachineArn:
+                        - !GetAtt HybridSearchIndexSFN.Arn
+                        - !GetAtt HybridSearchRebuildSFN.Arn
+                        - !GetAtt HybridSearchSearchSFN.Arn
+            State: ENABLED
+            Targets:
+                -
+                    Id: HandleExecutionFailureLambda
+                    Arn: !GetAtt HandleExecutionFailureLambda.Arn
+
+    SFNFailureRuleLambdaPermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !GetAtt HandleExecutionFailureLambda.Arn
+            Action: lambda:InvokeFunction
+            Principal: events.amazonaws.com
+            SourceArn: !GetAtt SFNFailureRule.Arn
+
+    ################################################################################
+    # Gateway tool Lambdas (Phase 2) — NORMAL and ADMIN targets.
+    # The admin/normal split is an IAM boundary: two Lambdas, two roles, two
+    # AgentCore Gateway targets. Normal agents' gateway cannot invoke admin.
+    ################################################################################
+    GatewayToolLambdaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service: lambda.amazonaws.com
+                        Action: sts:AssumeRole
+            Policies:
+                -
+                    PolicyName: GatewayToolPolicy
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                            # Scoped to the declared group; no logs:CreateLogGroup.
+                            -
+                                Effect: Allow
+                                Action:
+                                    - logs:CreateLogStream
+                                    - logs:PutLogEvents
+                                Resource: !GetAtt GatewayToolLambdaLogGroup.Arn
+                            # Start + poll the Index and Search SFNs
+                            -
+                                Effect: Allow
+                                Action:
+                                    - states:StartExecution
+                                Resource:
+                                    - !GetAtt HybridSearchIndexSFN.Arn
+                                    - !GetAtt HybridSearchSearchSFN.Arn
+                            -
+                                Effect: Allow
+                                Action:
+                                    - states:DescribeExecution
+                                Resource:
+                                    - !Sub
+                                        - arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${name}:*
+                                        - name: !Select [6, !Split [":", !GetAtt HybridSearchIndexSFN.Arn]]
+                                    - !Sub
+                                        - arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${name}:*
+                                        - name: !Select [6, !Split [":", !GetAtt HybridSearchSearchSFN.Arn]]
+                            # create_collection (conditional put) + list_collections
+                            -
+                                Effect: Allow
+                                Action:
+                                    - dynamodb:GetItem
+                                    - dynamodb:PutItem
+                                    - dynamodb:Scan
+                                Resource: !GetAtt LanceDBCollectionTable.Arn
+                            # list_collections index summary (state records)
+                            -
+                                Effect: Allow
+                                Action: dynamodb:Query
+                                Resource: !GetAtt LanceDBIndexStateTable.Arn
+
+    GatewayToolLambda:
+        Type: AWS::Lambda::Function
+        DependsOn: GatewayToolLambdaLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - { id: W89, reason: Not using VPC }
+                    - { id: W92, reason: No reserved concurrency required }
+        Properties:
+            FunctionName: !Sub ${ResourcePrefix}-hybrid-search-gateway-tool
+            Description: AgentCore Gateway dispatcher for hybrid-search (normal callers)
+            Runtime: python3.13
+            Architectures: [arm64]
+            Handler: lambda_function.lambda_handler
+            MemorySize: 256
+            Timeout: 90
+            Role: !GetAtt GatewayToolLambdaRole.Arn
+            LoggingConfig:
+                LogGroup: !Ref GatewayToolLambdaLogGroup
+            Code:
+                S3Bucket: !FindInMap [GatewayTool, Lambda, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${package}
+                    - keyPrefix: !FindInMap [GatewayTool, Lambda, KeyPrefix]
+                      package: !FindInMap [GatewayTool, Lambda, Package]
+            Environment:
+                Variables:
+                    INDEX_STATE_MACHINE_ARN: !GetAtt HybridSearchIndexSFN.Arn
+                    SEARCH_STATE_MACHINE_ARN: !GetAtt HybridSearchSearchSFN.Arn
+                    COLLECTION_TABLE: !Ref LanceDBCollectionTable
+                    INDEX_STATE_TABLE: !Ref LanceDBIndexStateTable
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    TOOL_VERSION: "%%VERSION%%"
+
+    GatewayToolLambdaPermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !GetAtt GatewayToolLambda.Arn
+            Action: lambda:InvokeFunction
+            Principal: bedrock-agentcore.amazonaws.com
+            # Confused-deputy guard: without this, ANY account's AgentCore
+            # gateway may invoke the function (CSR scan 2026-10-08).
+            SourceAccount: !Ref AWS::AccountId
+
+    AdminToolLambdaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service: lambda.amazonaws.com
+                        Action: sts:AssumeRole
+            Policies:
+                -
+                    PolicyName: AdminToolPolicy
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                            # Scoped to the declared group; no logs:CreateLogGroup.
+                            -
+                                Effect: Allow
+                                Action:
+                                    - logs:CreateLogStream
+                                    - logs:PutLogEvents
+                                Resource: !GetAtt AdminToolLambdaLogGroup.Arn
+                            # configure_search_backend + delete_collection registry ops
+                            -
+                                Effect: Allow
+                                Action:
+                                    - dynamodb:GetItem
+                                    - dynamodb:UpdateItem
+                                    - dynamodb:DeleteItem
+                                Resource: !GetAtt LanceDBCollectionTable.Arn
+                            # delete_collection sweep: state/lock/pending/asset records
+                            -
+                                Effect: Allow
+                                Action:
+                                    - dynamodb:Query
+                                    - dynamodb:DeleteItem
+                                Resource: !GetAtt LanceDBIndexStateTable.Arn
+                            # delete_collection sweep: dedup records
+                            -
+                                Effect: Allow
+                                Action:
+                                    - dynamodb:Scan
+                                    - dynamodb:BatchWriteItem
+                                Resource: !GetAtt LanceDBDedupTable.Arn
+                            # delete_collection sweep: LanceDB tables + staged rows
+                            -
+                                Effect: Allow
+                                Action: s3:ListBucket
+                                Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            -
+                                Effect: Allow
+                                Action:
+                                    - s3:GetObject
+                                    - s3:DeleteObject
+                                Resource:
+                                    - !Sub arn:aws:s3:::${ProxyBucket}/_lancedb_index/*
+                                    - !Sub arn:aws:s3:::${ProxyBucket}/_indexing/*
+                            # delete_collection sweep: S3 Vectors indexes
+                            -
+                                Effect: Allow
+                                Action:
+                                    - s3vectors:ListIndexes
+                                    - s3vectors:DeleteIndex
+                                Resource:
+                                    - !GetAtt HybridSearchVectorBucket.VectorBucketArn
+                                    - !Sub ${HybridSearchVectorBucket.VectorBucketArn}/index/*
+
+    AdminToolLambda:
+        Type: AWS::Lambda::Function
+        DependsOn: AdminToolLambdaLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - { id: W89, reason: Not using VPC }
+                    - { id: W92, reason: No reserved concurrency required }
+        Properties:
+            FunctionName: !Sub ${ResourcePrefix}-hybrid-search-admin-tool
+            Description: AgentCore Gateway dispatcher for hybrid-search ADMIN tools
+            Runtime: python3.13
+            Architectures: [arm64]
+            Handler: admin_function.lambda_handler
+            MemorySize: 256
+            Timeout: 300
+            Role: !GetAtt AdminToolLambdaRole.Arn
+            LoggingConfig:
+                LogGroup: !Ref AdminToolLambdaLogGroup
+            Code:
+                S3Bucket: !FindInMap [GatewayTool, Lambda, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${package}
+                    - keyPrefix: !FindInMap [GatewayTool, Lambda, KeyPrefix]
+                      package: !FindInMap [GatewayTool, Lambda, Package]
+            Environment:
+                Variables:
+                    COLLECTION_TABLE: !Ref LanceDBCollectionTable
+                    INDEX_STATE_TABLE: !Ref LanceDBIndexStateTable
+                    DEDUP_TABLE: !Ref LanceDBDedupTable
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    VECTOR_BUCKET: !Select [1, !Split ["bucket/", !GetAtt HybridSearchVectorBucket.VectorBucketArn]]
+                    TOOL_VERSION: "%%VERSION%%"
+
+    AdminToolLambdaPermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !GetAtt AdminToolLambda.Arn
+            Action: lambda:InvokeFunction
+            Principal: bedrock-agentcore.amazonaws.com
+            # Confused-deputy guard: without this, ANY account's AgentCore
+            # gateway may invoke the function (CSR scan 2026-10-08).
+            SourceAccount: !Ref AWS::AccountId
+
+
+Outputs:
+    ImageUri:
+        Description: ECR URI of the container image
+        Value: !Sub
+            - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repositoryName}:${imageTag}
+            - repositoryName: !FindInMap [ECR, Repository, Name]
+              imageTag: !FindInMap [ECR, Repository, ImageTag]
+    ECRRepositoryArn:
+        Description: ARN of the ECR repository
+        Value: !Sub
+            - arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${repoName}
+            - repoName: !FindInMap [ECR, Repository, Name]
+    IndexSFNArn:
+        Description: ARN of the hybrid search index state machine
+        Value: !GetAtt HybridSearchIndexSFN.Arn
+    RebuildSFNArn:
+        Description: ARN of the hybrid search rebuild state machine
+        Value: !GetAtt HybridSearchRebuildSFN.Arn
+    SearchSFNArn:
+        Description: ARN of the hybrid search search state machine
+        Value: !GetAtt HybridSearchSearchSFN.Arn
+    SearchHistoryDDBTableName:
+        Description: Name of the LanceDBSearchHistory DynamoDB table
+        Value: !Ref LanceDBSearchHistoryTable
+    SearchLambdaArn:
+        Description: ARN of the search Lambda function (invoked synchronously by API)
+        Value: !GetAtt SearchLambda.Arn
+    IndexStateDDBTableName:
+        Description: Name of the LanceDBIndexState DynamoDB table
+        Value: !Ref LanceDBIndexStateTable
+    DedupDDBTableName:
+        Description: Name of the LanceDBDedupState DynamoDB table
+        Value: !Ref LanceDBDedupTable
+    HandleExecutionFailureLambdaArn:
+        Description: ARN of the EventBridge failure handler Lambda
+        Value: !GetAtt HandleExecutionFailureLambda.Arn
+    CollectionDDBTableName:
+        Description: Name of the LanceDBCollections DynamoDB table
+        Value: !Ref LanceDBCollectionTable
+    GatewayToolLambdaArn:
+        Description: Pass as HybridSearchToolLambdaArn when deploying media-toolkit-gateway
+        Value: !GetAtt GatewayToolLambda.Arn
+    AdminToolLambdaArn:
+        Description: Pass as HybridSearchAdminToolLambdaArn when deploying media-toolkit-gateway (admin target)
+        Value: !GetAtt AdminToolLambda.Arn
+    VectorBucketName:
+        Description: S3 Vectors bucket (one per deployment; indexes created at runtime)
+        # Sliced from the ARN, not re-composed with !Sub: VectorBucketName is not
+        # a readOnlyProperty on AWS::S3Vectors::VectorBucket, so it is not
+        # GetAtt-able, and !Ref returns the ARN. This keeps ONE definition of the
+        # name in the template (the resource's own Properties).
+        Value: !Select [1, !Split ["bucket/", !GetAtt HybridSearchVectorBucket.VectorBucketArn]]
+    VectorBucketArn:
+        Description: ARN of the S3 Vectors bucket
+        Value: !GetAtt HybridSearchVectorBucket.VectorBucketArn

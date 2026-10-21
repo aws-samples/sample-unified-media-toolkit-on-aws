@@ -1,0 +1,7 @@
+# TEST-ONLY dependencies. Deliberately separate from the repo-root
+# requirements.txt, which is COPY'd into the Lambda container image by the
+# Dockerfile — nothing here should ship to production.
+#
+# PyYAML parses cfnstack.yaml for the TestCfnTemplate invariants. Without it
+# those tests SKIP (visibly, as "skipped=N"); the rest of the suite still runs.
+PyYAML==6.0.2

@@ -1,0 +1,101 @@
+{
+  "contract_version": 1,
+  "target": "speech-enhancement",
+  "stability": "Every entry in `outputs` is stable API: labels, basenames, and the field names/nesting shown in each example. Removing or renaming any of them is a breaking change and requires a TOOL_VERSION bump plus a changelog note here. Files NOT listed here (per-chunk intermediates under enhanced_chunks/, the resampled/ conversion intermediate) are internal and may change or vanish without notice. `description` is one line by design — it is joined verbatim into each get_job_status outputs[] entry as `desc`.",
+  "outputs": {
+    "enhanced": {
+      "basename": "audio_enhanced.wav",
+      "kind": "file",
+      "mime": "audio/wav",
+      "description": "Noise-suppressed dialogue WAV (DeepFilterNet3; 16 kHz mono default, configurable) — the full source audio enhanced in place, no stem extraction; a LISTENING deliverable — the current model measured worse than the original mix as a transcription input, so the mix is the validated ASR/diarization default and the enhanced track is not recommended there today",
+      "example": null,
+      "contents": {
+        "format": "RIFF/WAVE, 16-bit PCM, mono, one data chunk — full source duration, chunks already concatenated",
+        "sample_rate": "16000 Hz default; per-request via output_resampl_freq (8000/16000/32000/44100/48000/96000)"
+      },
+      "notes": "DeepFilterNet3 enhances the whole mix in place: it attenuates non-speech noise around the dialogue rather than extracting a speech stem, so everything keeps its position on the timeline. atten_lim_db caps how much attenuation is applied, enforced full-band by mixing the original back in (never more than N dB quieter); ~0 = bypass, >=100 = unlimited, null = full suppression. rms_db_in/rms_db_out/duration_sec for QC live in the metrics file's output block."
+    },
+    "metrics": {
+      "basename": "speech_enhancement.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Aggregate enhancement metrics (output summary with RMS in/out, timings, per-chunk summaries) — use for QC via rms_db_in/rms_db_out and locating the enhanced WAV via enhanced_key",
+      "example": {
+        "model_id": "deepfilternet3",
+        "audio_key": "<media-processing run prefix>/speech_enhancement/audio_48k_mono.wav",
+        "enhanced_key": "<prefix>/audio_enhanced.wav",
+        "total_chunks": 6,
+        "output": {
+          "s3_key": "<prefix>/audio_enhanced.wav",
+          "resampl_freq": 16000,
+          "rms_db_in": -27.9,
+          "rms_db_out": -28.6,
+          "duration_sec": 2112.0,
+          "size_bytes": 67584044
+        },
+        "timing_ms": {
+          "concat": 2140.0,
+          "total_compute": 94511.0,
+          "avg_chunk": 15751.8,
+          "slowest_chunk": "chunk_003"
+        },
+        "chunks": [
+          {
+            "chunk_idx": 0,
+            "chunk_name": "chunk_000",
+            "fetch_start_sec": 0.0,
+            "fetch_end_sec": 360.0,
+            "rms_db_in": -27.4,
+            "rms_db_out": -28.1,
+            "duration_sec": 360.0,
+            "timing_ms": {
+              "model_load": 950.0,
+              "s3_read": 320.0,
+              "dfn3": 12800.0,
+              "resample": 110.0,
+              "s3_write": 85.0,
+              "total": 14265.0
+            },
+            "metrics_key": "<prefix>/enhanced_chunks/chunk_000.json",
+            "elapsed_sec": 14.3
+          }
+        ],
+        "status": "COMPLETED",
+        "elapsed_sec": 4.1
+      },
+      "notes": "audio_key is the 48 kHz mono WAV the model actually consumed: the source itself on the WAV fast path, resampled/audio_48k_mono.wav (internal) or the wav under media-processing's own run prefix when conversion ran. rms_db_in is measured on that input (the exact window, context padding excluded); rms_db_out on the enhanced output — a drop between them is the noise removed. timing_ms.total_compute is the sum across chunks (the Map runs them in parallel, so wall time tracks the slowest chunk, named in slowest_chunk). Each chunks[].metrics_key points at that chunk's own enhanced_chunks/chunk_NNN.json — an internal file, not contract."
+    },
+    "usage": {
+      "basename": "usage_tracking.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Per-state durations and estimated cost, media-processing child included when conversion ran — use for reporting what this run cost",
+      "example": {
+        "execution_arn": "arn:aws:states:...",
+        "audio_bucket": "<bucket>",
+        "audio_key": "<media-processing run prefix>/speech_enhancement/audio_48k_mono.wav",
+        "output_bucket": "<bucket>",
+        "usage_key": "<prefix>/usage_tracking.json",
+        "pipeline_wall_sec": 92.3,
+        "total_estimated_cost": 0.00212,
+        "states": [
+          {
+            "state_name": "Map speech enhancement processing",
+            "operation": "StateRunSpeechEnhancementModel",
+            "lambda_arn": "arn:aws:lambda:...",
+            "architecture": "arm64",
+            "memory_mb": 10240,
+            "invocations": 6,
+            "retried": 0,
+            "wall_sec": 15.8,
+            "total_billed_sec": 94.5,
+            "incomplete": false,
+            "estimated_cost": 0.0015
+          }
+        ],
+        "media_processing": null
+      },
+      "notes": "Costs are us-east-1 arm64 estimates, not billing data. media_processing is null unless the source needed format conversion; when present it is {execution_arn, pipeline_wall_sec, estimated_cost, states} sourced from media-processing's own published usage_tracking.json (its states entries follow THAT stack's usage shape, not this one's), and its estimated_cost is already summed into total_estimated_cost. The final 'Usage tracking' states entry estimates its own duration (its terminal event has not fired when it writes this file) and omits retried/incomplete. retried counts billed failed attempts; incomplete is true only for an attempt with no terminal event in the history."
+    }
+  }
+}

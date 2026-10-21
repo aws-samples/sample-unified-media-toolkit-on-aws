@@ -1,0 +1,233 @@
+{
+    "Comment": "Hybrid search index workflow (README.md Design record). Prepare documents (contracts -> row groups, lock-free), then per-physical-table Map: acquire THAT table's lock (waitForTaskToken) -> index -> release. Writers to different tables never contend.",
+    "StartAt": "Set input defaults",
+    "States": {
+        "Set input defaults": {
+            "Type": "Pass",
+            "Comment": "Merge optional fields with defaults so downstream JSONPath never references absent keys. Exactly one of documents | documents_s3uri must be non-empty (validated in StatePrepareDocuments).",
+            "Parameters": {
+                "merged.$": "States.JsonMerge(States.StringToJson('{\"collection_id\":\"\",\"documents\":[],\"documents_s3uri\":\"\",\"asset_metadata\":{},\"workflow_config_uri\":\"\"}'), $$.Execution.Input, false)"
+            },
+            "ResultPath": "$.input",
+            "Next": "Prepare documents"
+        },
+        "Prepare documents": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${IndexerLambdaArn}",
+                "Payload": {
+                    "operation": "StatePrepareDocuments",
+                    "request_id.$": "$$.Execution.Name",
+                    "collection_id.$": "$.input.merged.collection_id",
+                    "documents.$": "$.input.merged.documents",
+                    "documents_s3uri.$": "$.input.merged.documents_s3uri",
+                    "asset_metadata.$": "$.input.merged.asset_metadata",
+                    "workflow_config_uri.$": "$.input.merged.workflow_config_uri"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "LambdaResourceTimeoutException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 1.0
+                },
+                {
+                    "ErrorEquals": [
+                        "ThrottlingException",
+                        "ServiceUnavailableException",
+                        "InternalServerException",
+                        "ModelTimeoutException",
+                        "ModelNotReadyException",
+                        "ServiceQuotaExceededException"
+                    ],
+                    "IntervalSeconds": 5,
+                    "MaxAttempts": 4,
+                    "BackoffRate": 2
+                },
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 1.5
+                },
+                {
+                    "ErrorEquals": [
+                        "Sandbox.Timedout",
+                        "Lambda.Unknown"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 2
+                }
+            ],
+            "Next": "(Map) Index tables"
+        },
+        "(Map) Index tables": {
+            "Type": "Map",
+            "MaxConcurrency": 8,
+            "ItemsPath": "$.map_items",
+            "ItemSelector": {
+                "item.$": "$$.Map.Item.Value",
+                "execution_arn.$": "$$.Execution.Id"
+            },
+            "ItemProcessor": {
+                "ProcessorConfig": {
+                    "Mode": "INLINE"
+                },
+                "StartAt": "Acquire table lock",
+                "States": {
+                    "Acquire table lock": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                        "ResultPath": "$.lock_result",
+                        "Parameters": {
+                            "FunctionName": "${IndexerLambdaArn}",
+                            "Payload": {
+                                "operation": "StateAcquireLock",
+                                "index_key.$": "$.item.index_key",
+                                "execution_arn.$": "$.execution_arn",
+                                "task_token.$": "$$.Task.Token",
+                                "uuid.$": "$.item.index_key"
+                            }
+                        },
+                        "HeartbeatSeconds": 21600,
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException",
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 1.5
+                            }
+                        ],
+                        "Next": "Index table"
+                    },
+                    "Index table": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "ResultPath": "$.index_result",
+                        "ResultSelector": {
+                            "indexed.$": "$.Payload.indexed"
+                        },
+                        "Parameters": {
+                            "FunctionName": "${IndexerLambdaArn}",
+                            "Payload": {
+                                "operation": "StateIndexDocuments",
+                                "index_key.$": "$.item.index_key",
+                                "rows_s3_key.$": "$.item.rows_s3_key",
+                                "collection_id.$": "$.item.collection_id"
+                            }
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException",
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 1.5
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "States.TaskFailed",
+                                    "States.Timeout"
+                                ],
+                                "IntervalSeconds": 15,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 2.0
+                            }
+                        ],
+                        "Catch": [
+                            {
+                                "ErrorEquals": [
+                                    "States.ALL"
+                                ],
+                                "ResultPath": "$.index_error",
+                                "Next": "Release table lock (on error)"
+                            }
+                        ],
+                        "Next": "Release table lock"
+                    },
+                    "Release table lock": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "ResultPath": null,
+                        "Parameters": {
+                            "FunctionName": "${IndexerLambdaArn}",
+                            "Payload": {
+                                "operation": "StateReleaseLock",
+                                "index_key.$": "$.item.index_key",
+                                "execution_arn.$": "$.execution_arn"
+                            }
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException",
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 1.5
+                            }
+                        ],
+                        "End": true
+                    },
+                    "Release table lock (on error)": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "ResultPath": null,
+                        "Parameters": {
+                            "FunctionName": "${IndexerLambdaArn}",
+                            "Payload": {
+                                "operation": "StateReleaseLock",
+                                "index_key.$": "$.item.index_key",
+                                "execution_arn.$": "$.execution_arn"
+                            }
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException",
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 1.5
+                            }
+                        ],
+                        "Next": "Fail table"
+                    },
+                    "Fail table": {
+                        "Type": "Fail",
+                        "Error": "IndexTableFailed",
+                        "Cause": "StateIndexDocuments failed after releasing the table lock"
+                    }
+                }
+            },
+            "ResultPath": "$.index_results",
+            "End": true
+        }
+    }
+}

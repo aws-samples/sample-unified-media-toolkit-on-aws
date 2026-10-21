@@ -1,0 +1,295 @@
+{
+  "Comment": "Face index management micro-workflow (README.md \u00a719). Routes on $.action: batch_index (manifest-driven tiled IndexFaces under the shared Rekognition semaphore), batch_delete (hard delete by face_ids | celebrity_name), delete_collection (full sweep, collection removed last). Event: {uuid, action, input, output:{s3uri}, data:{}}.",
+  "StartAt": "Validate index batch",
+  "States": {
+    "Validate index batch": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "${FaceRecognitionLambda1Core.Arn}",
+        "Payload": {
+          "operation": "StateValidateIndexBatch",
+          "uuid.$": "$.uuid",
+          "action.$": "$.action",
+          "input.$": "$.input",
+          "output.$": "$.output",
+          "data.$": "$.data"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "ProvisionedThroughputExceededException",
+            "ThrottlingException",
+            "InternalServerError",
+            "ServiceUnavailableException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 1.2
+        },
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.2
+        }
+      ],
+      "Next": "Route on action"
+    },
+    "Route on action": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.action",
+          "StringEquals": "batch_index",
+          "Next": "Acquire semaphore"
+        },
+        {
+          "Or": [
+            {
+              "Variable": "$.action",
+              "StringEquals": "batch_delete"
+            },
+            {
+              "Variable": "$.action",
+              "StringEquals": "delete_collection"
+            }
+          ],
+          "Next": "Batch delete faces"
+        }
+      ],
+      "Default": "Unknown action"
+    },
+    "Unknown action": {
+      "Type": "Fail",
+      "Error": "UnknownAction",
+      "Cause": "action must be batch_index | batch_delete | delete_collection \u2014 a new action must be wired into BOTH the validate dispatch and this Choice (the delete path must never be a fall-through default)"
+    },
+    "Acquire semaphore": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "ResultPath": null,
+      "Parameters": {
+        "FunctionName": "${FaceRecognitionLambda1Core.Arn}",
+        "Payload": {
+          "operation": "StateAcquireSemaphore",
+          "execution_arn.$": "$$.Execution.Id",
+          "task_token.$": "$$.Task.Token",
+          "uuid.$": "$.uuid",
+          "max_concurrent_executions.$": "$.input.max_concurrent_executions"
+        }
+      },
+      "TimeoutSeconds": 86400,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.2
+        }
+      ],
+      "Next": "Map batch index"
+    },
+    "Map batch index": {
+      "Type": "Map",
+      "MaxConcurrency": 4,
+      "ItemsPath": "$.data.iterators",
+      "ItemSelector": {
+        "operation": "StateBatchIndexWorker",
+        "uuid.$": "$.uuid",
+        "item_id.$": "$$.Map.Item.Index",
+        "item_data.$": "$$.Map.Item.Value",
+        "execution_arn.$": "$$.Execution.Id"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "Batch index worker",
+        "States": {
+          "Batch index worker": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+              "FunctionName": "${FaceRecognitionLambda3Cores.Arn}",
+              "Payload.$": "$"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "LambdaResourceTimeoutException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 10,
+                "BackoffRate": 1
+              },
+              {
+                "ErrorEquals": [
+                  "ProvisionedThroughputExceededException",
+                  "ThrottlingException",
+                  "InternalServerError",
+                  "ServiceUnavailableException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6,
+                "BackoffRate": 1.2
+              },
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 1,
+                "MaxAttempts": 2,
+                "BackoffRate": 1.2
+              },
+              {
+                "ErrorEquals": [
+                  "Sandbox.Timedout",
+                  "Lambda.Unknown"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 2,
+                "BackoffRate": 2
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.data.iterators",
+      "Next": "Release semaphore"
+    },
+    "Release semaphore": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "ResultPath": null,
+      "Parameters": {
+        "FunctionName": "${FaceRecognitionLambda1Core.Arn}",
+        "Payload": {
+          "operation": "StateReleaseSemaphore",
+          "execution_arn.$": "$$.Execution.Id"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.2
+        }
+      ],
+      "Next": "Batch index finalize"
+    },
+    "Batch index finalize": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "${FaceRecognitionLambda1Core.Arn}",
+        "Payload": {
+          "operation": "StateBatchIndexFinalize",
+          "uuid.$": "$.uuid",
+          "action.$": "$.action",
+          "input.$": "$.input",
+          "output.$": "$.output",
+          "data.$": "$.data"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "ProvisionedThroughputExceededException",
+            "ThrottlingException",
+            "InternalServerError",
+            "ServiceUnavailableException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 1.2
+        },
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.2
+        }
+      ],
+      "End": true
+    },
+    "Batch delete faces": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "${FaceRecognitionLambda1Core.Arn}",
+        "Payload": {
+          "operation": "StateBatchDeleteFaces",
+          "uuid.$": "$.uuid",
+          "action.$": "$.action",
+          "input.$": "$.input",
+          "output.$": "$.output",
+          "data.$": "$.data"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "LambdaResourceTimeoutException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 10,
+          "BackoffRate": 1
+        },
+        {
+          "ErrorEquals": [
+            "ProvisionedThroughputExceededException",
+            "ThrottlingException",
+            "InternalServerError",
+            "ServiceUnavailableException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 1.2
+        },
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.2
+        }
+      ],
+      "End": true
+    }
+  }
+}

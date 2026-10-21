@@ -1,0 +1,26 @@
+# NOT vendored — read the floors, they are load-bearing.
+#
+# boto3/botocore ship in the base image and are deliberately not `pip install`ed
+# over the top: a vendored botocore shadows the image's and goes stale, and here
+# that would mean an old TransactWriteItems error shape, which is exactly what
+# try_acquire's CancellationReasons parsing depends on. There is no third-party
+# dependency to install — this is DynamoDB transactions and the Converse API.
+#
+# So these are not install instructions. They are the CONTRACT the Dockerfile's
+# pinned `FROM` tag has to satisfy, and the floor is what the code actually
+# sends, not a round number:
+#
+#   1.42.59 is the first botocore whose bedrock service model carries
+#   `modelInvocationType` on CreateModelInvocationJobRequest. Below it, botocore
+#   rejects the parameter CLIENT-SIDE ("Unknown parameter in input") before the
+#   request leaves the process — and that parameter is not optional here, it is
+#   the §5.4 fix that stopped Bedrock judging this stack's Converse-shaped
+#   records malformed. Measured 2026-08-12: the pinned base image shipped
+#   1.40.4, so all four batch submits failed the moment the tier functions moved
+#   from the managed runtime (which auto-updates botocore) to the image (which
+#   freezes it). See the Dockerfile's FROM comment.
+#
+# test_the_base_image_is_new_enough_for_every_batch_parameter reads BOTH numbers
+# out of these two files and fails if they drift apart.
+boto3>=1.42.59
+botocore>=1.42.59

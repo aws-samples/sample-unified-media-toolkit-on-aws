@@ -1,0 +1,209 @@
+{
+  "contract_version": 1,
+  "target": "shot-metadata-enrichment",
+  "stability": "Anything not listed here — everything under _plan/ and _records/, and records.jsonl — is internal and may change without notice; integrating against those paths is unsupported. Raw model responses live at each bedrock-inference run's own prefix; window_manifest.json's inference_runs[] is the join.",
+  "outputs": {
+    "shots": {
+      "basename": "shot_metadata.jsonl",
+      "kind": "file",
+      "mime": "application/jsonl",
+      "description": "THE product: one validated metadata document per shot, JSONL in shot order — join to shots.json by shot_id for times",
+      "example": {
+        "shot_id": 214,
+        "description": "Ines steps out of a taxi onto a rain-slick city street and looks up at an office tower.",
+        "starts_new_scene": true,
+        "boundary_reason": "location_change",
+        "shot_kind": "normal",
+        "camera_shot_type": "wide",
+        "setting": "street_sidewalk",
+        "time_of_day": "night",
+        "weather": "rain",
+        "lighting": [
+          "low_light",
+          "neon"
+        ],
+        "notable": [],
+        "people_count": "1",
+        "people": [
+          "Ines Moreau"
+        ],
+        "texts_on_screen": [],
+        "unreadable_text_present": true,
+        "named_entities": [],
+        "brands": [
+          {
+            "name": "Toyota",
+            "carrier": "taxi sedan",
+            "carrier_type": "vehicle",
+            "evidence": "logotype",
+            "confidence": "medium"
+          }
+        ],
+        "objects": [
+          {
+            "name": "wheeled cabin suitcase",
+            "context": "street_sidewalk"
+          }
+        ],
+        "actions": [
+          "Ines hauls a suitcase from the taxi"
+        ],
+        "expressions": [
+          {
+            "who": "Ines Moreau",
+            "shows": "tight-lipped smile"
+          }
+        ],
+        "sentiment": "dramatic",
+        "depicted": [
+          {
+            "act": "firearm",
+            "detail": "holstered pistol on the gunman"
+          }
+        ],
+        "camera_motion": {
+          "kind": "push_in",
+          "reveals": "a dead gunman in the kitchen"
+        },
+        "state_change": {
+          "what": "rain begins on the windshield",
+          "when": "late"
+        }
+      },
+      "notes": "One line per ANSWERED shot; unanswered shot_ids are listed in scenes.json's shots_gap, never fabricated here. The model never emits timestamps — shot times, timecodes and frame ranges live in the shot-segmentation run's shots.json, joined by shot_id. starts_new_scene is the REPAIRED flag (`false` wins on a flag/reason cross-pairing, both directions); boundary_reason is the model's answer VERBATIM even when the pairing was repaired — scenes.json's pairing_repairs[] lists every repair. All closed-vocabulary fields (shot_kind, camera_shot_type, setting, time_of_day, weather, lighting, notable, people_count, sentiment, carrier_type, evidence, confidence) use the prompt's exact terms. people[] carries ONLY face-recognition-supplied names. state_change is OPTIONAL and rare (~10% of shots, measured on the development corpus): present only when the shot's begin and end states differ materially — `what` (<=15 words, the change only) + `when` (early|mid|late within the shot); absent means no material change, never null. actions[] (cap 3, strings <=10 words, present tense) carries the physical business a one-sentence description drops — hands, objects, contact; expressions[] (cap 3, {who, shows<=6 words}) carries readable facial/bodily reaction and is populated only at framings tight enough to read a face; camera_motion is OPTIONAL like state_change ({kind: pan|tilt|push_in|pull_back|tracking|crane_rise|crane_descend|aerial_sweep, reveals<=10 words naming what the move discloses}, absent on static or single-frame shots). These three exist because measured professional AD (reference corpus, two drama series, 2026-08-28) spends most of its non-credit gap on exactly this material; [] / absent are the expected majority answers."
+    },
+    "scenes": {
+      "basename": "scenes.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Scenes assembled deterministically from the repaired starts_new_scene flags, with code-aggregated attributes and per-scene shot descriptions",
+      "example": {
+        "scenes": [
+          {
+            "scene_id": 0,
+            "start_shot_id": 9,
+            "end_shot_id": 35,
+            "shot_count": 27,
+            "start_time": 32.5,
+            "end_time": 141.2,
+            "start_timecode": "00:00:32:12",
+            "end_timecode": "00:02:21:05",
+            "boundary_reason": "location_change",
+            "setting": "office",
+            "time_of_day": "day",
+            "sentiment": "dramatic",
+            "people": [
+              "Ray Halloran",
+              "Danny Kovac"
+            ],
+            "notable": [],
+            "brands": [],
+            "named_entities": [],
+            "shot_descriptions": [
+              {
+                "shot_id": 9,
+                "description": "..."
+              }
+            ],
+            "shots_gap": []
+          }
+        ],
+        "shots_total": 97,
+        "shots_gap": [],
+        "pairing_repairs": [
+          {
+            "shot_id": 75,
+            "window": 7,
+            "kind": "false_flag_true_reason",
+            "reason": "after_black"
+          }
+        ],
+        "pairing_repair_rate": 0.0103,
+        "provenance": {
+          "prompt": {
+            "category": "shot-metadata-enrichment",
+            "version": "default",
+            "source_md5": "…"
+          },
+          "model_chain": [
+            "anthropic.claude-sonnet-4-6"
+          ],
+          "use_batch": true,
+          "shots_s3uri": "s3://…/embeddings/shots.json",
+          "faces_s3uri": null,
+          "transcript_s3uri": null,
+          "window_count": 10,
+          "history_scope": "shots.502caf59-…",
+          "tool_version": "…"
+        }
+      },
+      "notes": "Scene attributes are AGGREGATED IN CODE across member shots (majority vote for setting/time_of_day/sentiment, name-deduped unions for people/brands/named_entities) — never read off a single shot, because per-window independence measurably drifts attributes inside one scene. pairing_repair_rate is a usable interleaved-genre signal: ~0 on linear content (scripted drama, film), 2-8% on interleaved content (news, current affairs; measured on the development corpus) — where flags alone under-segment and a grouping pass over this file is the designed follow-up. Scene times come from shots.json, never from the model."
+    },
+    "window-manifest": {
+      "basename": "window_manifest.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Traceability by POINTER: the window plan (shot_ids, context shot, image blocks, resolved flag) and the bedrock-inference run entries",
+      "example": {
+        "workflow_id": "…",
+        "shot_target": 10,
+        "image_budget": 20,
+        "windows": [
+          {
+            "index": 0,
+            "shot_ids": [
+              0,
+              1,
+              2
+            ],
+            "context_shot_id": null,
+            "image_blocks": 18,
+            "resolved": true
+          }
+        ],
+        "inference_runs": [
+          {
+            "workflow_id": "…",
+            "job_id": "arn:…",
+            "output_s3_prefix": "s3://…",
+            "records_s3uri": "s3://…",
+            "record_count": 10,
+            "absorbed": false,
+            "history_key": "micro-workflow/histories/…"
+          }
+        ]
+      },
+      "notes": "inference_runs[].output_s3_prefix is the bedrock run: request.jsonl there is the EXACT rendered bytes (the question), response.jsonl the raw model output per window (join by record_id window-NNN), summary.json the authoritative outcome and cost. Raw responses are never copied here — this file is the join."
+    },
+    "usage": {
+      "basename": "usage_tracking.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Aggregated spend across the run's bedrock-inference submissions, with the cost_is_complete discipline",
+      "example": {
+        "workflow_id": "…",
+        "tool_version": "…",
+        "written_at_ms": 1766130000000,
+        "inference_runs": [
+          {
+            "workflow_id": "…",
+            "inference_mode": "batch",
+            "mode_reason": "…",
+            "records_succeeded": 10,
+            "records_failed": 0,
+            "models_used": [
+              "anthropic.claude-sonnet-4-6"
+            ],
+            "estimated_cost": 0.31,
+            "usage_uri": "s3://…/usage_tracking.json"
+          }
+        ],
+        "total_estimated_cost": 0.31,
+        "cost_is_complete": true,
+        "total_input_tokens": 98030,
+        "total_output_tokens": 17800
+      },
+      "notes": "Costs are estimates from bedrock-inference's own summaries; cost_is_complete=false means at least one run's summary lacked a figure. Each run's own usage_tracking.json (usage_uri) carries the per-state breakdown."
+    }
+  }
+}

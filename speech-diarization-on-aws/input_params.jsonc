@@ -1,0 +1,170 @@
+{
+  // StateCheckAndPreprocess — minimal realistic input
+  //    Two scenarios shown:
+  //      Scenario A: MP4 / any non-WAV → needs_conversion=true
+  //      Scenario B: 16kHz mono WAV   → needs_conversion=false (fast-path)
+  //
+  //    Use Scenario A as the default test input.
+  "uuid": "uuid",
+
+  "input": {
+    "s3uri": "s3://<your-ingest-bucket>/uploads/interview.mp4", // Scenario A: MP4 needs conversion
+    // "s3uri": "s3://<your-ingest-bucket>/uploads/mono16k.wav"   // Scenario B: compatible WAV, bypass
+
+    // input_config — fully optional; all fields have defaults (see lib/input_schema.py)
+    "input_config": {
+      // ISO-639-1 code, or null/omitted to trigger automatic language detection.
+      // Future: accept "cy+en" for multilingual / code-switching content.
+      "language": "cy|en|ja|ko|de|ar", // null → auto-detect
+
+      // Enable partial duration
+      "use_partial": false,
+      // Mark In/Out: [start_time, end_time] specified in seconds
+      "mark_in_out": [0, 30],
+
+      // Where to fetch the models?
+      "model": {
+        // Default to os.environ["MODEL_BUCKET"]
+        "model_bucket": null,
+
+        // Default to os.environ["MODEL_ARTEFACTS_PREFIX"] - "_model_artefacts"
+        "model_prefix": null, 
+
+        // Default to os.environ["CLOUDFRONT_URL"]
+        // In case, the model has not been copied to customer model bucket,
+        // copy the model from cloudfront distribution to customer bucket
+        "cf_host": null       
+      },
+
+      // Voice Activity Detection
+      "vad": {
+        // informative, NOT configurable
+        "model_id": "pyannote.community1",
+
+        // fixed VAD chunk size (seconds)
+        "fixed_chunk_size_secs": 720,
+
+        // target dynamic transcription chunk (seconds)
+        "dynamic_speech_chunk_secs": 360,
+
+        // discard speech turn is <0.5s
+        "min_speech_duration_sec": 0.5,
+
+        // flatten two adjacent turns if <0.3s silence
+        "min_silence_duration_sec": 0.3,
+
+        // form a single speech group for whisper if <1.0s apart
+        "speech_group_max_gap_sec": 1.0
+      },
+
+      // Whisper / Alignment / Sentence Assembler
+      "asr": {
+        // Informative, not configurable
+        "model_id": "whisper", 
+
+        // Which Whisper model to use.
+        // "turbo" → whisper-large-v3-turbo (general purpose)
+        // "cy"    → Welsh-specialised model
+        // "ar"    → Arabic-specialised model
+        // Fallback: if the specialised model is not found in model_bucket,
+        // StateDownloadModels automatically falls back to "turbo".
+        // null → determined from detected/supplied language.
+        "model_variant": "turbo",
+
+        // Whisper settings:
+        // Number of probes to determine language (Detect Language state)
+        "language_detection_num_probes": 5,
+
+        // Minimum probe chunk size, 10s (Detect Language state)
+        "language_detection_min_sec": 10.0,
+
+        // Concurrent worker: 1 or 2. Keep it to 1.
+        "num_workers": 1,
+
+        // beam_size: 1-5. Default to 2.
+        "beam_size": 2,
+
+        // initial_prompt: could help whisper to understand:
+        // dialect, domain vocabulary, celebrity names, punctuation, language lockin
+        "initial_prompt": "",
+
+        // Sentence Assembler settings:
+        // merge short sentence if <0.20s
+        "merge_gap_threshold_sec": 0.20
+      },
+
+      // Turn Embedding
+      "embed": {
+        // Consider turn has good quality if >0.75s
+        "min_embedding_duration_sec": 0.75,
+
+        // Skip generate embedding if <0.30s.
+        // Between 0.30 and 0.75, still generate embedding but marked as low-quality
+        "soft_embedding_min_sec": 0.30  
+      },
+
+      // Speaker Clustering
+      "clustering": {
+        // "ahc" → Agglomerative Hierarchical Clustering (recommended default)
+        //         Fast, deterministic. Works well for ≤5 speakers and
+        //         per-turn embedding matrices (typical council/meeting content).
+        // "vbx" → Variational Bayes EM. Better for 6+ speakers and large N
+        //         (300+ embeddings). Requires dense sliding-window embeddings
+        //         to work reliably — not recommended for current pipeline.
+        "algorithm": "ahc", // "vbx" is currently disabled
+
+        // Force to cluster into known number of speakers
+        // null = auto-detect K via clustering
+        "num_speakers": null,
+
+        // Clusters smaller than this are merged into the nearest large cluster.
+        // null → default 2. Keep low (2–3) for per-turn embedding matrices.
+        "min_cluster_size": 2,
+
+        // Maximum K - absolute upperbound K
+        "max_k": 50,
+
+        // Gate the K range before cluster sweep logic
+        // K' = total_turns // min_turns_per_speaker
+        // K_upperbound = min(K', max_k)
+        "min_turns_per_speaker": 3,
+
+        // Select optimal K based on:
+        // "elbow"    → silhouette score with elbow detection
+        // "combined" → combined silhouette score with calinski harabasz index
+        "k_selection_method": "elbow",
+
+        // If "combined", silhouette score weight
+        "sil_weight": 0.6,
+
+        // If "combined", calinski harabasz weight
+        "ch_weight": 0.4,
+
+        // Remove outliers that falls outside of 97%
+        "outlier_global_percentile": 97.0,
+
+        // When all cosine distance <0.2, likely one single speaker in the content
+        "single_speaker_threshold": 0.2,
+
+        // Apply Symmetric score normalisation before cluster
+        "apply_snorm": false
+      }
+    }
+  },
+
+  "output": {
+    "s3uri": "s3://<your-proxy-bucket>/path/to/output/prefix", // mandatory
+
+    // output_config — fully optional; all fields have defaults
+    "output_config": {
+      // Generate speaker stems per speaker
+      "speaker_channels": true,
+
+      // "aligned" → Fill with silence
+      // "compact" → Join speech turn of the speaker with no fill
+      "channel_mode": "aligned"
+    }
+  },
+
+  "data": {}
+}

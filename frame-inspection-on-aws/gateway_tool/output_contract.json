@@ -1,0 +1,93 @@
+{
+  "contract_version": 1,
+  "target": "frame-inspection",
+  "stability": "Anything not listed here — everything under _plan/ and _records/, and records.jsonl — is internal and may change without notice; integrating against those paths is unsupported. Raw model responses live at the bedrock-inference run's own prefix; inspection_manifest.json's inference_runs[] is the join. Product paths are {run_prefix}/{asset_idx}/{basename}, one per (asset, category) in the request.",
+  "outputs": {
+    "credits-read": {
+      "basename": "credits.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Verbatim card text per nondiegetic block (end credits, main titles, logo runs, head slates), cards in display order with their programme-second timestamps — EVIDENCE only; which cards deserve voice is the consumer's judgment",
+      "example": {
+        "blocks": [
+          {
+            "start": 1642.5,
+            "end": 1762.3,
+            "kinds": ["credit_roll", "logo_bumper"],
+            "shot_ids": [385, 386],
+            "cards": [
+              {"t": 1642.47, "lines": ["Directed by", "Jordan Roe"]},
+              {"t": 1658.47, "lines": ["and", "Casey Doe"]},
+              {"t": 2946.52, "lines": ["In Loving Memory of Our Friend", "Jordan Sample", "March 3, 1961 – April 4, 2021"]}
+            ]
+          }
+        ],
+        "gaps": []
+      },
+      "notes": "Cards come from dense selection over shot-segmentation's OWN frame archives (4 fps, embedding change-gate + 6 s heartbeat — the heartbeat is what keeps slow SCROLLS sampled). A line the model could not read is the literal string [UNREADABLE], never a guess. gaps[] lists spans whose read produced nothing usable, with reasons; partial success IS success and the semantic retry is a fresh idempotency_token."
+    },
+    "title-read": {
+      "basename": "titles.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Verbatim text of unreadable-text shots OUTSIDE the nondiegetic blocks — supers, location cards, chapter titles over picture",
+      "example": {
+        "blocks": [
+          {
+            "start": 1570.6,
+            "end": 1574.3,
+            "kinds": ["normal"],
+            "shot_ids": [371],
+            "cards": [{"t": 1571.1, "lines": ["Based on the book Love and Peace by Jordan Roe"]}]
+          }
+        ],
+        "gaps": []
+      },
+      "notes": "Auto-trigger is shots flagged unreadable_text_present by shot-metadata-enrichment; the trigger INHERITS that flag's recall (a super the per-shot pass never saw fires nothing — measured, mitj404 shot 371). Explicit spans are the override."
+    },
+    "claim-verify": {
+      "basename": "verdicts.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Adversarial verification of visual claims: per explicit span+question, a verdict from a CLOSED enum with cited visible evidence",
+      "example": {
+        "verdicts": [
+          {"id": "w35", "verdict": "contradicted", "evidence": "the person on the floor raises their head in the final two frames"}
+        ],
+        "gaps": []
+      },
+      "notes": "verdict is validated against supported|contradicted|indeterminate — an out-of-enum answer is a parse failure and lands in gaps[], never passed through. Spans are ALWAYS caller-explicit and each carries its question; the question is part of request identity (a new question is a new run, the same question absorbs)."
+    },
+    "manifest": {
+      "basename": "inspection_manifest.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Traceability by POINTER: the resolved spans and units, per-product locations and gap counts, and the bedrock-inference run entries",
+      "example": {
+        "workflow_id": "…",
+        "tool_version": "…",
+        "products": [{"asset_idx": 0, "category": "credits-read", "s3uri": "s3://…/0/credits.json", "spans": 2, "gaps": 0}],
+        "units": [{"asset_idx": 0, "category": "credits-read", "span_idx": 0}],
+        "inference_runs": [{"workflow_id": "…", "job_id": "arn:…", "output_s3_prefix": "s3://…", "records_s3uri": "s3://…", "record_count": 5, "absorbed": false, "history_keys": {"credits-read": "micro-workflow/histories/…"}}]
+      },
+      "notes": "inference_runs[].output_s3_prefix is the bedrock run: request.jsonl there is the EXACT rendered bytes (frames included), response.jsonl the raw model output per record (join by record_id {asset_idx}:{category}:{span_idx}:{chunk}), summary.json the authoritative outcome and cost. Raw responses are never copied into products."
+    },
+    "usage": {
+      "basename": "usage_tracking.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Aggregated spend for the run's (single, pooled) bedrock-inference submission, with the cost_is_complete discipline",
+      "example": {
+        "workflow_id": "…",
+        "tool_version": "…",
+        "written_at_ms": 1766130000000,
+        "inference_runs": [{"workflow_id": "…", "record_count": 12, "absorbed": false, "estimated_cost": 0.09, "usage_uri": "s3://…/usage_tracking.json"}],
+        "total_estimated_cost": 0.09,
+        "cost_is_complete": true,
+        "total_input_tokens": 91000,
+        "total_output_tokens": 4200
+      },
+      "notes": "Costs are estimates from bedrock-inference's own summaries; cost_is_complete=false means the run's summary lacked a figure."
+    }
+  }
+}

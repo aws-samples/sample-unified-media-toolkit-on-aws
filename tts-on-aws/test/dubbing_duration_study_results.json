@@ -1,0 +1,778 @@
+{
+ "it": [
+  {
+   "id": 1660,
+   "en_text": "Romanticism had a large element of cultural determinism, drawn from writers such as Goethe, Fichte, and Schlegel.",
+   "en_duration_s": 11.52,
+   "tgt_text": "Il Romanticismo fu caratterizzato da una consistente componente di determinismo culturale, tratta da autori come Goethe, Fichte e Schlegel.",
+   "tgt_duration_s": 14.84,
+   "ratio": 1.288
+  },
+  {
+   "id": 1661,
+   "en_text": "He did not set a figure for the cuts, saying they will be made based on China's economic output.",
+   "en_duration_s": 6.9,
+   "tgt_text": "Non ha stabilito un valore preciso della riduzione, affermando che essa dipenderà dalla produttività economica cinese.",
+   "tgt_duration_s": 10.6,
+   "ratio": 1.536
+  },
+  {
+   "id": 1662,
+   "en_text": "Alloys are basically a mixture of two or more metals. Don't forget that there are many elements on the periodic table.",
+   "en_duration_s": 11.16,
+   "tgt_text": "Le leghe sono sostanzialmente una miscela di due o più metalli. Tenete presente che la tavola periodica contiene numerosi elementi.",
+   "tgt_duration_s": 13.92,
+   "ratio": 1.247
+  },
+  {
+   "id": 1663,
+   "en_text": "Cochamó Valley - Chile's premier climbing destination, known as the Yosemite of South America, with a variety of granite big walls and crags.",
+   "en_duration_s": 9.9,
+   "tgt_text": "Cochamó Valley: la più importante destinazione per arrampicate del Cile, nota come lo Yosemite del Sud America, dove si trava un gran numero di enormi pareti e falesie granitiche.",
+   "tgt_duration_s": 13.8,
+   "ratio": 1.394
+  },
+  {
+   "id": 1664,
+   "en_text": "Swirl the two dry powders together and then, with clean wet hands, squeeze them into a ball.",
+   "en_duration_s": 5.4,
+   "tgt_text": "Mescolare insieme le due polveri essiccate e poi, con le mani pulite e bagnate, infilarle in una palla.",
+   "tgt_duration_s": 8.56,
+   "ratio": 1.585
+  },
+  {
+   "id": 1665,
+   "en_text": "The document, according to the leak, will refer to the borders dispute, which Palestine wants based on the borders before the 1967 Mideast War.",
+   "en_duration_s": 10.8,
+   "tgt_text": "Secondo quanto trapelato, oggetto del documento sarà la disputa sui confini, che la Palestina vuole siano basati sui confini esistenti prima della Guerra del Medio Oriente del 1967.",
+   "tgt_duration_s": 13.88,
+   "ratio": 1.285
+  },
+  {
+   "id": 1666,
+   "en_text": "You may also wish to consult the advice of governments other than your own, but their advice is designed for their citizens.",
+   "en_duration_s": 10.58,
+   "tgt_text": "Ti potrebbero anche interessare i pareri di governi diversi dal tuo, ma tieni comunque presente che tali pareri sono mirati ai cittadini di quei governi.",
+   "tgt_duration_s": 10.16,
+   "ratio": 0.96
+  },
+  {
+   "id": 1667,
+   "en_text": "Generally speaking, two behaviors can emerge as managers begin to lead their former peers. One end of the spectrum is trying to remain “one of the guys” (or gals).",
+   "en_duration_s": 10.86,
+   "tgt_text": "In generale, quando i manager cominciano a dirigere i loro ex colleghi, possono emergere due comportamenti. Da una parte c'è chi cerca di rimanere \"uno dei ragazzi\" (o delle ragazze).",
+   "tgt_duration_s": 14.68,
+   "ratio": 1.352
+  },
+  {
+   "id": 1668,
+   "en_text": "It may also be beneficial for one to buy a Wild Card, which provides entry to either selections of parks in South Africa or all of the South African National Parks.",
+   "en_duration_s": 10.44,
+   "tgt_text": "Anche l'acquisto di una Wild Card potrebbe risultare utile, poiché consente l'accesso a una selezione di parchi in Sudafrica oppure a tutti i parchi nazionali sudafricani.",
+   "tgt_duration_s": 11.76,
+   "ratio": 1.126
+  },
+  {
+   "id": 1670,
+   "en_text": "Their thermal behavior is not as steady as large caves on Earth that often maintain a fairly constant temperature, but it is consistent with these being deep holes in the ground,\" said Ray Halloran of the United States Geological Survey (USGS) Astrogeology Team and of Northern Arizona University located in Flagstaff, Arizona.",
+   "en_duration_s": 19.8,
+   "tgt_text": "Ray Halloran del team di astrogeologi dell'agenzia geologica statunitense (USGS) e della Northern Arizona University di Flagstaff, in Arizona, ha dichiarato: \"Il loro comportamento termico non è costante come quello delle grandi grotte terrestri, che spesso mantengono una temperatura relativamente stabile, ma è coerente con il fatto che si tratta di profondi buchi nel terreno\".",
+   "tgt_duration_s": 28.52,
+   "ratio": 1.44
+  },
+  {
+   "id": 1671,
+   "en_text": "Congress began funding the obscenity initiative in fiscal 2005 and specified that the FBI must devote 10 agents to adult pornography.",
+   "en_duration_s": 12.42,
+   "tgt_text": "L'iniziativa contro le oscenità è stata finanziata dal Congresso a partire dall'anno fiscale 2005, con la specifica richiesta all'FBI di assegnare 10 agenti alla pornografia per adulti.",
+   "tgt_duration_s": 16.08,
+   "ratio": 1.295
+  },
+  {
+   "id": 1672,
+   "en_text": "Be careful not to allow fabric to become too hot (which can cause shrinkage, or in extreme cases, scorch).",
+   "en_duration_s": 10.6,
+   "tgt_text": "Prestare attenzione a non sottoporre i tessuti a temperature troppo elevate, per evitare restringimenti o, nel peggiore dei casi, bruciature.",
+   "tgt_duration_s": 9.24,
+   "ratio": 0.872
+  },
+  {
+   "id": 1673,
+   "en_text": "During the Revolutionary War, the thirteen states first formed a weak central government—with the Congress being its only component—under the Articles of Confederation.",
+   "en_duration_s": 10.68,
+   "tgt_text": "Durante la guerra d’indipendenza, i tredici stati formarono per la prima volta un governo centrale debole, e il Congresso ne fu l’unico componente, secondo lo Statuto della Confederazione.",
+   "tgt_duration_s": 16.04,
+   "ratio": 1.502
+  },
+  {
+   "id": 1674,
+   "en_text": "In some areas boiling water for a minute is enough, in others several minutes are needed.",
+   "en_duration_s": 6.6,
+   "tgt_text": "In certe zone è sufficiente far bollire l'acqua per un minuto, in altre occorrono molti minuti.",
+   "tgt_duration_s": 6.92,
+   "ratio": 1.048
+  },
+  {
+   "id": 1676,
+   "en_text": "As with all South African National Parks, there are daily conservation and entry fees for the park.",
+   "en_duration_s": 9.34,
+   "tgt_text": "Come per tutti i parchi nazionali del Sudafrica, sono previsti dei contributi giornalieri per la conservazione e l'ingresso al parco.",
+   "tgt_duration_s": 10.08,
+   "ratio": 1.079
+  },
+  {
+   "id": 1677,
+   "en_text": "Today, the only insects that cannot fold back their wings are dragon flies and mayflies.",
+   "en_duration_s": 6.18,
+   "tgt_text": "Tra tutti gli insetti esistenti al giorno d'oggi, gli unici che non sono in grado di ripiegare le ali sono le libellule e le effimere.",
+   "tgt_duration_s": 9.88,
+   "ratio": 1.599
+  },
+  {
+   "id": 1678,
+   "en_text": "Tomas Vega, in his paper The Chancellor's Speech, indicated how people who are unable to understand speech because of brain damage are nevertheless able to assess sincerity accurately.",
+   "en_duration_s": 10.2,
+   "tgt_text": "Nel suo saggio \"Il discorso del Cancelliere\", Tomas Vega ha illustrato come persone incapaci di comprendere il linguaggio parlato a causa di danni cerebrali siano tuttavia in grado di valutare con precisione la sincerità.",
+   "tgt_duration_s": 13.96,
+   "ratio": 1.369
+  },
+  {
+   "id": 1679,
+   "en_text": "Astrelli have cancelled their remaining concerts on their tour.",
+   "en_duration_s": 4.38,
+   "tgt_text": "I successivi concerti del tour sono stati annullati dagli Astrelli.",
+   "tgt_duration_s": 5.12,
+   "ratio": 1.169
+  },
+  {
+   "id": 1680,
+   "en_text": "A well rounded athlete, the tiger can climb (though not well), swim, leap great distances and pull with five times the force of a strong human.",
+   "en_duration_s": 14.88,
+   "tgt_text": "Un atleta completo: la tigre è in grado di arrampicarsi (seppure non troppo bene), nuotare, fare salti molto lunghi ed esercitare una forza di trazione cinque volte superiore a quella di un uomo forte.",
+   "tgt_duration_s": 18.88,
+   "ratio": 1.269
+  },
+  {
+   "id": 1681,
+   "en_text": "It isn’t alone though, experimentation, and an experiment is a test that is used to eliminate one or more of the possible hypotheses, asking questions, and making observations also guide scientific research.",
+   "en_duration_s": 11.34,
+   "tgt_text": "Ma non si tratta solo della sperimentazione, posto che un esperimento è un test che si usa per escludere uno o più delle possibili ipotesi; anche porre domande e fare osservazioni consente di orientare la ricerca scientifica.",
+   "tgt_duration_s": 15.0,
+   "ratio": 1.323
+  },
+  {
+   "id": 1682,
+   "en_text": "While no one knows for certain who wrote it, it is known that early in its life, the large parchment document (it measures 29¾ inches by 24½ inches) was rolled up for storage.",
+   "en_duration_s": 15.64,
+   "tgt_text": "Nonostante non si sappia per certo chi lo ha scritto, è risaputo che all'inizio della sua esistenza l'ampio documento di pergamena (misura 29,75 pollici per 24,5 pollici) sia stato arrotolato per essere riposto.",
+   "tgt_duration_s": 16.08,
+   "ratio": 1.028
+  },
+  {
+   "id": 1683,
+   "en_text": "There are still many men and women alive who survived their time here, and many more who had loved ones who were murdered or worked to death there, Jews and non-Jews alike.",
+   "en_duration_s": 17.7,
+   "tgt_text": "Ci sono ancora molti uomini e donne sopravvissuti a questi luoghi, e molti altri che hanno visto i propri cari assassinati o fatti lavorare fino alla morte, sia ebrei che non.",
+   "tgt_duration_s": 15.24,
+   "ratio": 0.861
+  },
+  {
+   "id": 1684,
+   "en_text": "Apia is the capital of Samoa. The town is on the island of Upolu and has a population of just under 40,000.",
+   "en_duration_s": 9.96,
+   "tgt_text": "Apia è la capitale delle isole Samoa. È situata sull'isola di Upolu e la sua popolazione conta poco meno di 40.000 abitanti.",
+   "tgt_duration_s": 10.88,
+   "ratio": 1.092
+  },
+  {
+   "id": 1685,
+   "en_text": "For example, the most common still image photography format in the world is 35mm, which was the dominant film size at the close of the analog film era.",
+   "en_duration_s": 12.9,
+   "tgt_text": "Il formato più comune nel mondo per la fotografia di immagini fisse, ad esempio, è il 35 mm, lo stesso della pellicola più usata sul finire dell'era della fotografia analogica.",
+   "tgt_duration_s": 15.32,
+   "ratio": 1.188
+  }
+ ],
+ "de": [
+  {
+   "id": 1660,
+   "en_text": "Romanticism had a large element of cultural determinism, drawn from writers such as Goethe, Fichte, and Schlegel.",
+   "en_duration_s": 11.52,
+   "tgt_text": "Die Romantik hatte ein starkes, kulturell deterministisches Element, das sich aus Schriftstellern wie Goethe, Fichte und Schlegel schöpfte.",
+   "tgt_duration_s": 9.76,
+   "ratio": 0.847
+  },
+  {
+   "id": 1661,
+   "en_text": "He did not set a figure for the cuts, saying they will be made based on China's economic output.",
+   "en_duration_s": 6.9,
+   "tgt_text": "Er nannte keine Zahl für die Kürzungen, sondern sagte, sie würden auf der Grundlage der Wirtschaftsleistung Chinas vorgenommen.",
+   "tgt_duration_s": 7.44,
+   "ratio": 1.078
+  },
+  {
+   "id": 1662,
+   "en_text": "Alloys are basically a mixture of two or more metals. Don't forget that there are many elements on the periodic table.",
+   "en_duration_s": 11.16,
+   "tgt_text": "Legierungen sind im Grunde eine Mischung aus zwei oder mehr Metallen. Vergessen Sie nicht, dass es viele Elemente im Periodensystem gibt.",
+   "tgt_duration_s": 9.2,
+   "ratio": 0.824
+  },
+  {
+   "id": 1663,
+   "en_text": "Cochamó Valley - Chile's premier climbing destination, known as the Yosemite of South America, with a variety of granite big walls and crags.",
+   "en_duration_s": 9.9,
+   "tgt_text": "Das Cochamó-Tal – Chiles wichtigstes Kletterziel, bekannt als der Yosemite-Nationalpark von Südamerika, mit einer Vielzahl von großen Granitwänden und -klippen.",
+   "tgt_duration_s": 13.84,
+   "ratio": 1.398
+  },
+  {
+   "id": 1664,
+   "en_text": "Swirl the two dry powders together and then, with clean wet hands, squeeze them into a ball.",
+   "en_duration_s": 5.4,
+   "tgt_text": "Mischen Sie die zwei Trockenpulver zusammen und formen Sie sie dann mit sauberen, nassen Händen zu einem Ball.",
+   "tgt_duration_s": 6.48,
+   "ratio": 1.2
+  },
+  {
+   "id": 1665,
+   "en_text": "The document, according to the leak, will refer to the borders dispute, which Palestine wants based on the borders before the 1967 Mideast War.",
+   "en_duration_s": 10.8,
+   "tgt_text": "Dem Leak zufolge bezieht sich das Dokument auf den Grenzstreit, in dem die Palästinenser ein Zurücksetzen der Grenzen in den Zustand vor dem Sechstagekrieg von 1967 fordern.",
+   "tgt_duration_s": 12.0,
+   "ratio": 1.111
+  },
+  {
+   "id": 1666,
+   "en_text": "You may also wish to consult the advice of governments other than your own, but their advice is designed for their citizens.",
+   "en_duration_s": 10.58,
+   "tgt_text": "Sie können auch die Ratschläge anderer Regierungen als der Ihren konsultieren. Deren Hinweise sind jedoch auf ihre eigenen Staatsbürger zugeschnitten.",
+   "tgt_duration_s": 10.8,
+   "ratio": 1.021
+  },
+  {
+   "id": 1667,
+   "en_text": "Generally speaking, two behaviors can emerge as managers begin to lead their former peers. One end of the spectrum is trying to remain “one of the guys” (or gals).",
+   "en_duration_s": 10.86,
+   "tgt_text": "Im Allgemeinen können sich zwei Verhaltensweisen abzeichnen, wenn Manager beginnen, ihre ehemaligen Kollegen zu leiten. Das eine Ende des Spektrums ist der Versuch, „einer der Jungs“ (oder eines der Mädels) zu bleiben.",
+   "tgt_duration_s": 16.8,
+   "ratio": 1.547
+  },
+  {
+   "id": 1668,
+   "en_text": "It may also be beneficial for one to buy a Wild Card, which provides entry to either selections of parks in South Africa or all of the South African National Parks.",
+   "en_duration_s": 10.44,
+   "tgt_text": "Es kann sich auch lohnen, eine Wild Card zu kaufen, die Zutritt entweder zu ausgewählten Parks in Südafrika oder zu allen südafrikanischen Nationalparks gewährt.",
+   "tgt_duration_s": 10.6,
+   "ratio": 1.015
+  },
+  {
+   "id": 1670,
+   "en_text": "Their thermal behavior is not as steady as large caves on Earth that often maintain a fairly constant temperature, but it is consistent with these being deep holes in the ground,\" said Ray Halloran of the United States Geological Survey (USGS) Astrogeology Team and of Northern Arizona University located in Flagstaff, Arizona.",
+   "en_duration_s": 19.8,
+   "tgt_text": "\"Ihr thermisches Verhalten ist nicht so gleichmäßig wie das großer Höhlen auf der Erde, die oft eine ziemlich konstante Temperatur haben, aber es stimmt damit überein, dass es sich um tiefe Löcher im Boden handelt\"\", sagte Ray Halloran vom Astrogeologie-Team des United States Geological Survey (USGS) und der Northern Arizona University in Flagstaff, Arizona.\"",
+   "tgt_duration_s": 24.84,
+   "ratio": 1.255
+  },
+  {
+   "id": 1671,
+   "en_text": "Congress began funding the obscenity initiative in fiscal 2005 and specified that the FBI must devote 10 agents to adult pornography.",
+   "en_duration_s": 12.42,
+   "tgt_text": "Der Kongress begann im August 2005 mit der Finanzierung der anti-Obszönitätsinitiative und legte fest, dass das FBI 10 Agenten für die Erwachsenenpornographie einsetzen muss.",
+   "tgt_duration_s": 11.8,
+   "ratio": 0.95
+  },
+  {
+   "id": 1672,
+   "en_text": "Be careful not to allow fabric to become too hot (which can cause shrinkage, or in extreme cases, scorch).",
+   "en_duration_s": 10.6,
+   "tgt_text": "Geben Sie acht, dass der Stoff nicht zu heiß wird (das kann ihn schrumpfen lassen oder in extremen Fällen zu Verbrennungen führen).",
+   "tgt_duration_s": 7.6,
+   "ratio": 0.717
+  },
+  {
+   "id": 1673,
+   "en_text": "During the Revolutionary War, the thirteen states first formed a weak central government—with the Congress being its only component—under the Articles of Confederation.",
+   "en_duration_s": 10.68,
+   "tgt_text": "Während der Revolutionskämpfe formten die 13 Bundesstaaten auf Basis des Bundesvertrages zuerst eine schwache Zentralregierung, die nur aus dem Kongress bestand.",
+   "tgt_duration_s": 12.12,
+   "ratio": 1.135
+  },
+  {
+   "id": 1674,
+   "en_text": "In some areas boiling water for a minute is enough, in others several minutes are needed.",
+   "en_duration_s": 6.6,
+   "tgt_text": "In einigen Gebieten genügt es, Wasser eine Minute lang abzukochen, in anderen müssen es mehrere Minuten sein.",
+   "tgt_duration_s": 7.72,
+   "ratio": 1.17
+  },
+  {
+   "id": 1675,
+   "en_text": "All nouns, alongside the word Sie for you, always begin with a capital letter, even in the middle of a sentence.",
+   "en_duration_s": 6.6,
+   "tgt_text": "\"Alle Substantive beginnen neben dem Wort Sie für \"\"you\"\" immer mit einem Großbuchstaben, auch in der Mitte eines Satzes.\"",
+   "tgt_duration_s": 7.84,
+   "ratio": 1.188
+  },
+  {
+   "id": 1676,
+   "en_text": "As with all South African National Parks, there are daily conservation and entry fees for the park.",
+   "en_duration_s": 9.34,
+   "tgt_text": "Wie alle südafrikanischen Nationalparks erhebt der Park tägliche Schutz- und Eintrittsgebühren.",
+   "tgt_duration_s": 8.6,
+   "ratio": 0.921
+  },
+  {
+   "id": 1677,
+   "en_text": "Today, the only insects that cannot fold back their wings are dragon flies and mayflies.",
+   "en_duration_s": 6.18,
+   "tgt_text": "Heute sind Libellen und Eintagsfliegen die einzigen Insekten, die ihre Flügel nicht zurückklappen können.",
+   "tgt_duration_s": 6.12,
+   "ratio": 0.99
+  },
+  {
+   "id": 1678,
+   "en_text": "Tomas Vega, in his paper The Chancellor's Speech, indicated how people who are unable to understand speech because of brain damage are nevertheless able to assess sincerity accurately.",
+   "en_duration_s": 10.2,
+   "tgt_text": "In seinem Artikel Die Rede des Kanzlers zeigte Tomas Vega auf, wie Leute, die wegen eines Hirnschadens keine Sprache mehr verstehen können, trotzdem die Ehrlichkeit von Menschen richtig einschätzen können.",
+   "tgt_duration_s": 12.28,
+   "ratio": 1.204
+  },
+  {
+   "id": 1679,
+   "en_text": "Astrelli have cancelled their remaining concerts on their tour.",
+   "en_duration_s": 4.38,
+   "tgt_text": "Astrelli haben die noch ausstehenden Konzerte ihrer Tour abgesagt.",
+   "tgt_duration_s": 5.04,
+   "ratio": 1.151
+  },
+  {
+   "id": 1680,
+   "en_text": "A well rounded athlete, the tiger can climb (though not well), swim, leap great distances and pull with five times the force of a strong human.",
+   "en_duration_s": 14.88,
+   "tgt_text": "Als vielseitiger Athlet kann der Tiger klettern (wenn auch nicht besonders gut), schwimmen, große Strecken springen und mit der fünffachen Kraft eines starken Menschen ziehen.",
+   "tgt_duration_s": 14.64,
+   "ratio": 0.984
+  },
+  {
+   "id": 1682,
+   "en_text": "While no one knows for certain who wrote it, it is known that early in its life, the large parchment document (it measures 29¾ inches by 24½ inches) was rolled up for storage.",
+   "en_duration_s": 15.64,
+   "tgt_text": "Zwar weiß niemand mit Sicherheit, wer es geschrieben hat, es ist allerdings bekannt, dass das große Pergamentdokument (welches 29¾ Zoll x 24½ Zoll misst) zu Beginn seines Lebens zur Aufbewahrung zusammengerollt wurde.",
+   "tgt_duration_s": 19.56,
+   "ratio": 1.251
+  },
+  {
+   "id": 1683,
+   "en_text": "There are still many men and women alive who survived their time here, and many more who had loved ones who were murdered or worked to death there, Jews and non-Jews alike.",
+   "en_duration_s": 17.7,
+   "tgt_text": "Es leben noch viele Männer und Frauen, die ihre Zeit hier überlebt haben, und viele weitere mit Angehörigen, die dort ermordet wurden oder sich zu Tode arbeiteten, Juden und Nichtjuden gleichermaßen.",
+   "tgt_duration_s": 13.04,
+   "ratio": 0.737
+  },
+  {
+   "id": 1684,
+   "en_text": "Apia is the capital of Samoa. The town is on the island of Upolu and has a population of just under 40,000.",
+   "en_duration_s": 9.96,
+   "tgt_text": "Apia ist die auf der Insel Upolu liegende Hauptstadt von Samoa und weist eine Einwohnerzahl von knapp unter 40.000 auf.",
+   "tgt_duration_s": 7.52,
+   "ratio": 0.755
+  },
+  {
+   "id": 1685,
+   "en_text": "For example, the most common still image photography format in the world is 35mm, which was the dominant film size at the close of the analog film era.",
+   "en_duration_s": 12.9,
+   "tgt_text": "Zum Beispiel ist das weltweit am weitesten verbreitete Standbildformat 35 mm, was der vorherrschenden Filmgröße am Ende der Analogfilmära entspricht.",
+   "tgt_duration_s": 9.96,
+   "ratio": 0.772
+  }
+ ],
+ "es": [
+  {
+   "id": 1660,
+   "en_text": "Romanticism had a large element of cultural determinism, drawn from writers such as Goethe, Fichte, and Schlegel.",
+   "en_duration_s": 11.52,
+   "tgt_text": "El elemento del determinismo cultural se encontraba muy presente en el romanticismo, según estudiosos como Goether, Fichte y Schlegel.",
+   "tgt_duration_s": 9.64,
+   "ratio": 0.837
+  },
+  {
+   "id": 1661,
+   "en_text": "He did not set a figure for the cuts, saying they will be made based on China's economic output.",
+   "en_duration_s": 6.9,
+   "tgt_text": "No mencionó una cifra para los recortes y manifestó que se harán en base a la producción económica de China.",
+   "tgt_duration_s": 8.72,
+   "ratio": 1.264
+  },
+  {
+   "id": 1662,
+   "en_text": "Alloys are basically a mixture of two or more metals. Don't forget that there are many elements on the periodic table.",
+   "en_duration_s": 11.16,
+   "tgt_text": "Las aleaciones son, básicamente, una combinación de dos o más metales. Recuerde que la tabla periódica tiene muchos elementos.",
+   "tgt_duration_s": 10.44,
+   "ratio": 0.935
+  },
+  {
+   "id": 1663,
+   "en_text": "Cochamó Valley - Chile's premier climbing destination, known as the Yosemite of South America, with a variety of granite big walls and crags.",
+   "en_duration_s": 9.9,
+   "tgt_text": "El Valle de Cochamó es el destino para escalar más popular de Chile y es conocido como el Yosemite de Sudamérica, con variedad de extensos muros y riscos de granito.",
+   "tgt_duration_s": 13.12,
+   "ratio": 1.325
+  },
+  {
+   "id": 1664,
+   "en_text": "Swirl the two dry powders together and then, with clean wet hands, squeeze them into a ball.",
+   "en_duration_s": 5.4,
+   "tgt_text": "Agite ambos polvos secos juntos y, después de hacerlo, con las manos higienizadas y húmedas, exprímalos para formar una bola.",
+   "tgt_duration_s": 11.16,
+   "ratio": 2.067
+  },
+  {
+   "id": 1665,
+   "en_text": "The document, according to the leak, will refer to the borders dispute, which Palestine wants based on the borders before the 1967 Mideast War.",
+   "en_duration_s": 10.8,
+   "tgt_text": "Según la información que se filtró, el documento tratará sobre el conflicto fronterizo, que Palestina pretende resolver basándose en los límites vigentes en forma previa a la Guerra del Medio Oriente de 1967.",
+   "tgt_duration_s": 15.08,
+   "ratio": 1.396
+  },
+  {
+   "id": 1666,
+   "en_text": "You may also wish to consult the advice of governments other than your own, but their advice is designed for their citizens.",
+   "en_duration_s": 10.58,
+   "tgt_text": "Es posible que quiera consultar las recomendaciones de otros gobiernos, pero están pensadas para sus propios ciudadanos.",
+   "tgt_duration_s": 7.72,
+   "ratio": 0.73
+  },
+  {
+   "id": 1667,
+   "en_text": "Generally speaking, two behaviors can emerge as managers begin to lead their former peers. One end of the spectrum is trying to remain “one of the guys” (or gals).",
+   "en_duration_s": 10.86,
+   "tgt_text": "En general, pueden darse dos tipos de comportamiento cuando los gerentes comienzan a liderar a sus antiguos compañeros. De un lado del espectro, está el intento de continuar siendo «uno de los muchachos» (o muchachas).",
+   "tgt_duration_s": 21.12,
+   "ratio": 1.945
+  },
+  {
+   "id": 1668,
+   "en_text": "It may also be beneficial for one to buy a Wild Card, which provides entry to either selections of parks in South Africa or all of the South African National Parks.",
+   "en_duration_s": 10.44,
+   "tgt_text": "También puede ser conveniente comprar una Wild Card que permite la entrada a selecciones de parques en Sudáfrica o a todos los Parques Nacionales del país.",
+   "tgt_duration_s": 9.28,
+   "ratio": 0.889
+  },
+  {
+   "id": 1670,
+   "en_text": "Their thermal behavior is not as steady as large caves on Earth that often maintain a fairly constant temperature, but it is consistent with these being deep holes in the ground,\" said Ray Halloran of the United States Geological Survey (USGS) Astrogeology Team and of Northern Arizona University located in Flagstaff, Arizona.",
+   "en_duration_s": 19.8,
+   "tgt_text": "«Si bien su comportamiento térmico no es tan regular como las grandes cuevas en nuestro planeta, que suelen sostener una temperatura bastante estable, es consistente con estas profundas cavidades en el suelo», sostuvo Ray Halloran, del equipo de arqueología del Servicio Geológico Estadounidense (USGS) y de la Universidad del Norte de Arizona, en Flagstaff, Arizona.",
+   "tgt_duration_s": 24.64,
+   "ratio": 1.244
+  },
+  {
+   "id": 1671,
+   "en_text": "Congress began funding the obscenity initiative in fiscal 2005 and specified that the FBI must devote 10 agents to adult pornography.",
+   "en_duration_s": 12.42,
+   "tgt_text": "En el año fiscal 2005, el Congreso inició la financiación de la campaña contra la obscenidad y dio la instrucción de que el FBI debe asignar 10 agentes a ocuparse de la pornografía para adultos.",
+   "tgt_duration_s": 13.92,
+   "ratio": 1.121
+  },
+  {
+   "id": 1672,
+   "en_text": "Be careful not to allow fabric to become too hot (which can cause shrinkage, or in extreme cases, scorch).",
+   "en_duration_s": 10.6,
+   "tgt_text": "Procure no dejar que la tela se caliente demasiado, ya que podría encogerse o, en casos extremos, quemarse.",
+   "tgt_duration_s": 9.16,
+   "ratio": 0.864
+  },
+  {
+   "id": 1673,
+   "en_text": "During the Revolutionary War, the thirteen states first formed a weak central government—with the Congress being its only component—under the Articles of Confederation.",
+   "en_duration_s": 10.68,
+   "tgt_text": "Durante la Guerra de la Revolución, los trece estados formaron, en un principio, un gobierno central endeble bajo los Artículos de la Confederación, en el que el congreso era su único componente.",
+   "tgt_duration_s": 14.44,
+   "ratio": 1.352
+  },
+  {
+   "id": 1674,
+   "en_text": "In some areas boiling water for a minute is enough, in others several minutes are needed.",
+   "en_duration_s": 6.6,
+   "tgt_text": "En algunos, lugares basta con hervir agua durante un minuto, en otros, son necesarios varios más.",
+   "tgt_duration_s": 7.76,
+   "ratio": 1.176
+  },
+  {
+   "id": 1675,
+   "en_text": "All nouns, alongside the word Sie for you, always begin with a capital letter, even in the middle of a sentence.",
+   "en_duration_s": 6.6,
+   "tgt_text": "Todos los sustantivos, así como el vocablo Sie para significar 'usted', llevan siempre su letra inicial mayúscula, aunque estén ubicados en el medio de la oración.",
+   "tgt_duration_s": 12.48,
+   "ratio": 1.891
+  },
+  {
+   "id": 1676,
+   "en_text": "As with all South African National Parks, there are daily conservation and entry fees for the park.",
+   "en_duration_s": 9.34,
+   "tgt_text": "Como en todas las reservas naturales de Sudáfrica, existen tarifas diarias para la conservación y de acceso al parque.",
+   "tgt_duration_s": 8.36,
+   "ratio": 0.895
+  },
+  {
+   "id": 1677,
+   "en_text": "Today, the only insects that cannot fold back their wings are dragon flies and mayflies.",
+   "en_duration_s": 6.18,
+   "tgt_text": "Actualmente, los anisópteros y los efemerópteros son los únicos insectos incapaces de doblar sus alas.",
+   "tgt_duration_s": 8.8,
+   "ratio": 1.424
+  },
+  {
+   "id": 1678,
+   "en_text": "Tomas Vega, in his paper The Chancellor's Speech, indicated how people who are unable to understand speech because of brain damage are nevertheless able to assess sincerity accurately.",
+   "en_duration_s": 10.2,
+   "tgt_text": "Tomas Vega, en su artículo El discurso del canciller, explicó la forma en que aquellos que no pueden comprender el habla a causa de un daño cerebral, pueden, no obstante, evaluar la sinceridad con precisión.",
+   "tgt_duration_s": 16.88,
+   "ratio": 1.655
+  },
+  {
+   "id": 1679,
+   "en_text": "Astrelli have cancelled their remaining concerts on their tour.",
+   "en_duration_s": 4.38,
+   "tgt_text": "Astrelli canceló los conciertos pendientes de su gira.",
+   "tgt_duration_s": 4.32,
+   "ratio": 0.986
+  },
+  {
+   "id": 1680,
+   "en_text": "A well rounded athlete, the tiger can climb (though not well), swim, leap great distances and pull with five times the force of a strong human.",
+   "en_duration_s": 14.88,
+   "tgt_text": "Atleta integral, el tigre tiene la habilidad de trepar (pero no demasiado bien), nadar, dar extensos saltos y jalar cinco veces más fuerte que una persona robusta.",
+   "tgt_duration_s": 15.64,
+   "ratio": 1.051
+  },
+  {
+   "id": 1681,
+   "en_text": "It isn’t alone though, experimentation, and an experiment is a test that is used to eliminate one or more of the possible hypotheses, asking questions, and making observations also guide scientific research.",
+   "en_duration_s": 11.34,
+   "tgt_text": "No se trata, sin embargo, de una experimentación, es una prueba que se usa para descartar una o más de las posibles hipótesis, haciendo preguntas y observaciones que guían la investigación científica.",
+   "tgt_duration_s": 13.32,
+   "ratio": 1.175
+  },
+  {
+   "id": 1682,
+   "en_text": "While no one knows for certain who wrote it, it is known that early in its life, the large parchment document (it measures 29¾ inches by 24½ inches) was rolled up for storage.",
+   "en_duration_s": 15.64,
+   "tgt_text": "Aunque se desconoce a ciencia cierta quién lo redactó, se sabe que apenas fue confeccionado, el enorme documento de pergamino (mide 29¾ pulgadas por 24½ pulgadas) fue enrollado para ser guardado.",
+   "tgt_duration_s": 19.2,
+   "ratio": 1.228
+  },
+  {
+   "id": 1683,
+   "en_text": "There are still many men and women alive who survived their time here, and many more who had loved ones who were murdered or worked to death there, Jews and non-Jews alike.",
+   "en_duration_s": 17.7,
+   "tgt_text": "Aún quedan muchos hombres y mujeres con vida que sobrevivieron a su estadía en este lugar y muchos más que tuvieron seres queridos a los que asesinaron o trabajaron allí hasta su muerte, tanto judíos como no judíos.",
+   "tgt_duration_s": 15.52,
+   "ratio": 0.877
+  },
+  {
+   "id": 1684,
+   "en_text": "Apia is the capital of Samoa. The town is on the island of Upolu and has a population of just under 40,000.",
+   "en_duration_s": 9.96,
+   "tgt_text": "Capital de Samoa, la ciudad de Apia se ubica en la isla de Upolu y cuenta con poco menos de 40 000 habitantes.",
+   "tgt_duration_s": 8.96,
+   "ratio": 0.9
+  }
+ ],
+ "ja": [
+  {
+   "id": 1661,
+   "en_text": "He did not set a figure for the cuts, saying they will be made based on China's economic output.",
+   "en_duration_s": 6.9,
+   "tgt_text": "胡氏は、削減する数値を定めませんでしたが、削減は中国の経済産出量に基づいて実施されるだろうと述べました。",
+   "tgt_duration_s": 13.84,
+   "ratio": 2.006
+  },
+  {
+   "id": 1662,
+   "en_text": "Alloys are basically a mixture of two or more metals. Don't forget that there are many elements on the periodic table.",
+   "en_duration_s": 11.16,
+   "tgt_text": "合金とは、基本的には2種類以上の金属の混合物です。周期表に載っているたくさんの元素を思い出してください。",
+   "tgt_duration_s": 13.44,
+   "ratio": 1.204
+  },
+  {
+   "id": 1664,
+   "en_text": "Swirl the two dry powders together and then, with clean wet hands, squeeze them into a ball.",
+   "en_duration_s": 5.4,
+   "tgt_text": "乾いた粉を2つ合わせてくるくるとこね回し、清潔な濡れた手でぎゅっと握ります。",
+   "tgt_duration_s": 8.68,
+   "ratio": 1.607
+  },
+  {
+   "id": 1665,
+   "en_text": "The document, according to the leak, will refer to the borders dispute, which Palestine wants based on the borders before the 1967 Mideast War.",
+   "en_duration_s": 10.8,
+   "tgt_text": "漏れ聞いた情報によれば、当該文書は国境紛争に言及するもので、パレスチナの希望は1967年の中東戦争前の国境に基づくものです。",
+   "tgt_duration_s": 15.8,
+   "ratio": 1.463
+  },
+  {
+   "id": 1666,
+   "en_text": "You may also wish to consult the advice of governments other than your own, but their advice is designed for their citizens.",
+   "en_duration_s": 10.58,
+   "tgt_text": "自国以外の政府からの助言を参考にしてもかいまいませんが、そのような助言はその国の国民向けのものです。",
+   "tgt_duration_s": 11.96,
+   "ratio": 1.13
+  },
+  {
+   "id": 1667,
+   "en_text": "Generally speaking, two behaviors can emerge as managers begin to lead their former peers. One end of the spectrum is trying to remain “one of the guys” (or gals).",
+   "en_duration_s": 10.86,
+   "tgt_text": "一般的に言えば、管理職がかつての仲間を率いることになった場合、2とおりの行動が現れる可能性があります。1つは「仲間の1人」のままでいようとする行動です。",
+   "tgt_duration_s": 17.12,
+   "ratio": 1.576
+  },
+  {
+   "id": 1668,
+   "en_text": "It may also be beneficial for one to buy a Wild Card, which provides entry to either selections of parks in South Africa or all of the South African National Parks.",
+   "en_duration_s": 10.44,
+   "tgt_text": "ワイルドカードを購入するとお得な場合があります。南アフリカの主な公園または南アフリカのすべての国立公園に入場できます。",
+   "tgt_duration_s": 13.88,
+   "ratio": 1.33
+  },
+  {
+   "id": 1670,
+   "en_text": "Their thermal behavior is not as steady as large caves on Earth that often maintain a fairly constant temperature, but it is consistent with these being deep holes in the ground,\" said Ray Halloran of the United States Geological Survey (USGS) Astrogeology Team and of Northern Arizona University located in Flagstaff, Arizona.",
+   "en_duration_s": 19.8,
+   "tgt_text": "「そうした熱挙動は、一定の温度をかなり保てる地球上の大洞窟ほど安定していないことが多いのですが、地中に深い穴ができる点は一致しています」と、米国地質調査所(USGS)宇宙地質学チームとアリゾナ州フラッグスタッフにあるノーザンアリゾナ大学のレイ・ハロラン氏は述べています。",
+   "tgt_duration_s": 27.24,
+   "ratio": 1.376
+  },
+  {
+   "id": 1671,
+   "en_text": "Congress began funding the obscenity initiative in fiscal 2005 and specified that the FBI must devote 10 agents to adult pornography.",
+   "en_duration_s": 12.42,
+   "tgt_text": "連邦議会は2005年度から猥褻物取締法への資金提供を開始し、FBIはアダルトポルノに10人の捜査員を投入しなければならないと規定しました。",
+   "tgt_duration_s": 19.28,
+   "ratio": 1.552
+  },
+  {
+   "id": 1672,
+   "en_text": "Be careful not to allow fabric to become too hot (which can cause shrinkage, or in extreme cases, scorch).",
+   "en_duration_s": 10.6,
+   "tgt_text": "生地の温度が上がりすぎないように気を付けてください（縮みの原因になったり、極端な場合は焦げ付きの原因になります）。",
+   "tgt_duration_s": 11.2,
+   "ratio": 1.057
+  },
+  {
+   "id": 1674,
+   "en_text": "In some areas boiling water for a minute is enough, in others several minutes are needed.",
+   "en_duration_s": 6.6,
+   "tgt_text": "1分間で沸騰する地域もあれば、沸騰するまでに何分もかかる地域もあります。",
+   "tgt_duration_s": 9.48,
+   "ratio": 1.436
+  },
+  {
+   "id": 1675,
+   "en_text": "All nouns, alongside the word Sie for you, always begin with a capital letter, even in the middle of a sentence.",
+   "en_duration_s": 6.6,
+   "tgt_text": "すべての名詞は、「あなた」を指す単語Sieと同様に、文の途中であっても常に大文字で始まります。",
+   "tgt_duration_s": 11.2,
+   "ratio": 1.697
+  },
+  {
+   "id": 1676,
+   "en_text": "As with all South African National Parks, there are daily conservation and entry fees for the park.",
+   "en_duration_s": 9.34,
+   "tgt_text": "南アフリカにあるすべての国立公園と同様に、この公園には毎日保護費と入園料がかかります。",
+   "tgt_duration_s": 9.84,
+   "ratio": 1.054
+  },
+  {
+   "id": 1677,
+   "en_text": "Today, the only insects that cannot fold back their wings are dragon flies and mayflies.",
+   "en_duration_s": 6.18,
+   "tgt_text": "現在、翅を折り返すことができない昆虫はトンボとカゲロウのみです。",
+   "tgt_duration_s": 3.4,
+   "ratio": 0.55
+  },
+  {
+   "id": 1679,
+   "en_text": "Astrelli have cancelled their remaining concerts on their tour.",
+   "en_duration_s": 4.38,
+   "tgt_text": "アストレッリはツアーで予定していたコンサートを中止しました。",
+   "tgt_duration_s": 4.32,
+   "ratio": 0.986
+  },
+  {
+   "id": 1680,
+   "en_text": "A well rounded athlete, the tiger can climb (though not well), swim, leap great distances and pull with five times the force of a strong human.",
+   "en_duration_s": 14.88,
+   "tgt_text": "実に均整の取れた体で運動能力の高い虎は、（うまくはないものの）登ったり、泳いだり、長い距離を跳んだり、たくましい人間の5倍の力で引っ張ったりできます。",
+   "tgt_duration_s": 18.16,
+   "ratio": 1.22
+  },
+  {
+   "id": 1681,
+   "en_text": "It isn’t alone though, experimentation, and an experiment is a test that is used to eliminate one or more of the possible hypotheses, asking questions, and making observations also guide scientific research.",
+   "en_duration_s": 11.34,
+   "tgt_text": "しかし、それだけではありません。実験とは、可能性のある仮説の1つ以上を排除するために使用される試験のことで、質問をしたり観察をしたりすることも科学研究の指針となります。",
+   "tgt_duration_s": 16.56,
+   "ratio": 1.46
+  },
+  {
+   "id": 1683,
+   "en_text": "There are still many men and women alive who survived their time here, and many more who had loved ones who were murdered or worked to death there, Jews and non-Jews alike.",
+   "en_duration_s": 17.7,
+   "tgt_text": "ここには当時を生き延びた多くの男女がおり、ユダヤ人かどうかを問わず、そこで大切な人が殺害されたり強制労働させられたりした人たちも大勢います。",
+   "tgt_duration_s": 16.52,
+   "ratio": 0.933
+  },
+  {
+   "id": 1684,
+   "en_text": "Apia is the capital of Samoa. The town is on the island of Upolu and has a population of just under 40,000.",
+   "en_duration_s": 9.96,
+   "tgt_text": "アピアはサモアの首都です。この町はウポル島にあり、人口は4万人弱です。",
+   "tgt_duration_s": 12.2,
+   "ratio": 1.225
+  },
+  {
+   "id": 1685,
+   "en_text": "For example, the most common still image photography format in the world is 35mm, which was the dominant film size at the close of the analog film era.",
+   "en_duration_s": 12.9,
+   "tgt_text": "例えば、世界で最も普及している静止画写真のフィルム形式は35 mmで、これはアナログフィルム時代の終わり頃には主流のフィルムサイズでした。",
+   "tgt_duration_s": 17.88,
+   "ratio": 1.386
+  },
+  {
+   "id": 1686,
+   "en_text": "As a result, the process of an organization working together to overcome an obstacle can lead to a new innovative process to serve the customer's need.",
+   "en_duration_s": 8.76,
+   "tgt_text": "その結果、組織が協力して障害を克服するプロセスは、顧客のニーズに応えるための新しい革新的なプロセスにつながる可能性があります。",
+   "tgt_duration_s": 16.52,
+   "ratio": 1.886
+  },
+  {
+   "id": 1687,
+   "en_text": "Segregation and recombination shuffle variation back and forth between the two pools with each generation.",
+   "en_duration_s": 11.22,
+   "tgt_text": "棲み分けと組み換えは、世代ごとに2つのプールの間を行き来しながら変異をシャッフルします。",
+   "tgt_duration_s": 10.12,
+   "ratio": 0.902
+  },
+  {
+   "id": 1688,
+   "en_text": "The job of navies has traditionally been to ensure that your country maintains the ability to move your people and goods, while at the same time, interfering with your enemy's ability to move his people and goods.",
+   "en_duration_s": 15.36,
+   "tgt_text": "従来より、海軍の仕事は、自国民や物資を輸送する能力を維持すると同時に、敵国民や物資を輸送する能力を確実に妨害することでした。",
+   "tgt_duration_s": 18.84,
+   "ratio": 1.227
+  },
+  {
+   "id": 1690,
+   "en_text": "We agree with the USOC's statement that the interests of our athletes and clubs, and their sport, may be better served by moving forward with meaningful change within our organization, rather than decertification.",
+   "en_duration_s": 19.66,
+   "tgt_text": "私たちは、資格を剥奪するよりも、組織内で意味のある変革を進めた方が選手やクラブ、そしてスポーツに資する可能性があるというUSOCの声明に同意しています。",
+   "tgt_duration_s": 18.12,
+   "ratio": 0.922
+  }
+ ]
+}

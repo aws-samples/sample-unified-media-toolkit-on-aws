@@ -1,0 +1,522 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# ============================================================================
+# cast-resolution-on-aws — resolves WHO is in a media asset: binds
+# diarization SPEAKER_IDs, face-recognition person ids, and on-screen text
+# names into person entities with names, types, and evidence (README.md).
+#
+# TWO Lambdas out of ONE flat zip (the gateway dispatcher and the
+# operation-routed workflow handler) and ONE two-state machine. P0 binds
+# from FREE EVIDENCE only — no Bedrock, no OCR, no sibling invocation —
+# so this stack has no sibling-ARN parameters yet; P1's frame-inspection
+# reads will add them the CA way (explicit parameters, never
+# Fn::ImportValue).
+# ============================================================================
+Description: >
+    cast-resolution micro-workflow: sibling run prefixes in (diarization,
+    face-recognition, shot-segmentation, enrichment), person entities and
+    pinned remap tables out. Names only from independent naming
+    mechanisms; a critic demotes contradictions rather than guessing.
+
+Metadata:
+    AWS::CloudFormation::Interface:
+        ParameterGroups:
+            -
+                Label:
+                    default: Resource Naming
+                Parameters:
+                    - ResourcePrefix
+            -
+                Label:
+                    default: S3 Bucket
+                Parameters:
+                    - ProxyBucket
+        ParameterLabels:
+            ResourcePrefix:
+                default: Resource Name Prefix
+            ProxyBucket:
+                default: Proxy Bucket (sibling outputs in, outputs out)
+
+Parameters:
+    ResourcePrefix:
+        Type: String
+        Description: Prefix applied to all resource names.
+        AllowedPattern: "[a-z0-9][a-z0-9-]*"
+    ProxyBucket:
+        Type: String
+        Description: S3 proxy bucket — sibling run outputs are read from micro-workflow/* and outputs land under micro-workflow/cast-resolution/. No default on purpose.
+    FrameInspectionGatewayLambdaArn:
+        Type: String
+        Default: ""
+        Description: The frame-inspection stack's GatewayToolLambdaArn output. Empty (the default) disables focus reads entirely — the machine binds on free evidence; reads are an enhancement, never a dependency.
+
+    BedrockInferenceGatewayLambdaArn:
+        Type: String
+        Default: ""
+        Description: The bedrock-inference stack's GatewayToolLambdaArn output. Empty (the default) disables the two enrichment rounds (addressee resolution + cast adjudication) — the machine still binds and reads; enrichment is an enhancement, never a dependency.
+
+    PromptRegistryGatewayLambdaArn:
+        Type: String
+        Description: The prompt-registry stack's AdminToolLambdaArn output (the ADMIN surface — the three enrichment system prompts are INTERNAL categories, invisible on the standard target). REQUIRED — ValidateSources binds cast-adjudicate / cast-critic2 / cast-vocatives before any state runs.
+
+Conditions:
+    HasFrameInspection: !Not [!Equals [!Ref FrameInspectionGatewayLambdaArn, ""]]
+    HasBedrockInference: !Not [!Equals [!Ref BedrockInferenceGatewayLambdaArn, ""]]
+
+Mappings:
+    Solution:
+        Package:
+            GatewayTool: "%%PKG_GATEWAY_TOOL%%"
+            Workflow: "%%PKG_WORKFLOW%%"
+        Source:
+            Bucket: "%%BUCKET_NAME%%"
+            KeyPrefix: "%%KEY_PREFIX%%"
+    Lambda:
+        GatewayTool:
+            Name: gateway-tool
+            Memory: 512
+            Timeout: 60
+        Workflow:
+            Name: workflow
+            Memory: 1024
+            Timeout: 300
+
+Resources:
+    ############################################################################
+    # Gateway tool — resolve_cast / get_job_status / describe_tool
+    ############################################################################
+    GatewayToolLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            # -log suffix + LoggingConfig, never /aws/lambda/{name}: the
+            # canonical group may exist as an orphan from an earlier deploy,
+            # and CFN cannot adopt a group (micro-workflow-bundle/README.md §C8).
+            LogGroupName: !Sub
+                - ${ResourcePrefix}-cast-resolution-${tool}-log
+                - tool: !FindInMap [Lambda, GatewayTool, Name]
+            RetentionInDays: 30
+
+    GatewayToolRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}CastResolutionGatewayToolPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # Scoped logs, no AWSLambdaBasicExecutionRole (the
+                          # managed policy lets a function that cannot reach
+                          # its declared group silently create an unmanaged
+                          # one).
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt GatewayToolLogGroup.Arn
+                          - Effect: Allow
+                            Action: states:StartExecution
+                            Resource: !Ref CastResolutionStateMachine
+                          # DescribeExecution / GetExecutionHistory take
+                          # execution ARNs, not the machine ARN.
+                          - Effect: Allow
+                            Action:
+                                - states:DescribeExecution
+                                - states:GetExecutionHistory
+                            Resource: !Sub
+                                - arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${smName}:*
+                                - smName: !GetAtt CastResolutionStateMachine.Name
+                          # get_job_status lifts small header fields from the
+                          # finished persons document and lists which
+                          # conditional outputs exist.
+                          - Effect: Allow
+                            Action: s3:GetObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/cast-resolution/*
+                          # Without ListBucket, GetObject on a MISSING key
+                          # answers 403 AccessDenied instead of 404 NoSuchKey.
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            Condition:
+                                StringLike:
+                                    s3:prefix: micro-workflow/*
+
+    GatewayToolLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Single-purpose dispatcher; reserved concurrency unnecessary
+        Properties:
+            # Unnamed on purpose: reached through LoggingConfig, renames stay
+            # one-update operations.
+            Description: !Sub ${ResourcePrefix}-cast-resolution gateway tool (resolve_cast / get_job_status / describe_tool)
+            Runtime: python3.13
+            Architectures:
+                - arm64
+            Handler: lambda_function.lambda_handler
+            Role: !GetAtt GatewayToolRole.Arn
+            Code:
+                S3Bucket: !FindInMap [Solution, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [Solution, Source, KeyPrefix]
+                      pkg: !FindInMap [Solution, Package, GatewayTool]
+            MemorySize: !FindInMap [Lambda, GatewayTool, Memory]
+            Timeout: !FindInMap [Lambda, GatewayTool, Timeout]
+            LoggingConfig:
+                LogGroup: !Ref GatewayToolLogGroup
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    STATE_MACHINE_ARN: !Ref CastResolutionStateMachine
+                    TOOL_VERSION: "%%VERSION%%"
+                    # Must equal the GatewayTarget Name in media-toolkit-gateway.
+                    TARGET_NAME: cast-resolution
+
+    ############################################################################
+    # Workflow Lambda — one zip, operation-routed (states/router.py)
+    ############################################################################
+    WorkflowLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub
+                - ${ResourcePrefix}-cast-resolution-${tool}-log
+                - tool: !FindInMap [Lambda, Workflow, Name]
+            RetentionInDays: 30
+
+    WorkflowRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}CastResolutionWorkflowPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt WorkflowLogGroup.Arn
+                          # Reads sibling run outputs (any micro-workflow/
+                          # prefix — diarization, face-recognition,
+                          # shot-segmentation, enrichment).
+                          - Effect: Allow
+                            Action: s3:GetObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/*
+                          # Writes ONLY its own run prefix.
+                          - Effect: Allow
+                            Action: s3:PutObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/cast-resolution/*
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            Condition:
+                                StringLike:
+                                    s3:prefix: micro-workflow/*
+                          # The held state SELF-COMPLETES its token on the
+                          # skip/degrade paths. SendTaskSuccess cannot be
+                          # resource-scoped (a task token is a bearer
+                          # credential, not an ARN — bedrock's W11).
+                          - Effect: Allow
+                            Action: states:SendTaskSuccess
+                            # any machine in THIS account+region — the token's machine is the
+                            # caller's (ours or a customer's own), never known at deploy time
+                            Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*
+                          # ScheduleReadsAndWait invokes the witness's
+                          # gateway Lambda directly (the family's sibling-
+                          # invoke pattern, never its state machine).
+                          - !If
+                              - HasFrameInspection
+                              - Effect: Allow
+                                Action: lambda:InvokeFunction
+                                Resource: !Ref FrameInspectionGatewayLambdaArn
+                              - !Ref AWS::NoValue
+                          # ValidateSources binds the three internal
+                          # prompt categories at refuse-before-spend time
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource: !Ref PromptRegistryGatewayLambdaArn
+                          # the two enrichment states invoke the
+                          # bedrock-inference gateway the same way
+                          - !If
+                              - HasBedrockInference
+                              - Effect: Allow
+                                Action: lambda:InvokeFunction
+                                Resource: !Ref BedrockInferenceGatewayLambdaArn
+                              - !Ref AWS::NoValue
+
+    WorkflowLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Serial workflow states; reserved concurrency unnecessary
+        Properties:
+            Description: !Sub ${ResourcePrefix}-cast-resolution workflow states (operation-routed)
+            Runtime: python3.13
+            Architectures:
+                - arm64
+            Handler: lambda_function.lambda_handler
+            Role: !GetAtt WorkflowRole.Arn
+            Code:
+                S3Bucket: !FindInMap [Solution, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [Solution, Source, KeyPrefix]
+                      pkg: !FindInMap [Solution, Package, Workflow]
+            MemorySize: !FindInMap [Lambda, Workflow, Memory]
+            Timeout: !FindInMap [Lambda, Workflow, Timeout]
+            LoggingConfig:
+                LogGroup: !Ref WorkflowLogGroup
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    TARGET_NAME: cast-resolution
+                    TOOL_VERSION: "%%VERSION%%"
+                    FI_GATEWAY_ARN: !If [HasFrameInspection, !Ref FrameInspectionGatewayLambdaArn, ""]
+                    BEDROCK_GATEWAY_ARN: !If [HasBedrockInference, !Ref BedrockInferenceGatewayLambdaArn, ""]
+                    PROMPT_REGISTRY_ARN: !Ref PromptRegistryGatewayLambdaArn
+
+    ############################################################################
+    # State machine
+    ############################################################################
+    StateMachineRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: states.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}CastResolutionStateMachinePolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource: !GetAtt WorkflowLambda.Arn
+
+    CastResolutionStateMachine:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            StateMachineName: !Sub ${ResourcePrefix}-cast-resolution
+            RoleArn: !GetAtt StateMachineRole.Arn
+            DefinitionSubstitutions:
+                WorkflowLambdaArn: !GetAtt WorkflowLambda.Arn
+            # Inline is the single source of truth for what deploys;
+            # definitions.json is the readability copy — edit BOTH, the
+            # build script fails on drift.
+            DefinitionString: |-
+                {
+                  "Comment": "cast-resolution: sibling run prefixes in, person entities + pinned remap tables out. SIX linear states, the family shape (CA \u00a78): every wait is ONE held waitForTaskToken state completed by a service-side waker (bedrock-inference for the two enrichment rounds, frame-inspection for the witness reads), NO polling and NO Choice states anywhere \u2014 skips are SELF-COMPLETED tokens carrying the reason as data. ONE BIND: addressee resolution runs BEFORE BindPersons so its output joins the bind as ordinary cues, and everything after BindPersons only AMENDS the written products (post-review architecture, 2026-09-05 \u2014 no second pipeline, so enrichment can never lose evidence Bind paid for). State count follows the record-dependency rule: independent records pool into one submission (adjudication + critique share round 2); dependent rounds get their own state. Caller flags (normalized into the identity hash, ONE default home pb_common.DEFAULT_FLAGS, all true): read_onscreen_text, llm_enrichment, use_batch (witness-read economics; enrichment rounds are tiny text and always sync). Timeouts are CA-sized DEADMEN: witness held state 93600s (batch SLA), enrichment held states 3600s (sync rounds), machine 108000s. Readability copy of the template's inline DefinitionString; edit BOTH, the build fails on drift.",
+                  "StartAt": "Validate sources",
+                  "TimeoutSeconds": 108000,
+                  "States": {
+                    "Validate sources": {
+                      "Type": "Task",
+                      "Comment": "Everything that can refuse refuses HERE: input shape, own-bucket rule, sibling artifact existence, the provenance pin, and flag normalization. Persists _plan/plan.json; states pass URIs, never bodies.",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "ValidateSources",
+                          "uuid.$": "$.uuid",
+                          "input.$": "$.input"
+                        }
+                      },
+                      "OutputPath": "$.Payload",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Resolve addressees"
+                    },
+                    "Read on-screen text": {
+                      "Type": "Task",
+                      "Comment": "HELD: credits/chyrons/titles get read by the frame-inspection witness during this state. Submits with callback_task_token + idempotency_token = THIS run's uuid; fi's waker completes the token with the terminal status AS DATA. Self-completed skips: read_onscreen_text=false, no witness/capability, nothing to read, all ledgered (prior products handed over), submit failure. NO Catch: a REDRIVE resubmits and absorbs \u2014 redrive IS the reconcile.",
+                      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "ReadOnscreenText",
+                          "uuid.$": "$.uuid",
+                          "plan_s3uri.$": "$.plan_s3uri",
+                          "task_token.$": "$$.Task.Token"
+                        }
+                      },
+                      "ResultPath": "$.reads_result",
+                      "TimeoutSeconds": 93600,
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 5,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Bind persons"
+                    },
+                    "Bind persons": {
+                      "Type": "Task",
+                      "Comment": "THE pipeline, one retry unit (~0.4s, $0 beyond what earlier states spent): sources, cues (round-1 addressees injected as ordinary cues), vocative voting, co-occurrence, persons with the TOOTH-1 critic inside, witness-product consumption via fi's manifest, cast pairing, roles, read-ledger append. WRITES persons.json (provenance pin included) + remap tables + usage (witness + round-1 costs; pre_enrichment_total recorded so ApplyEnrichment recomputes idempotently) \u2014 the durability line: the final product only gains from here, never loses.",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "BindPersons",
+                          "uuid.$": "$.uuid",
+                          "plan_s3uri.$": "$.plan_s3uri",
+                          "reads_result.$": "$.reads_result",
+                          "addressees_result.$": "$.addressees_result"
+                        }
+                      },
+                      "ResultSelector": {
+                        "summary.$": "$.Payload"
+                      },
+                      "ResultPath": "$.bind_result",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Adjudicate cast"
+                    },
+                    "Resolve addressees": {
+                      "Type": "Task",
+                      "Comment": "HELD, enrichment round 1 (P2-b), runs FIRST because it needs only the transcript: who is being ADDRESSED in dialogue. Unresolved vocative sites (adjacency voting first, its names never re-asked) go to bedrock-inference with callback_task_token; sync, tiny text records. BindPersons consumes the answers as ordinary cues \u2014 one bind, no re-bind. Self-completed skips: llm_enrichment=false, no transcript/cues, nothing unresolved, submit failure \u2014 every path reaches the reads.",
+                      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "ResolveAddressees",
+                          "plan_s3uri.$": "$.plan_s3uri",
+                          "task_token.$": "$$.Task.Token"
+                        }
+                      },
+                      "ResultPath": "$.addressees_result",
+                      "TimeoutSeconds": 3600,
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 5,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Read on-screen text"
+                    },
+                    "Adjudicate cast": {
+                      "Type": "Task",
+                      "Comment": "HELD, enrichment round 2 (P2-a + tooth-2): builds cast-adjudication dossiers and report-only critique records from the SHIPPED persons.json (never a re-bind) and submits them as ONE pooled run \u2014 the two families are independent, so they share the submission (the batching rule). Context artifacts are written only when a submission exists. Nothing to ask self-completes with adjudication=skipped.",
+                      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "AdjudicateCast",
+                          "plan_s3uri.$": "$.plan_s3uri",
+                          "task_token.$": "$$.Task.Token"
+                        }
+                      },
+                      "ResultPath": "$.adjudication_result",
+                      "TimeoutSeconds": 3600,
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 5,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Apply enrichment"
+                    },
+                    "Apply enrichment": {
+                      "Type": "Task",
+                      "Comment": "The enrichment consumer, AMENDS ONLY: firewall the verdicts (verbatim universe + citations + agreement), apply assignments onto the persons.json BindPersons wrote (provenance pin carries through), re-run the tooth-1 critic (demote-only), attach report-only tooth-2 flags, rewrite persons.json + remap tables, and recompute usage from the recorded pre-enrichment base + round-2 cost \u2014 idempotent, a retried apply writes the same numbers. A skipped/failed round 2 is a no-op: round 1's results and cost are already in Bind's products.",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "ApplyEnrichment",
+                          "plan_s3uri.$": "$.plan_s3uri",
+                          "adjudication_result.$": "$.adjudication_result"
+                        }
+                      },
+                      "OutputPath": "$.Payload",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "End": true
+                    }
+                  }
+                }
+Outputs:
+    GatewayToolLambdaArn:
+        Description: ARN of the gateway tool Lambda — the value media-toolkit-gateway' CastResolutionToolLambdaArn parameter will consume.
+        Value: !GetAtt GatewayToolLambda.Arn
+    StateMachineArn:
+        Description: ARN of the cast-resolution state machine.
+        Value: !Ref CastResolutionStateMachine

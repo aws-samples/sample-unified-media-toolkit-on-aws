@@ -1,0 +1,54 @@
+// Annotated example event for the face-recognition state machine.
+// The gateway tool constructs this from flat MCP parameters — direct SFN
+// callers supply it verbatim. All input_config fields optional; defaults in
+// lib/input_schema.py.
+{
+  // Execution identity: the gateway derives this (uuid5 of canonical input +
+  // tool version) and names the execution with it. The sandbox collection is
+  // "sandbox-{uuid}" and the semaphore holder key embeds the execution ARN,
+  // both reconstructed from this value + STATE_MACHINE_ARN.
+  "uuid": "3f1a2b3c-4d5e-5f60-8192-a3b4c5d6e7f8",
+
+  "input": {
+    "s3uri": "s3://<your-ingest-bucket>/path/to/source.mp4",
+    "input_config": {
+      // ── Frame extraction (media-processing child) ──────────────────────
+      "frame_interval_sec": 1.0,       // 0.2-10; one frame per second
+      "use_partial": false,
+      "mark_in_out": [0, 0],           // [start_sec, end_sec] when use_partial
+
+      // ── Probe-then-fill detection ──────────────────────────────────────
+      "probe_stride": 4,               // pass 1 = every 4th frame; 0 = dense
+      "dedup_hamming_threshold": 4,    // near-dup skip; 0 = frame-exact boxes
+
+      // ── Shot-segmentation supplement (README.md §21) ─────────────────────
+      // Optional shots.json from a shot-segmentation run on the SAME asset
+      // (its "shot-list" output). DINOv2 boundaries JOIN the dHash cut
+      // detector (union) for track containment; fails on asset mismatch.
+      "shot_segmentation_s3uri": "",   // "" = dHash cut detector (default)
+
+      // ── Recognition policy (GDPR use cases — README.md §2b) ──────────────
+      "celebrity_recognition": true,   // false: no RecognizeCelebrities
+      "collection_id": "face-recognition-on-aws",  // "": no persistent ops
+      "max_faces_to_index": 10,        // 0: search-only (no auto-index)
+      "index_named_faces_only": false, // true: index only named faces
+
+      // ── Quality / validation ───────────────────────────────────────────
+      "min_confidence": 80,            // detection confidence floor
+      "min_appearances": 3,            // tracks required to validate identity
+      "max_track_gap_sec": 3.0,        // temporal tracking gap ceiling
+
+      // ── Concurrency (request-level; NOT stack parameters) ──────────────
+      "max_concurrent_executions": 5,  // semaphore cap (1-50; only ratchets UP)
+      "detect_map_concurrency": 4      // Map MaxConcurrencyPath (1-10; lower for low-TPS regions)
+    }
+  },
+
+  "output": {
+    // Service-derived by the gateway:
+    // s3://{PROXY_BUCKET}/micro-workflow/face-recognition/{workflow_id}
+    "s3uri": "s3://<your-proxy-bucket>/micro-workflow/face-recognition/3f1a2b3c-4d5e-5f60-8192-a3b4c5d6e7f8"
+  },
+
+  "data": {}
+}

@@ -1,0 +1,155 @@
+{
+ "comment": "Per tool: `required` names the fields the gateway refuses without (a prose entry like 'a OR b' states a one-of rule the schema cannot express); `example` is a minimal VALID request including recommended optionals; every other accepted parameter is declared, with type and description, in the tool's InputSchema (delivered via tools/list). The shapes and field names are the contract; every s3 uri, ARN, and id value is an invented placeholder — substitute your deployment's own. Each submit example passes this gateway's full input validation (pinned by a unit test), so an example that drifts from the real contract fails the build.",
+ "tools": {
+  "process_media": {
+   "required": [
+    "asset_s3uri"
+   ],
+   "example": {
+    "asset_s3uri": "s3://my-ingest-bucket/path/to/source.mxf",
+    "idempotency_token": "my-run-2026-10-07"
+   }
+  },
+  "get_job_status": {
+   "required": [
+    "job_id"
+   ],
+   "example": {
+    "job_id": "arn:aws:states:eu-west-1:111111111111:execution:myprefix-media-processing:00000000-0000-5000-8000-000000000001"
+   }
+  },
+  "describe_tool": {
+   "required": [],
+   "example": {}
+  },
+  "quick_edit": {
+   "required": [
+    "segments"
+   ],
+   "example": {
+    "segments": [
+     {
+      "source_s3uri": "s3://my-ingest-bucket/a.mp4",
+      "in_ms": 10000,
+      "out_ms": 18000,
+      "transition_in": {
+       "type": "fade",
+       "duration_ms": 500
+      }
+     },
+     {
+      "source_s3uri": "s3://my-ingest-bucket/b.mp4",
+      "in_ms": 65000,
+      "out_ms": 71000,
+      "transition_in": {
+       "type": "crossfade",
+       "duration_ms": 1000
+      }
+     }
+    ],
+    "target": {
+     "resolution": "1920x1080",
+     "fps": "25"
+    }
+   },
+   "alternatives": {
+    "black_segment": {
+     "segments": [
+      {
+       "source_s3uri": "s3://my-ingest-bucket/a.mp4",
+       "in_ms": 0,
+       "out_ms": 5000
+      },
+      {
+       "source_s3uri": "black",
+       "in_ms": 0,
+       "out_ms": 1600,
+       "transition_in": {
+        "type": "crossfade",
+        "duration_ms": 800
+       }
+      },
+      {
+       "source_s3uri": "s3://my-ingest-bucket/b.mp4",
+       "in_ms": 0,
+       "out_ms": 5000,
+       "transition_in": {
+        "type": "crossfade",
+        "duration_ms": 800
+       }
+      }
+     ],
+     "target": {
+      "resolution": "1920x1080",
+      "fps": "25"
+     }
+    },
+    "audio_overlays": {
+     "segments": [
+      {
+       "source_s3uri": "s3://my-ingest-bucket/a.mp4",
+       "in_ms": 0,
+       "out_ms": 10000,
+       "channel": "v",
+       "crop": {
+        "x": 0.34,
+        "y": 0.0,
+        "width": 0.3125,
+        "height": 1.0
+       }
+      }
+     ],
+     "audio_overlays": [
+      {
+       "source_s3uri": "s3://my-ingest-bucket/vo.wav",
+       "in_ms": 0,
+       "out_ms": 10000,
+       "at_record_ms": 0,
+       "mode": "replace"
+      }
+     ],
+     "target": {
+      "resolution": "1080x1920",
+      "fps": "25"
+     }
+    }
+   }
+  },
+  "capture_frames": {
+   "required": [
+    "markers"
+   ],
+   "example": {
+    "markers": [
+     {
+      "source_s3uri": "s3://my-ingest-bucket/a.mp4",
+      "at_ms": 12345
+     },
+     {
+      "source_s3uri": "s3://my-ingest-bucket/b.mp4",
+      "at_ms": 98000,
+      "crop": {
+       "x": 0.34,
+       "y": 0.0,
+       "width": 0.3125,
+       "height": 1.0
+      }
+     }
+    ],
+    "format": "jpeg"
+   },
+   "alternatives": {
+    "resize": {
+     "markers": [
+      {
+       "source_s3uri": "s3://my-ingest-bucket/a.mp4",
+       "at_ms": 12345
+      }
+     ],
+     "format": "png",
+     "resize": "1080x1920"
+    }
+   }
+  }
+ }
+}

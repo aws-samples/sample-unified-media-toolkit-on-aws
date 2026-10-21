@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+dist/
+.DS_Store
+venv/
+
+# local runs against real content: per-asset outputs and grabbed
+# frames are customer-identifying and copyrighted — never committed
+results/
+*.jpg
+*.jpeg
+*.png
+*.webp

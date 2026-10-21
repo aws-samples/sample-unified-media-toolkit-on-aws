@@ -1,0 +1,215 @@
+{
+    "Comment": "CosyVoice3 TTS synthesis - batch text-to-speech with voice cloning, per-clip ASR QC.",
+    "StartAt": "Check and preprocess",
+    "States": {
+        "Check and preprocess": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${TtsLambda1Core.Arn}",
+                "Payload": {
+                    "operation": "StateCheckAndPreprocess",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Map batch synthesis"
+        },
+        "Map batch synthesis": {
+            "Comment": "MaxConcurrency MUST equal MAP_MAX_CONCURRENCY in states/check_and_preprocess — that state splits the caller's transcripts into at most this many iterators, balanced by estimated work, so a lower value here queues the surplus into a second serial wave that pays every cold model load again while a higher one leaves slots idle. It can exceed this only when one invocation could not hold an iterator's Flow+HiFT work, where an extra iterator (parallel) beats an extra checkpoint resume (serial). Raised 10 -> 40 on 2026-08-10, after execution 630f729f ran 73 transcripts for 52 min at concurrency 1 because one caller batch was one iterator.",
+            "Type": "Map",
+            "MaxConcurrency": 40,
+            "ItemsPath": "$.data.iterators",
+            "ItemSelector": {
+                "operation": "StateSynthesizeLLM",
+                "item_id.$": "$$.Map.Item.Index",
+                "item_data.$": "$$.Map.Item.Value"
+            },
+            "ItemProcessor": {
+                "ProcessorConfig": {
+                    "Mode": "INLINE"
+                },
+                "StartAt": "Synthesize LLM",
+                "States": {
+                    "Synthesize LLM": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "OutputPath": "$.Payload",
+                        "Parameters": {
+                            "FunctionName": "${TtsLambda2Cores.Arn}",
+                            "Payload.$": "$"
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "LambdaResourceTimeoutException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 10,
+                                "BackoffRate": 1
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ClientExecutionTimeoutException",
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException"
+                                ],
+                                "IntervalSeconds": 6,
+                                "MaxAttempts": 4,
+                                "BackoffRate": 2
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 6,
+                                "BackoffRate": 1.5
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Sandbox.Timedout",
+                                    "Lambda.Unknown"
+                                ],
+                                "MaxAttempts": 0
+                            }
+                        ],
+                        "Next": "Synthesize Flow HiFT"
+                    },
+                    "Synthesize Flow HiFT": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "OutputPath": "$.Payload",
+                        "Parameters": {
+                            "FunctionName": "${TtsLambda4Cores.Arn}",
+                            "Payload": {
+                                "operation": "StateSynthesizeFlowHift",
+                                "item_id.$": "$.item_id",
+                                "item_data.$": "$.item_data"
+                            }
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "LambdaResourceTimeoutException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 10,
+                                "BackoffRate": 1
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ClientExecutionTimeoutException",
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException"
+                                ],
+                                "IntervalSeconds": 6,
+                                "MaxAttempts": 4,
+                                "BackoffRate": 2
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 6,
+                                "BackoffRate": 1.5
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Sandbox.Timedout",
+                                    "Lambda.Unknown"
+                                ],
+                                "MaxAttempts": 0
+                            }
+                        ],
+                        "Next": "Verify output"
+                    },
+                    "Verify output": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "OutputPath": "$.Payload",
+                        "Parameters": {
+                            "FunctionName": "${TtsLambda1Core.Arn}",
+                            "Payload": {
+                                "operation": "StateVerifyOutput",
+                                "item_id.$": "$.item_id",
+                                "item_data.$": "$.item_data"
+                            }
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "LambdaResourceTimeoutException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 10,
+                                "BackoffRate": 1
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException",
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 1.5
+                            }
+                        ],
+                        "End": true
+                    }
+                }
+            },
+            "ResultPath": "$.data.iterators",
+            "Next": "Usage tracking"
+        },
+        "Usage tracking": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${TtsLambdaHalfCore.Arn}",
+                "Payload": {
+                    "operation": "StateUsageTracking",
+                    "execution_arn.$": "$$.Execution.Id",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "End": true
+        }
+    }
+}

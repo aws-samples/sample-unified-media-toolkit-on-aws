@@ -1,0 +1,406 @@
+{
+    "Comment": "Frame Embedding - DINOv2 with shot detection, dissolve/noise resolution, recurrence.",
+    "StartAt": "Probe video for chunk transcode",
+    "States": {
+        "Probe video for chunk transcode": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${ShotSegmentationLambda1Core.Arn}",
+                "Payload": {
+                    "operation": "StateProbeVideoForChunkTranscode",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.Unknown"
+                    ],
+                    "MaxAttempts": 0
+                },
+                {
+                    "ErrorEquals": [
+                        "Sandbox.Timedout"
+                    ],
+                    "IntervalSeconds": 6,
+                    "MaxAttempts": 4,
+                    "BackoffRate": 1
+                },
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.ClientExecutionTimeoutException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 2
+                }
+            ],
+            "Catch": [
+                {
+                    "ErrorEquals": [
+                        "LargeMediaFileException"
+                    ],
+                    "Next": "Probe video for chunk transcode (large file)",
+                    "ResultPath": "$.error"
+                }
+            ],
+            "Next": "Map transcode processing"
+        },
+        "Probe video for chunk transcode (large file)": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${ShotSegmentationLambda3Cores.Arn}",
+                "Payload": {
+                    "operation": "StateProbeVideoForChunkTranscodeLargeFile",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.Unknown"
+                    ],
+                    "MaxAttempts": 0
+                },
+                {
+                    "ErrorEquals": [
+                        "Sandbox.Timedout"
+                    ],
+                    "IntervalSeconds": 6,
+                    "MaxAttempts": 4,
+                    "BackoffRate": 1
+                },
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.ClientExecutionTimeoutException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 2
+                }
+            ],
+            "Next": "Map transcode processing"
+        },
+        "Map transcode processing": {
+            "Type": "Map",
+            "MaxConcurrency": 40,
+            "ItemsPath": "$.data.iterators",
+            "ItemSelector": {
+                "operation": "StateRunFFmpegTranscode",
+                "item_id.$": "$$.Map.Item.Index",
+                "item_data.$": "$$.Map.Item.Value"
+            },
+            "ItemProcessor": {
+                "ProcessorConfig": {
+                    "Mode": "INLINE"
+                },
+                "StartAt": "Run FFmpeg transcode",
+                "States": {
+                    "Run FFmpeg transcode": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "OutputPath": "$.Payload",
+                        "Parameters": {
+                            "FunctionName": "${ShotSegmentationLambda3Cores.Arn}",
+                            "Payload.$": "$"
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.Unknown"
+                                ],
+                                "MaxAttempts": 0
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Sandbox.Timedout"
+                                ],
+                                "IntervalSeconds": 6,
+                                "MaxAttempts": 4,
+                                "BackoffRate": 1
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException",
+                                    "Lambda.ClientExecutionTimeoutException",
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 6,
+                                "BackoffRate": 2
+                            }
+                        ],
+                        "End": true
+                    }
+                }
+            },
+            "ResultPath": "$.data.iterators",
+            "Next": "Dynamic chunking for frame embedding"
+        },
+        "Dynamic chunking for frame embedding": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${ShotSegmentationLambdaHalfCore.Arn}",
+                "Payload": {
+                    "operation": "StateDynamicChunkingForFrameEmbedding",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.Unknown"
+                    ],
+                    "MaxAttempts": 0
+                },
+                {
+                    "ErrorEquals": [
+                        "Sandbox.Timedout"
+                    ],
+                    "IntervalSeconds": 6,
+                    "MaxAttempts": 4,
+                    "BackoffRate": 1
+                },
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.ClientExecutionTimeoutException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 2
+                }
+            ],
+            "Next": "Map frame features extraction"
+        },
+        "Map frame features extraction": {
+            "Type": "Map",
+            "MaxConcurrency": 40,
+            "ItemsPath": "$.data.iterators",
+            "ItemSelector": {
+                "operation": "StateExtractFrameFeatures",
+                "item_id.$": "$$.Map.Item.Index",
+                "item_data.$": "$$.Map.Item.Value"
+            },
+            "ItemProcessor": {
+                "ProcessorConfig": {
+                    "Mode": "INLINE"
+                },
+                "StartAt": "Extract frame features",
+                "States": {
+                    "Extract frame features": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "OutputPath": "$.Payload",
+                        "Parameters": {
+                            "FunctionName": "${ShotSegmentationLambda4Cores.Arn}",
+                            "Payload.$": "$"
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "LambdaResourceTimeoutException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 10,
+                                "BackoffRate": 1
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.Unknown"
+                                ],
+                                "IntervalSeconds": 5,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 1
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Sandbox.Timedout"
+                                ],
+                                "IntervalSeconds": 6,
+                                "MaxAttempts": 4,
+                                "BackoffRate": 1
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException",
+                                    "Lambda.ClientExecutionTimeoutException",
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 6,
+                                "BackoffRate": 2
+                            }
+                        ],
+                        "End": true
+                    }
+                }
+            },
+            "ResultPath": "$.data.iterators",
+            "Next": "Merge and reconcile shots"
+        },
+        "Merge and reconcile shots": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${ShotSegmentationLambda3Cores.Arn}",
+                "Payload": {
+                    "operation": "StateMergeAndReconcileShots",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.Unknown"
+                    ],
+                    "MaxAttempts": 0
+                },
+                {
+                    "ErrorEquals": [
+                        "Sandbox.Timedout"
+                    ],
+                    "IntervalSeconds": 6,
+                    "MaxAttempts": 4,
+                    "BackoffRate": 1
+                },
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.ClientExecutionTimeoutException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 2
+                }
+            ],
+            "Next": "Store debug shot images"
+        },
+        "Store debug shot images": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${ShotSegmentationLambda6Cores.Arn}",
+                "Payload": {
+                    "operation": "StateStoreDebugShotImages",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.Unknown"
+                    ],
+                    "MaxAttempts": 0
+                },
+                {
+                    "ErrorEquals": [
+                        "Sandbox.Timedout"
+                    ],
+                    "IntervalSeconds": 6,
+                    "MaxAttempts": 4,
+                    "BackoffRate": 1
+                },
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.ClientExecutionTimeoutException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 2
+                }
+            ],
+            "Next": "Usage tracking"
+        },
+        "Usage tracking": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${ShotSegmentationLambdaHalfCore.Arn}",
+                "Payload": {
+                    "operation": "StateUsageTracking",
+                    "execution_arn.$": "$$.Execution.Id",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.Unknown"
+                    ],
+                    "MaxAttempts": 0
+                },
+                {
+                    "ErrorEquals": [
+                        "Sandbox.Timedout"
+                    ],
+                    "IntervalSeconds": 6,
+                    "MaxAttempts": 4,
+                    "BackoffRate": 1
+                },
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.ClientExecutionTimeoutException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 2
+                }
+            ],
+            "End": true
+        }
+    }
+}

@@ -1,0 +1,149 @@
+{
+    "Comment": "bedrock-inference ORCHESTRATOR (README.md §M1). Plans the work, routes it to one of two standalone child state machines, and collects usage tracking. It runs no Bedrock call itself and holds no lease — the sync child owns the lease, the batch child owns the queue, and each child ends with its own Summarize so each returns a complete summary.json + response.jsonl and is independently startable given a plan. This is the machine callers start: its name is ${ResourcePrefix}-bedrock-inference and its ARN is the InferenceStateMachineArn output, so a consumer calling startExecution.sync:2 on it reads $.Output.data.records_succeeded exactly as before the split. Input: {\"operation\":\"StateValidateAndPlan\",\"uuid\":\"<correlation>\",\"input\":{\"request_s3uri\":\"s3://.../input_params.json\"},\"data\":{}}\n\nFOUR STATES, ONE PATH, NO Catch ANYWHERE. Failures propagate as themselves: whatever the child raised — BedrockInferenceFailed from Summarize with its per-record message, a ValidationException from the plan, a genuine States.Timeout — is what the caller receives, because nothing here intercepts it. A Fail state cannot do better; its Error and Cause must be STATIC (a States.Timeout carries no Cause, and an intrinsic over an absent path fails the state), so catching in order to re-raise could only ever replace a specific error with a generic one. Lease cleanup does not need a Catch either: the child's holder is reclaimed by QuotaTerminalRule on the child's own terminal event, which also covers ABORTED — a status no Catch can see (README.md §M1.1).",
+    "StartAt": "Validate & plan",
+    "States": {
+        "Validate & plan": {
+            "Comment": "Everything that can fail deterministically fails here, BEFORE a token is spent and before a child execution exists: the request parses, the records parse, every model in the chain is registered, and the mode is chosen and reported. Planning lives in the orchestrator rather than in each child so the two children share one plan and neither has to re-read S3 to learn what it is running. No Catch: nothing has been acquired and no child has started, so there is nothing to release and a failure here should surface as itself.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${InferenceLambdaArn}",
+                "Payload": {
+                    "operation": "StateValidateAndPlan",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "data.$": "$.data",
+                    "execution_arn.$": "$$.Execution.Id"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Choose mode"
+        },
+        "Choose mode": {
+            "Comment": "The mode was RESOLVED in Validate & plan, not here — 'auto' never reaches this state. Choice states cannot read the model registry, and the auto decision needs the primary model's batchJob.canSupport plus the record count. Resolving it in the Lambda also means the reason is reportable ($.data.mode_reason → summary.mode_reason), which matters because mode is excluded from workflow_id (§3) and the summary is the only place a caller learns which path ran.\n\nNO Default, deliberately: a mode that is neither 'sync' nor 'batch' fails the execution with States.NoChoiceMatched, which is the same outcome a Fail state here would produce and needs no state to say it. What must never happen is a Default that falls through to sync — that would run a 5000-record set through a serial lease-held loop that cannot finish inside the child's retry budget. choose_mode() returns only these two values and a test pins that, so this is unreachable either way.",
+            "Type": "Choice",
+            "Choices": [
+                {
+                    "Variable": "$.data.mode",
+                    "StringEquals": "sync",
+                    "Next": "Run sync inference"
+                },
+                {
+                    "Variable": "$.data.mode",
+                    "StringEquals": "batch",
+                    "Next": "Run batch inference"
+                }
+            ]
+        },
+        "Run sync inference": {
+            "Comment": "The sync child, called synchronously so this execution's history carries the child's outcome. The child is NAMED {workflow_id}-sync rather than workflow_id: the same records through sync and through batch are deliberately the SAME workflow_id (EXCLUDED_KEYS contains 'mode'), so an unsuffixed child name would be ambiguous between the two children and a mode flip on a retried workflow_id would collide with the sibling's history. The orchestrator execution keeps the bare workflow_id, which is what makes a resubmit hit ExecutionAlreadyExists and return the existing run rather than paying twice (§3). TimeoutSeconds exceeds the child's own worst case (up to 24 h queued for a lease plus ~2.5 h of checkpoint/re-enter retries) so the child's own bounds fire first and report themselves.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::states:startExecution.sync:2",
+            "ResultPath": "$.child",
+            "ResultSelector": {
+                "data.$": "$.Output.data",
+                "execution_arn.$": "$.ExecutionArn",
+                "status.$": "$.Status"
+            },
+            "Parameters": {
+                "StateMachineArn": "${SyncInferenceStateMachineArn}",
+                "Name.$": "States.Format('{}-sync', $.data.workflow_id)",
+                "Input": {
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "data.$": "$.data"
+                }
+            },
+            "TimeoutSeconds": 100800,
+            "Retry": [
+                {
+                    "Comment": "TRANSPORT failures only. States.TaskFailed is deliberately absent: it is what a genuine child failure raises, and retrying that re-issues startExecution under the SAME name, which returns StepFunctions.ExecutionAlreadyExists — so the caller would see a name collision instead of the child's real error. StepFunctions.ExecutionAlreadyExists is likewise not retried: it means this exact child already ran or is running, and a second attempt under a new name would pay for the work twice. Both propagate.",
+                    "ErrorEquals": [
+                        "StepFunctions.SdkClientException",
+                        "StepFunctions.ThrottlingException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 2
+                }
+            ],
+            "Next": "Usage tracking"
+        },
+        "Run batch inference": {
+            "Comment": "The batch child. No lease on its SUBMISSION path: the Bedrock in-progress-job limit is account-level and service-enforced, so a local cap would serialize submissions Bedrock is willing to accept in parallel (§1.1). Its repair tail does take one, by starting the sync child itself (§8) — which is why TimeoutSeconds is 190800 rather than 90000: the child's own worst case is now 86400 s parked on the submit token PLUS its repair grandchild's 100800 s bound, and a parent timeout shorter than that would ABORT a running repair mid-flight instead of letting the child report its own bound. The extra hour is collect and summarize.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::states:startExecution.sync:2",
+            "ResultPath": "$.child",
+            "ResultSelector": {
+                "data.$": "$.Output.data",
+                "execution_arn.$": "$.ExecutionArn",
+                "status.$": "$.Status"
+            },
+            "Parameters": {
+                "StateMachineArn": "${BatchInferenceStateMachineArn}",
+                "Name.$": "States.Format('{}-batch', $.data.workflow_id)",
+                "Input": {
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "data.$": "$.data"
+                }
+            },
+            "TimeoutSeconds": 190800,
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "StepFunctions.SdkClientException",
+                        "StepFunctions.ThrottlingException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 2
+                }
+            ],
+            "Next": "Usage tracking"
+        },
+        "Usage tracking": {
+            "Comment": "Rolls up Lambda cost across the whole execution TREE — this one, the child it started, and anything that child started in turn. Reading only the orchestrator would report near-zero: its own history is one child span and two short Lambda calls, while every Converse retry and every checkpoint re-entry lives in the child. Child spans are tagged and NOT billed as Lambda time, which is the whole reason this module uses face-recognition's kind-tagged model rather than the seven-stack state-span model (README.md §M4). $.child.data is the child's Summarize output, so this state's return carries records_succeeded / records_failed / keys.response unchanged and a caller's ResultSelector on $.Output.data keeps working across the split.\n\nNo child_execution_arn parameter, deliberately. A repaired batch run is a TREE — orchestrator → batch child → sync repair grandchild — and a scalar could name only one of the two, while the grandchild is where the repair's Converse calls and lease wait are billed. The handler discovers descendants instead, from the ExecutionArn each .sync:2 TaskSubmitted event carries, and recurses; the one edge the scalar covered is the first thing that discovery finds.\n\nSUCCESS PATH ONLY — there is no failure-path twin. A failed run's Lambda time is worth well under a cent (every function here is 1024-2048 MB) and it is an ESTIMATE from history timestamps, not billing data; the money that actually matters is Bedrock tokens, and those are already on S3 per record in _progress.json before any failure, priced, because run_inference checkpoints a full response line per record. Nobody bills a customer for a failed run or capacity-plans off failures, so the state that used to record this bought a sub-cent estimate at the price of laundering every distinct child error into one static Fail. The handler still never raises, for a different reason now: this is the terminal state, and a reporting exception here would fail an execution whose response.jsonl and summary.json are already written.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${InferenceLambdaArn}",
+                "Payload": {
+                    "operation": "StateUsageTracking",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "data.$": "$.child.data",
+                    "execution_arn.$": "$$.Execution.Id"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 1.5
+                }
+            ],
+            "End": true
+        }
+    }
+}

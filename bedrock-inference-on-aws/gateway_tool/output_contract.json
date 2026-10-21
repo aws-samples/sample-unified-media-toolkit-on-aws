@@ -1,0 +1,102 @@
+{
+  "contract_version": 1,
+  "target": "bedrock-inference",
+  "stability": "Every entry in `outputs` is stable API: labels, basenames, and the field names/nesting shown in each example. Removing or renaming any of them is a breaking change and requires a TOOL_VERSION bump plus a changelog note here. Files NOT listed here (input_params.json, request.jsonl, _progress.json, anything under batch/) are internal and may change or vanish without notice. `description` is one line by design — it is joined verbatim into each get_job_status outputs[] entry as `desc`.",
+  "outputs": {
+    "response": {
+      "basename": "response.jsonl",
+      "kind": "file",
+      "mime": "application/jsonl",
+      "description": "One line per input record, in request order — output_text is the model's answer; a FAILED line carries reason instead and the run still SUCCEEDS (partial success is success)",
+      "example": {
+        "record_id": "r0",
+        "status": "SUCCESS",
+        "model_id": "global.anthropic.claude-sonnet-4-6",
+        "output_text": "A flowchart of circular nodes connected by solid and dashed arrows.",
+        "stop_reason": "end_turn",
+        "usage": {
+          "inputTokens": 1316,
+          "outputTokens": 59,
+          "cacheReadInputTokens": 0,
+          "cacheWriteInputTokens": 0,
+          "totalTokens": 1375
+        },
+        "estimated_cost": 0.0024165,
+        "rounds": 1
+      },
+      "notes": "status is SUCCESS or FAILED. A FAILED line keeps record_id ordering and adds `reason` (output_text empty, stop_reason empty); usage/rounds are still reported because a record that failed after burning tokens on two models cost real money. `rounds` counts billable model calls behind the line — retries and chain fallbacks included — so summing rounds can exceed the record count. stop_reason `max_tokens` is a normal outcome with partial text intact, not an error. `notes` (optional list) records in-band recoveries, e.g. a model rejecting `temperature`. estimated_cost is null for unpriced models, never 0.0."
+    },
+    "summary": {
+      "basename": "summary.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Run-level rollup — which mode ran and why, per-record success counts, model fallbacks used, and the token/cost totals across every billable call",
+      "example": {
+        "workflow_id": "95bcc113-6559-5ed7-8434-71b5a759aebb",
+        "tool_version": "alpha.20260814e",
+        "inference_mode": "batch",
+        "mode_reason": "requested (use_batch: true)",
+        "models_used": ["global.anthropic.claude-sonnet-4-6"],
+        "records_total": 2,
+        "records_succeeded": 1,
+        "records_failed": 1,
+        "records_resumed": 0,
+        "failures": [
+          {"record_id": "r7", "reason": "content_filtered"}
+        ],
+        "bedrock_usage": {
+          "input_tokens": 1316,
+          "output_tokens": 59,
+          "cache_read_input_tokens": 0,
+          "cache_write_input_tokens": 0,
+          "total_tokens": 1375,
+          "rounds": 1,
+          "rounds_unpriced": 0,
+          "estimated_cost": 0.0024165,
+          "cost_is_complete": true
+        },
+        "quota_table": "",
+        "request_s3uri": "s3://<bucket>/micro-workflow/bedrock-inference/<workflow_id>/input_params.json",
+        "response_s3uri": "s3://<bucket>/micro-workflow/bedrock-inference/<workflow_id>/response.jsonl",
+        "output_prefix": "s3://<bucket>/micro-workflow/bedrock-inference/<workflow_id>",
+        "model_chain": ["anthropic.claude-sonnet-4-6"]
+      },
+      "notes": "inference_mode is `sync` or `batch` — decided at PLAN time and reported with mode_reason (e.g. an auto decision by the dollar guard, or a requested batch downgraded to sync because the model cannot batch); never assume the mode you asked for is the mode that ran. failures[] lists EVERY failed record as {record_id, reason} — no truncation (only the exception MESSAGE on an all-failed run caps at 5). quota_table is always present (empty string unless the deployment names an external quota table) — the split-brain detector between plan and lease. records_resumed counts records a checkpoint re-entry (or a batch repair pass) skipped as already done. bedrock_usage.cost_is_complete false means at least one round ran on an unpriced model, so estimated_cost is a floor, not the bill. `records_repaired` and `repair_error` appear only on batch runs that took the repair tail."
+    },
+    "usage": {
+      "basename": "usage_tracking.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Per-state Lambda wall-clock and cost accounting for the whole execution tree (orchestrator plus whichever child ran) — Bedrock spend included, for the run's total cost of ownership",
+      "example": {
+        "complete": true,
+        "pipeline_wall_sec": 598.1,
+        "child_wall_sec": 596.12,
+        "total_estimated_cost": 0.002452,
+        "lambda_cost": 3.5e-05,
+        "orchestrator_lambda_cost": 9e-06,
+        "child_lambda_cost": 2.6e-05,
+        "bedrock_cost": 0.002417,
+        "bedrock_cost_is_complete": true,
+        "inference_mode": "batch",
+        "execution_arn": "arn:aws:states:<region>:<account>:execution:<prefix>-bedrock-inference:<workflow_id>",
+        "child_execution_arns": ["arn:aws:states:<region>:<account>:execution:<prefix>-bedrock-inference-batch:<workflow_id>-batch"],
+        "states": {
+          "orchestrator": {
+            "Validate & plan": {"kind": "lambda", "invocations": 1, "retried": 0, "duration_sec": 0.196, "billed_sec": 0.183, "memory_mb": 3584, "estimated_cost": 9e-06, "incomplete": false, "wall_sec": 0.196}
+          },
+          "children": {
+            "<workflow_id>-batch": {
+              "execution_arn": "arn:aws:states:<region>:<account>:execution:<prefix>-bedrock-inference-batch:<workflow_id>-batch",
+              "wall_sec": 596.12,
+              "states": {
+                "Submit batch": {"kind": "task_token", "invocations": 1, "retried": 0, "duration_sec": 595.52, "billed_sec": 0.0, "memory_mb": null, "estimated_cost": 0.0, "incomplete": false, "wall_sec": 595.52}
+              }
+            }
+          }
+        }
+      },
+      "notes": "This stack's usage state walks TWO execution histories — the orchestrator's own and whichever child ran — because the orchestrator is three short Lambda calls while every Converse retry and the whole lease wait live in the child. `complete` mirrors summary's cost_is_complete — false whenever any round ran on an unpriced model, even with full history. A run whose HISTORY was unavailable returns the degraded shape {complete: false, reason} with none of the fields below; the run's outcome is unaffected and summary.json stays authoritative for Bedrock cost. `retried` counts re-invocations of the same state (invocations - 1), not failed attempts. Shapes differ slightly across stacks — do not byte-pin this file against another workflow's."
+    }
+  }
+}

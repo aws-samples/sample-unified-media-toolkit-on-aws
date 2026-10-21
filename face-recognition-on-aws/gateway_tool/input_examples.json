@@ -1,0 +1,89 @@
+{
+  "comment": "Per tool: `required` names the fields the gateway refuses without (a prose entry like 'a OR b' states a one-of rule the schema cannot express); `example` is a minimal VALID request including recommended optionals; every other accepted parameter is declared, with type and description, in the tool's InputSchema (delivered via tools/list). The shapes and field names are the contract; every s3 uri, ARN, and id value is an invented placeholder — substitute your deployment's own. Each submit example passes this gateway's full input validation (pinned by a unit test), so an example that drifts from the real contract fails the build. Where a one-of rule exists, `alternatives` holds one valid example of each other form, keyed by the field that selects it; alternatives round-trip the same validation.",
+  "tools": {
+    "recognize_faces": {
+      "required": ["asset_s3uri"],
+      "example": {
+        "asset_s3uri": "s3://my-ingest-bucket/videos/episode-01.mp4",
+        "shot_segmentation_s3uri": "s3://my-proxy-bucket/micro-workflow/shot-segmentation/00000000-0000-5000-8000-000000000001/shots.json",
+        "max_faces_to_index": 0,
+        "idempotency_token": "my-run-2026-10-07"
+      }
+    },
+    "get_job_status": {
+      "required": ["job_id"],
+      "example": {
+        "job_id": "arn:aws:states:eu-west-1:111111111111:execution:myprefix-face-recognition:00000000-0000-5000-8000-000000000002"
+      }
+    },
+    "create_collection": {
+      "required": ["collection_id"],
+      "example": {
+        "collection_id": "my-face-collection"
+      }
+    },
+    "list_collections": {
+      "required": [],
+      "example": {}
+    },
+    "list_faces": {
+      "required": [],
+      "example": {
+        "collection_id": "my-face-collection"
+      }
+    },
+    "get_face": {
+      "required": ["face_id"],
+      "example": {
+        "face_id": "00000000-0000-4000-8000-000000000003"
+      }
+    },
+    "batch_update_faces": {
+      "required": ["updates"],
+      "example": {
+        "updates": [
+          {
+            "face_id": "00000000-0000-4000-8000-000000000003",
+            "celebrity_name": "Lena Voss"
+          }
+        ]
+      }
+    },
+    "batch_index_faces": {
+      "required": ["exactly one of s3_prefix | manifest_s3uri"],
+      "example": {
+        "collection_id": "my-face-collection",
+        "s3_prefix": "s3://my-proxy-bucket/face-index/headshots/"
+      },
+      "alternatives": {
+        "manifest_s3uri": {
+          "collection_id": "my-face-collection",
+          "manifest_s3uri": "s3://my-proxy-bucket/face-index/manifest.jsonl"
+        }
+      }
+    },
+    "batch_delete_faces": {
+      "required": ["exactly one of face_ids | celebrity_name"],
+      "example": {
+        "collection_id": "my-face-collection",
+        "face_ids": ["00000000-0000-4000-8000-000000000003"]
+      },
+      "alternatives": {
+        "celebrity_name": {
+          "collection_id": "my-face-collection",
+          "celebrity_name": "Lena Voss"
+        }
+      }
+    },
+    "delete_collection": {
+      "required": ["collection_id"],
+      "example": {
+        "collection_id": "my-face-collection"
+      }
+    },
+    "describe_tool": {
+      "required": [],
+      "example": {}
+    }
+  }
+}

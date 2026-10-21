@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<!--
+  AUDIO DESCRIPTION review bench. "Is this narration right?" — hero
+  interaction: the audio toggle (Original <-> Described mix, synced).
+  Timeline: dialogue / planned windows / placed narration / gaps.
+  Click a cue -> full ledger dossier. Self-contained: data embedded,
+  media presigned (~1 h) — re-run the skill to refresh.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>__ASSET__ — AD review</title>
+<style>
+/* ad_poc — house metadata-viz look: dark, system-ui 13px, mono timecodes,
+   three categorical colors (blue/orange/green) encoding EVIDENCE state. */
+:root {
+  --bg: #14171c; --panel: #1b1f26; --edge: #2c313a; --ink: #d7dce4;
+  --dim: #8d95a5; --blue: #3987e5; --orange: #d95926; --green: #199e70;
+  --purple: #8a7ae0;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg);
+  color: var(--ink); font: 13px/1.45 system-ui, sans-serif; }
+body { display: flex; flex-direction: column; }
+
+#hdr { display: flex; justify-content: space-between; align-items: center;
+  padding: 8px 14px; border-bottom: 1px solid var(--edge); }
+.hgroup { display: flex; gap: 12px; align-items: center; }
+.fact { font-variant-numeric: tabular-nums; color: var(--dim); }
+.dim { color: var(--dim); }
+select, input, button { background: var(--panel); color: var(--ink);
+  border: 1px solid var(--edge); border-radius: 4px; padding: 4px 8px;
+  font: inherit; }
+button[aria-pressed="true"] { border-color: var(--blue);
+  color: var(--blue); }
+button { cursor: pointer; }
+
+main { display: flex; gap: 10px; padding: 10px 14px 0; min-height: 0;
+  flex: 1 1 auto; }
+#left { width: 46%; display: flex; flex-direction: column; gap: 8px; }
+#vwrap { position: relative; }
+video { width: 100%; background: #000; border-radius: 6px;
+  max-height: 46vh; display: block; }
+.subOverlay { position: absolute; left: 6%; right: 6%; text-align: center;
+  pointer-events: none; font-size: 15px; line-height: 1.35;
+  text-shadow: 0 1px 2px #000; }
+#subDialogue { bottom: 12%; color: #fff; }
+#subDialogue span { background: rgba(0,0,0,.65); padding: 1px 8px;
+  border-radius: 4px; box-decoration-break: clone; }
+/* narration reads as a DIFFERENT voice: amber, italic, AD chip —
+   never confusable with dialogue subtitles */
+#subNarration { bottom: 24%; color: #f4b860; font-style: italic; }
+#subNarration span { background: rgba(20,12,0,.72); padding: 1px 8px;
+  border-radius: 4px; box-decoration-break: clone; }
+#subNarration span::before { content: "AD"; font-style: normal;
+  font-size: 10px; letter-spacing: .08em; color: #14171c;
+  background: #f4b860; border-radius: 3px; padding: 0 4px;
+  margin-right: 6px; vertical-align: 1px; }
+#audioBar { display: flex; gap: 10px; align-items: center; }
+#audioBar .lbl { color: var(--dim); font-size: 11px;
+  letter-spacing: .08em; }
+#audSel { display: flex; gap: 6px; }
+
+#right { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#tabs { display: flex; gap: 6px; margin-bottom: 8px; }
+.tab.on { border-color: var(--blue); color: var(--blue); }
+.tabPane { display: none; overflow: auto; min-height: 0; flex: 1; }
+.tabPane.on { display: block; }
+#cueFilter { width: 100%; margin-bottom: 6px; }
+
+.cue { display: grid; grid-template-columns: 64px 70px 1fr;
+  gap: 8px; padding: 5px 8px; border-bottom: 1px solid var(--edge);
+  cursor: pointer; }
+.cue:hover, .cue.sel { background: var(--panel); }
+.cue .tcv { font-family: ui-monospace, monospace; color: var(--dim); }
+.cue.cur { outline: 1px solid var(--blue); }
+.st { font-size: 11px; padding: 0 6px; border-radius: 8px;
+  align-self: start; text-align: center; }
+.st.placed { background: #12332a; color: var(--green); }
+.st.dropped { background: #3a1d15; color: var(--orange); }
+.st.unwritten { background: #2c313a; color: var(--dim); }
+.st.obligation { background: #241f3a; color: var(--purple); }
+
+#inspector { border-top: 1px solid var(--edge); padding: 8px 14px;
+  min-height: 118px; max-height: 24vh; overflow: auto; flex: none;
+  background: var(--panel); }
+#inspBody .row { display: flex; flex-wrap: wrap; align-items: center;
+  gap: 2px 4px; }
+#inspBody .row { margin: 2px 0; }
+#inspBody .k { color: var(--dim); margin-right: 6px; }
+.pill { display: inline-block; border: 1px solid var(--edge);
+  border-radius: 10px; padding: 0 8px; margin: 1px 4px 1px 0;
+  font-size: 12px; }
+.viol { color: var(--orange); }
+
+#timeline { border-top: 1px solid var(--edge); }
+#tlScroll { position: relative; overflow-x: hidden; }
+#lanes { padding: 4px 0; }
+.lane { display: flex; align-items: center; height: 24px; }
+.lane .rlabel { width: 120px; padding: 0 10px; color: var(--dim);
+  font-size: 11px; flex: none; }
+.lane canvas { flex: 1; height: 18px; display: block; }
+#playhead { position: absolute; top: 0; bottom: 0; width: 1px;
+  background: var(--blue); pointer-events: none; left: 120px; }
+
+.card { display: inline-block; background: var(--bg);
+  border: 1px solid var(--edge); border-radius: 5px;
+  padding: 4px 8px; margin: 2px; }
+.card .k { display: block; font-size: 10px; color: var(--dim);
+  letter-spacing: .06em; }
+table.sumtbl { border-collapse: collapse; margin-top: 6px; }
+table.sumtbl td, table.sumtbl th { border-bottom: 1px solid var(--edge);
+  padding: 3px 10px 3px 0; text-align: left; }
+td.num { font-variant-numeric: tabular-nums; text-align: right; }
+.nm { padding: 6px 4px; border-bottom: 1px solid var(--edge); }
+.nm b { color: var(--ink); }
+
+#tlLegend { display: flex; gap: 16px; padding: 4px 14px 0; font-size: 11px; }
+#tlLegend .sw { display: inline-block; width: 10px; height: 10px;
+  border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+
+</style>
+</head>
+<body>
+
+<header id="hdr">
+  <div class="hgroup">
+    <select id="assetPick" title="asset"></select>
+    <span class="fact" id="fDur">–</span>
+    <span class="fact" id="fCues">–</span>
+    <span class="fact" id="fCost">–</span>
+  </div>
+  <div class="hgroup dim">narration is EVIDENCE-REVIEW output — cue text,
+    placement and every violation come verbatim from the run's own ledger</div>
+</header>
+
+<main>
+  <section id="left">
+    <div id="vwrap">
+      <video id="v" controls preload="metadata" crossorigin="anonymous"></video>
+      <div id="subNarration" class="subOverlay"></div>
+      <div id="subDialogue" class="subOverlay"></div>
+    </div>
+    <div id="audioBar">
+      <span class="lbl">AUDIO</span>
+      <div id="audSel">
+        <button id="audOrig" aria-pressed="true">original</button>
+        <button id="audMix" aria-pressed="false">described mix</button>
+      </div>
+      <button id="btnSubs" aria-pressed="true">narration text on</button>
+      <button id="btnDlg" aria-pressed="true">dialogue subs on</button>
+      <span class="dim" id="mixNote"></span>
+    </div>
+  </section>
+
+  <section id="right">
+    <nav id="tabs">
+      <button class="tab on" data-pane="cues">Cues</button>
+      <button class="tab" data-pane="names">Name map</button>
+      <button class="tab" data-pane="gaps">Gaps</button>
+      <button class="tab" data-pane="summary">Summary</button>
+    </nav>
+    <div id="pane-cues" class="tabPane on">
+      <input id="cueFilter" placeholder="filter text / state…">
+      <div id="cueList"></div>
+    </div>
+    <div id="pane-names" class="tabPane"><div id="nameBody"></div></div>
+    <div id="pane-gaps" class="tabPane"><div id="gapBody"></div></div>
+    <div id="pane-summary" class="tabPane"><div id="summaryBody"></div></div>
+  </section>
+</main>
+
+<section id="inspector"><div id="inspBody" class="dim">click a cue —
+  its ledger dossier (budget, fit, violations, repair disposition)
+  appears here</div></section>
+
+<section id="timeline">
+  <div id="tlLegend" class="dim">
+    <span><i class="sw" style="background:#2f3b4d"></i>window</span>
+    <span><i class="sw" style="background:#8a7ae0"></i>scene-entry duty</span>
+    <span><i class="sw" style="background:#199e70"></i>placed cue</span>
+    <span><i class="sw" style="background:#d95926"></i>dropped / gap</span>
+    <span><i class="sw" style="background:#4a5262"></i>dialogue</span>
+  </div>
+  <div id="tlScroll"><div id="lanes"></div><div id="playhead"></div></div>
+</section>
+
+<audio id="mixAudio" preload="none"></audio>
+<script type="application/json" id="DATA">/*__DATA__*/</script>
+<script>
+/* AD review bench. Self-contained: view data + VTT ride the embedded
+ * DATA block; media (video | mix) is presigned at build time and
+ * expires (~1 h) — re-run the skill to refresh. The described mix is a
+ * synced <audio> that mutes the video's own track. */
+"use strict";
+
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => Array.from(document.querySelectorAll(s));
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const pad = (x) => String(x).padStart(2, "0");
+const hms = (t) => { t = Math.max(0, t | 0);
+  return `${t / 3600 | 0}:${pad(t % 3600 / 60 | 0)}:${pad(t % 60)}`; };
+
+const DATA = JSON.parse(document.getElementById("DATA").textContent);
+const ASSETS = [DATA.asset];
+const ASSET_LABEL = { [DATA.asset]: DATA.asset_label || DATA.asset };
+const S = { view: null, asset: null, selCue: null };
+const v = $("#v");
+const mix = $("#mixAudio");
+
+async function presign(asset, kind) {
+  const u = (DATA.media || {})[kind];
+  if (!u) throw new Error(`no embedded media url for ${kind}`);
+  return u;
+}
+
+/* ------------------------------------------------------------ audio toggle */
+let described = false;
+function syncMix(force) {
+  if (!described || !mix.src) { if (!mix.paused) mix.pause();
+    v.muted = false; return; }
+  v.muted = true;
+  if (Math.abs(mix.currentTime - v.currentTime) > (force ? 0.05 : 0.30))
+    mix.currentTime = v.currentTime;
+  mix.playbackRate = v.playbackRate;
+  if (!v.paused && mix.paused) mix.play().catch(() => {});
+  if (v.paused && !mix.paused) mix.pause();
+}
+["play", "pause", "seeked", "ratechange"].forEach((e) =>
+  v.addEventListener(e, () => syncMix(true)));
+v.addEventListener("timeupdate", () => syncMix(false));
+function setAudio(mode) {
+  described = mode === "mix";
+  $("#audOrig").setAttribute("aria-pressed", String(!described));
+  $("#audMix").setAttribute("aria-pressed", String(described));
+  syncMix(true);
+}
+$("#audOrig").onclick = () => setAudio("orig");
+$("#audMix").onclick = () => setAudio("mix");
+
+/* bounded media retry: ONE retry per element; a source the browser
+ * cannot play must not loop (measured: a tail-moov .mov looped
+ * forever) */
+let mediaRetries = 0;
+function retryMedia(el, kind) {
+  el.addEventListener("error", async () => {
+    if (!S.asset || !el.error || mediaRetries >= 2) {
+      if (el === v) $("#mixNote").textContent =
+        "video not playable in browser (needs an mp4 proxy)";
+      return;
+    }
+    mediaRetries += 1;
+    const t = el.currentTime;
+    try { el.src = await presign(S.asset, kind); el.currentTime = t; }
+    catch (e) { /* unavailable */ }
+  });
+}
+retryMedia(mix, "mix");
+retryMedia(v, "video");
+
+/* two cue layers rendered by US, not the native track UI: the browser
+ * cannot show two tracks with distinct styling, and narration must
+ * never be confusable with dialogue (user, 2026-09-10). Tracks stay
+ * mode:hidden — we listen to cuechange and paint the overlays. */
+let subsOn = true, dlgOn = true;
+function paintCues(track, host, on) {
+  host.innerHTML = "";  // nosemgrep: html.security.audit.insecure-document-method
+  if (!on || !track) return;
+  for (const cue of track.activeCues || []) {
+    const div = document.createElement("div");
+    for (const line of String(cue.text).split("\n")) {
+      const s = document.createElement("span");
+      s.textContent = line;
+      div.appendChild(s);
+      div.appendChild(document.createElement("br"));
+    }
+    host.appendChild(div);
+  }
+}
+function trackByLabel(label) {
+  return Array.from(v.textTracks).find((t) => t.label === label);
+}
+function applySubs() {
+  for (const t of v.textTracks) t.mode = "hidden";  // we render, not the UA
+  paintCues(trackByLabel("narration"), $("#subNarration"), subsOn);
+  paintCues(trackByLabel("dialogue"), $("#subDialogue"), dlgOn);
+  $("#btnSubs").setAttribute("aria-pressed", String(subsOn));
+  $("#btnSubs").textContent = `narration text ${subsOn ? "on" : "off"}`;
+  $("#btnDlg").setAttribute("aria-pressed", String(dlgOn));
+  $("#btnDlg").textContent = `dialogue subs ${dlgOn ? "on" : "off"}`;
+}
+$("#btnSubs").onclick = () => { subsOn = !subsOn; applySubs(); };
+$("#btnDlg").onclick = () => { dlgOn = !dlgOn; applySubs(); };
+function wireCueEvents() {
+  for (const t of v.textTracks) {
+    t.mode = "hidden";
+    t.oncuechange = applySubs;
+  }
+}
+v.addEventListener("seeked", applySubs);
+
+function seekTo(t) { v.currentTime = Math.max(0, t); }
+
+/* ------------------------------------------------------------------- load */
+async function loadAsset(a) {
+  S.asset = a;
+  mediaRetries = 0;
+  const view = DATA.view;
+  S.view = view;
+  S.selCue = null;
+
+  try { v.src = await presign(a, "video"); }
+  catch (e) { v.removeAttribute("src");
+    $("#mixNote").textContent = "video unavailable (source not playable)"; }
+  v.innerHTML = "";  // nosemgrep: html.security.audit.insecure-document-method
+  for (const [label, text] of [["narration", DATA.narration_vtt],
+                               ["dialogue", DATA.dialogue_vtt]]) {
+    if (!text) continue;
+    const track = document.createElement("track");
+    track.kind = "subtitles"; track.label = label;
+    track.srclang = "en";
+    track.src = URL.createObjectURL(new Blob([text], { type: "text/vtt" }));
+    track.addEventListener("load", () => { wireCueEvents(); applySubs(); });
+    v.appendChild(track);
+  }
+  wireCueEvents();
+  applySubs();
+
+  mix.removeAttribute("src");
+  if (view.mix) {
+    presign(a, "mix").then((u) => { mix.src = u;
+      $("#mixNote").textContent = ""; })
+      .catch(() => { $("#mixNote").textContent = "mix unavailable"; });
+  } else {
+    $("#mixNote").textContent = "no described mix for this asset";
+  }
+  setAudio("orig");
+
+  $("#fDur").textContent = hms(view.duration_sec);
+  $("#fCues").textContent =
+    `${view.summary.cues_placed} cues placed · ` +
+    `${view.summary.cues_dropped} dropped`;
+  $("#fCost").textContent = `$${view.summary.cost.toFixed(2)}`;
+  buildCueList();
+  buildNames();
+  buildGaps();
+  buildSummary();
+  buildTimeline();
+}
+
+/* --------------------------------------------------------------- cue list */
+function buildCueList() {
+  const q = ($("#cueFilter").value || "").trim().toLowerCase();
+  const host = $("#cueList");
+  host.innerHTML = "";  // nosemgrep: html.security.audit.insecure-document-method
+  const frag = document.createDocumentFragment();
+  S.view.cues.forEach((c, i) => {
+    if (q && !`${c.text} ${c.state} ${c.kind}`.toLowerCase().includes(q))
+      return;
+    const el = document.createElement("div");
+    el.className = "cue";
+    el.dataset.i = i;
+    const stateCls = c.kind === "obligation" ? "obligation" : c.state;
+    // nosemgrep: html.security.audit.insecure-document-method
+    el.innerHTML = `
+      <span class="tcv">${c.at != null ? hms(c.at) : "—"}</span>
+      <span class="st ${esc(stateCls)}">${esc(c.kind === "obligation"
+        ? "duty" : c.state)}</span>
+      <span>${esc(c.text || "(no text)")}</span>`;
+    el.onclick = () => { selectCue(i); if (c.at != null) seekTo(c.at); };
+    frag.appendChild(el);
+  });
+  host.appendChild(frag);
+}
+$("#cueFilter").oninput = buildCueList;
+
+function selectCue(i) {
+  S.selCue = i;
+  $$("#cueList .cue").forEach((el) =>
+    el.classList.toggle("sel", Number(el.dataset.i) === i));
+  const c = S.view.cues[i];
+  const w = S.view.windows.find((x) => x.window_id === c.window_id);
+  const fit = (c.dur && w)
+    ? `${c.dur.toFixed(2)}s of ${w.seconds.toFixed(2)}s window`
+    : null;
+  // nosemgrep: html.security.audit.insecure-document-method
+  $("#inspBody").innerHTML = `
+    <div class="row"><b>${esc(c.text || "(no text)")}</b></div>
+    <div class="row">
+      <span class="pill st ${esc(c.state)}">${esc(c.state)}</span>
+      ${c.kind === "obligation" ? '<span class="pill">duty window</span>' : ""}
+      ${c.important ? '<span class="pill">important</span>' : ""}
+      <span class="pill">window ${esc(c.window_id)}</span>
+      ${c.at != null ? `<span class="pill">at ${hms(c.at)}</span>` : ""}
+      ${fit ? `<span class="pill">${fit}</span>` : ""}
+      ${c.tempo && c.tempo !== 1 ? `<span class="pill">tempo ×${esc(c.tempo)}</span>` : ""}
+      <span class="pill">${esc(c.words)}/${esc(c.budget ?? "?")} words</span>
+      ${c.necessity != null ? `<span class="pill">necessity ${esc(c.necessity)}</span>` : ""}
+    </div>
+    ${c.why_needed?.length ? `<div class="row"><span class="k">why needed</span>${
+      c.why_needed.map((x) => esc(String(x).slice(0, 140))).join(" · ")}</div>` : ""}
+    ${c.violations?.length ? `<div class="row viol"><span class="k">violations</span>${
+      c.violations.map((x) => esc(JSON.stringify(x).slice(0, 160))).join(" · ")}</div>` : ""}
+    ${c.disposition ? `<div class="row"><span class="k">disposition</span>${
+      esc(JSON.stringify(c.disposition).slice(0, 200))}</div>` : ""}
+    ${c.oracle ? `<div class="row"><span class="k">oracle</span>${
+      esc(String(c.oracle))}</div>` : ""}`;
+}
+
+/* ------------------------------------------------------------- name map */
+function buildNames() {
+  const host = $("#nameBody");
+  // nosemgrep: html.security.audit.insecure-document-method
+  host.innerHTML = (S.view.characters || []).map((c) => `
+    <div class="nm">
+      <b>${esc(c.face_key)}</b> → ${esc(c.character_name || "NO NAME")}
+      ${c.concealed ? '<span class="pill viol">CONCEALED — descriptor only</span>' : ""}
+      <div class="dim">${esc(c.descriptor || "")}</div>
+      <div class="dim">speakable from ${hms(c.speakable_from_sec
+        ?? c.first_established_sec ?? 0)}
+        ${c.evidence ? " — " + esc(String(c.evidence).slice(0, 140)) : ""}</div>
+    </div>`).join("") || '<div class="dim">no characters</div>';
+}
+
+/* ----------------------------------------------------------------- gaps */
+function buildGaps() {
+  const host = $("#gapBody");
+  // nosemgrep: html.security.audit.insecure-document-method
+  host.innerHTML = (S.view.gaps || []).map((g) => `
+    <div class="nm" style="cursor:pointer"
+         onclick="window.__seek(${Number(g.sec) || 0})">
+      <b class="tcv">${hms(g.sec || 0)}</b>
+      <span class="pill">${esc(g.kind || "gap")}</span>
+      ${esc(g.beat || "")}
+      <div class="dim">${esc(g.reason || "")}</div>
+    </div>`).join("") || '<div class="dim">no gaps — full coverage</div>';
+}
+window.__seek = seekTo;
+
+/* -------------------------------------------------------------- summary */
+function buildSummary() {
+  const s = S.view.summary;
+  const card = (k, val) => `<div class="card"><span class="k">${esc(k)}</span>${esc(String(val))}</div>`;
+  // nosemgrep: html.security.audit.insecure-document-method
+  $("#summaryBody").innerHTML = `
+    ${card("windows planned", s.windows)}
+    ${card("cues placed", s.cues_placed)}
+    ${card("dropped", s.cues_dropped)}
+    ${card("unwritten", s.cues_unwritten)}
+    ${card("duty windows hit", `${s.duty_hit}/${s.duty_windows}`)}
+    ${card("narration", s.narration_sec + "s")}
+    ${card("window time", s.window_sec + "s")}
+    ${card("gaps", s.gaps)}
+    ${card("est. cost", "$" + s.cost.toFixed(2))}
+    <table class="sumtbl"><thead>
+      <tr><th>workflow</th><th>cost</th></tr></thead><tbody>
+      ${(s.usage || []).map((u) => `<tr><td>${esc(u.workflow)}</td>
+        <td class="num">${u.cost != null ? "$" + u.cost.toFixed(2) : "–"}</td></tr>`).join("")}
+    </tbody></table>`;
+}
+
+/* -------------------------------------------------------------- timeline */
+const LANES = [];
+function laneEl(label) {
+  const div = document.createElement("div");
+  div.className = "lane";
+  div.innerHTML = `<span class="rlabel">${label}</span>`;  // nosemgrep: html.security.audit.insecure-document-method
+  const c = document.createElement("canvas");
+  div.appendChild(c);
+  $("#lanes").appendChild(div);
+  return c;
+}
+function drawLane(c, blocks, dur, tip) {
+  const W = c.clientWidth * devicePixelRatio;
+  const H = c.clientHeight * devicePixelRatio;
+  c.width = W; c.height = H;
+  const g = c.getContext("2d");
+  g.clearRect(0, 0, W, H);
+  for (const b of blocks) {
+    g.fillStyle = b.color;
+    const x = b.t0 / dur * W;
+    const w = Math.max(1.5 * devicePixelRatio, (b.t1 - b.t0) / dur * W);
+    g.fillRect(x, H * 0.15, w, H * 0.7);
+  }
+  c.onclick = (ev) => {
+    const t = (ev.offsetX / c.clientWidth) * dur;
+    let best = null;
+    for (const b of blocks)
+      if (t >= b.t0 - 1 && t <= b.t1 + 1
+          && (!best || (b.t1 - b.t0) < (best.t1 - best.t0))) best = b;
+    if (best?.cueIndex != null) selectCue(best.cueIndex);
+    seekTo(best ? best.t0 : t);
+  };
+  c.title = tip;
+}
+function buildTimeline() {
+  $("#lanes").innerHTML = "";  // nosemgrep: html.security.audit.insecure-document-method
+  const view = S.view, dur = view.duration_sec;
+  const css = (n) => getComputedStyle(document.documentElement)
+    .getPropertyValue(n).trim();
+  drawLane(laneEl("DIALOGUE"), view.turns.map((t) => ({
+    t0: t.start, t1: t.end, color: "#4a5262" })), dur,
+    "dialogue turns — narration must live between these");
+  drawLane(laneEl("WINDOWS"), view.windows.map((w) => ({
+    t0: w.start, t1: w.end,
+    color: w.scene_entry ? css("--purple") : "#2f3b4d" })), dur,
+    "planned narration windows (purple = scene-entry duty)");
+  drawLane(laneEl("NARRATION"), view.cues
+    .map((c, i) => ({ c, i }))
+    .filter((x) => x.c.at != null && x.c.kind === "cue")
+    .map((x) => ({ t0: x.c.at, t1: x.c.at + (x.c.dur || 1),
+      cueIndex: x.i,
+      color: x.c.state === "placed" ? css("--green")
+           : x.c.state === "dropped" ? css("--orange") : "#5a6274" })),
+    dur, "placed cues (green) and drops (orange) — click to inspect");
+  drawLane(laneEl("GAPS"), (view.gaps || []).map((g2) => ({
+    t0: Number(g2.sec) || 0, t1: (Number(g2.sec) || 0) + 4,
+    color: css("--orange") })), dur, "coverage gaps");
+}
+function tick() {
+  if (S.view) {
+    const lanes = $("#lanes");
+    const x = 120 + (v.currentTime / S.view.duration_sec)
+      * (lanes.clientWidth - 120);
+    $("#playhead").style.left = `${x}px`;
+    // highlight the playing cue
+    const t = v.currentTime;
+    const i = S.view.cues.findIndex((c) => c.at != null
+      && t >= c.at && t <= c.at + (c.dur || 0));
+    $$("#cueList .cue").forEach((el) =>
+      el.classList.toggle("cur", Number(el.dataset.i) === i));
+  }
+  requestAnimationFrame(tick);
+}
+
+/* ------------------------------------------------------------------- tabs */
+$$("#tabs .tab").forEach((b) => b.onclick = () => {
+  $$("#tabs .tab").forEach((x) => x.classList.remove("on"));
+  b.classList.add("on");
+  $$(".tabPane").forEach((p) => p.classList.remove("on"));
+  $(`#pane-${b.dataset.pane}`).classList.add("on");
+});
+
+/* ------------------------------------------------------------------ boot */
+const pick = $("#assetPick");
+for (const a of ASSETS) {
+  const o = document.createElement("option");
+  o.value = a; o.textContent = ASSET_LABEL?.[a] || a;
+  pick.appendChild(o);
+}
+pick.onchange = () => loadAsset(pick.value);
+window.addEventListener("resize", () => S.view && buildTimeline());
+requestAnimationFrame(tick);
+loadAsset(ASSETS[0]);
+
+</script>
+</body>
+</html>

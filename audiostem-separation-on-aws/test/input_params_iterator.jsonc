@@ -1,0 +1,24 @@
+{
+  "operation": "StateRunBanditV2Model",
+  "item_id": 0,
+  "item_data": {
+    "chunk_idx": 0,
+    "chunk_name": "chunk_000",
+    "fetch_start_sec": 0,
+    "fetch_end_sec": 296,
+    "model_id": "bandit_v2",
+    "audio_bucket": "[audio_bucket]",
+    "audio_key": "path/to/audio/audio_48k.wav",
+    "output_bucket": "[output_bucket]",
+    "output_prefix": "path/to/audio/segment_chunks",
+    "fixed_chunk_size_secs": 300,
+    "speech_stem": true,
+    "music_stem": true,
+    "sfx_stem": true,
+    "speech_resampl_freq": 16000,
+    "sfx_resampl_freq": 32000,
+    "music_resampl_freq": 48000,
+    "speech_safe": false,
+    "speech_safe_resampl_freq": 48000
+  }
+}

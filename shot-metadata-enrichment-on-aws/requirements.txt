@@ -1,0 +1,24 @@
+# requirements.txt
+# Pinned for reproducibility.
+# boto3/botocore are included in the Lambda base image but pinned here
+# so the version is explicit and not silently upgraded by AWS.
+
+# ── AWS ───────────────────────────────────────────────────────────────────────
+boto3==1.40.4
+botocore==1.40.4
+
+# ── Imaging ───────────────────────────────────────────────────────────────────
+# pyvips[binary] bundles libvips — no system install. Used for ONE thing:
+# composing the per-window reference-face gallery (lib/gallery.py, PLAN §5).
+# THE PIN PAIR IS LOAD-BEARING: pyvips's Python half must match the decls
+# compiled into the pyvips-binary wheel — pyvips 2.1 + binary 8.18 imports
+# cleanly and then dies at ffi.callback('VipsCallbackFn') on first use
+# (measured live, ladder rung 3, 2026-08-19). Same pin as face-recognition.
+pyvips[binary]==3.0.0
+
+# Model-output salvage deliberately needs NO package here (user decision
+# 2026-08-26): the ladder lives in lib/parse_partial_output.py, a verbatim
+# copy of bedrock-inference's stdlib-only master. json-repair was measured
+# and rejected — on a string cut mid-word it returns the silently trimmed
+# 'indetermina', fabricated metadata nothing downstream would catch, where
+# our own completer drops the incomplete value whole.

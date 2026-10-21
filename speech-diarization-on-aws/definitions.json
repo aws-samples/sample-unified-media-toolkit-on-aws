@@ -1,0 +1,467 @@
+{
+    "Comment": "Speech to text workflow \u2014 sequential pipeline with speech groups, sentence-level speaker embeddings.",
+    "StartAt": "Check and preprocess",
+    "States": {
+        "Check and preprocess": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${SpeechDiarizationLambda2Cores.Arn}",
+                "Payload": {
+                    "operation": "StateCheckAndPreprocess",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Needs conversion?"
+        },
+        "Needs conversion?": {
+            "Type": "Choice",
+            "Choices": [
+                {
+                    "Variable": "$.data.needs_conversion",
+                    "BooleanEquals": true,
+                    "Next": "Run media processing"
+                }
+            ],
+            "Default": "Fix chunking for voice activity detection"
+        },
+        "Run media processing": {
+            "Type": "Task",
+            "Comment": "HELD (2026-09-18, the family sibling pattern): submits the conversion request to the media-processing GATEWAY with this state's task token; MP's waker completes it with the submit handle + terminal status AS DATA (never a detonation) \u2014 Extract processed audio enforces SUCCEEDED and derives the wav key from MP's output contract. Idempotent: the token derives from this run's uuid, so a redrive absorbs into the same MP run instead of re-transcoding. Replaces the direct states:startExecution.sync:2 of MP's machine (its internal execution output was our API, no idempotency, extra IAM).",
+            "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+            "Parameters": {
+                "FunctionName": "${SpeechDiarizationLambdaHalfCore.Arn}",
+                "Payload": {
+                    "operation": "StateSubmitMediaProcessing",
+                    "uuid.$": "$.uuid",
+                    "data.$": "$.data",
+                    "mp_gateway_arn": "${MediaProcessingGatewayLambdaArn}",
+                    "task_token.$": "$$.Task.Token"
+                }
+            },
+            "ResultPath": "$.data.media_processing_output",
+            "TimeoutSeconds": 14400,
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 5,
+                    "MaxAttempts": 4,
+                    "BackoffRate": 2.0
+                }
+            ],
+            "Next": "Extract processed audio"
+        },
+        "Extract processed audio": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${SpeechDiarizationLambdaHalfCore.Arn}",
+                "Payload": {
+                    "operation": "StateExtractProcessedAudio",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Fix chunking for voice activity detection"
+        },
+        "Fix chunking for voice activity detection": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${SpeechDiarizationLambdaHalfCore.Arn}",
+                "Payload": {
+                    "operation": "StateFixedChunkingForVAD",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Map VAD processing"
+        },
+        "Map VAD processing": {
+            "Type": "Map",
+            "MaxConcurrency": 40,
+            "ItemsPath": "$.data.iterators",
+            "ItemSelector": {
+                "operation": "StateRunVADModel",
+                "item_id.$": "$$.Map.Item.Index",
+                "item_data.$": "$$.Map.Item.Value"
+            },
+            "ItemProcessor": {
+                "ProcessorConfig": {
+                    "Mode": "INLINE"
+                },
+                "StartAt": "Run voice activity detection",
+                "States": {
+                    "Run voice activity detection": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "OutputPath": "$.Payload",
+                        "Parameters": {
+                            "FunctionName": "${SpeechDiarizationLambda2Cores.Arn}",
+                            "Payload.$": "$"
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ClientExecutionTimeoutException",
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException"
+                                ],
+                                "IntervalSeconds": 6,
+                                "MaxAttempts": 4,
+                                "BackoffRate": 2
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 6,
+                                "BackoffRate": 1.5
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Sandbox.Timedout",
+                                    "Lambda.Unknown"
+                                ],
+                                "MaxAttempts": 0
+                            }
+                        ],
+                        "End": true
+                    }
+                }
+            },
+            "ResultPath": "$.data.iterators",
+            "Next": "Dynamic chunking based on speech turns"
+        },
+        "Dynamic chunking based on speech turns": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${SpeechDiarizationLambdaHalfCore.Arn}",
+                "Payload": {
+                    "operation": "StateDynamicChunkingBySpeechTurns",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Detect and download language models"
+        },
+        "Detect and download language models": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${SpeechDiarizationLambda3Cores.Arn}",
+                "Payload": {
+                    "operation": "StateDetectLanguageDownloadModels",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Map transcribe processing"
+        },
+        "Map transcribe processing": {
+            "Type": "Map",
+            "MaxConcurrency": 40,
+            "ItemsPath": "$.data.iterators",
+            "ItemSelector": {
+                "operation": "StateRunWhisperAlignWtpsplitModels",
+                "item_id.$": "$$.Map.Item.Index",
+                "item_data.$": "$$.Map.Item.Value"
+            },
+            "ItemProcessor": {
+                "ProcessorConfig": {
+                    "Mode": "INLINE"
+                },
+                "StartAt": "Run whisper, align, sentence splitting models",
+                "States": {
+                    "Run whisper, align, sentence splitting models": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "OutputPath": "$.Payload",
+                        "Parameters": {
+                            "FunctionName": "${SpeechDiarizationLambda4Cores.Arn}",
+                            "Payload.$": "$"
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ClientExecutionTimeoutException",
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException"
+                                ],
+                                "IntervalSeconds": 6,
+                                "MaxAttempts": 4,
+                                "BackoffRate": 2
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 6,
+                                "BackoffRate": 1.5
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Sandbox.Timedout",
+                                    "Lambda.Unknown"
+                                ],
+                                "MaxAttempts": 0
+                            }
+                        ],
+                        "Next": "Run speech embedding model"
+                    },
+                    "Run speech embedding model": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "OutputPath": "$.Payload",
+                        "Parameters": {
+                            "FunctionName": "${SpeechDiarizationLambda2Cores.Arn}",
+                            "Payload": {
+                                "operation": "StateRunSpeechEmbeddingModel",
+                                "item_data.$": "$"
+                            }
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ClientExecutionTimeoutException",
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException"
+                                ],
+                                "IntervalSeconds": 6,
+                                "MaxAttempts": 4,
+                                "BackoffRate": 2
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 6,
+                                "BackoffRate": 1.5
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Sandbox.Timedout",
+                                    "Lambda.Unknown"
+                                ],
+                                "MaxAttempts": 0
+                            }
+                        ],
+                        "End": true
+                    }
+                }
+            },
+            "ResultPath": "$.data.iterators",
+            "Next": "Global speaker clustering"
+        },
+        "Global speaker clustering": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${SpeechDiarizationLambda1Core.Arn}",
+                "Payload": {
+                    "operation": "StateGlobalSpeakersClustering",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Merge speakers and transcripts"
+        },
+        "Merge speakers and transcripts": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${SpeechDiarizationLambda1Core.Arn}",
+                "Payload": {
+                    "operation": "StateMergeSpeakersTranscripts",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Separate speaker channels"
+        },
+        "Separate speaker channels": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${SpeechDiarizationLambda2Cores.Arn}",
+                "Payload": {
+                    "operation": "StateSeparateSpeakerChannels",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Usage tracking"
+        },
+        "Usage tracking": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${SpeechDiarizationLambdaHalfCore.Arn}",
+                "Payload": {
+                    "operation": "StateUsageTracking",
+                    "execution_arn.$": "$$.Execution.Id",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "End": true
+        }
+    }
+}

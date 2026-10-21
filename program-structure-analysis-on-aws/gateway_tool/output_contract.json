@@ -1,0 +1,57 @@
+{
+  "contract_version": 1,
+  "target": "program-structure-analysis",
+  "stability": "Anything not listed here — everything under _plan/ — is internal and may change without notice. PSA makes no model calls: there are no inference runs to join; provenance is the manifest's input pointers.",
+  "outputs": {
+    "structure": {
+      "basename": "structure.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "CPL-style markers, graded break candidates, and (narrative mode) evidence-graded sequences. acts[] is deliberately ABSENT on masters — a measured negative result: broadcast act positions are delivery metadata, not surface signal (README.md §8).",
+      "example": {
+        "mode": "narrative",
+        "markers": {
+          "blackframes": [{"start": 634.1, "end": 636.9, "shot_ids": [201]}],
+          "slate": [],
+          "bars_and_tone": [{"start": 0.0, "end": 30.0, "shot_ids": [0], "tone_confirmed": true}],
+          "opening_title": [{"start": 340.0, "end": 410.0, "shot_ids": [98, 99], "kinds": ["title_card"]}],
+          "interior_title_cards": [],
+          "end_credits": [{"start": 2780.0, "end": 2846.0, "shot_ids": [645, 646], "kinds": ["credit_roll", "logo_bumper"]}],
+          "textless_tail": []
+        },
+        "break_candidates": [{"at": 658.9, "score": 3.0, "evidence": {"black_sec": 0.0, "silent": true, "bumper_card": 655.2}}],
+        "sequences": [{"sequence_id": 3, "start": 415.0, "end": 610.0, "scene_ids": [7, 8, 9], "threads": [[7, 9], [8]], "settings": ["office"], "evidence": [{"scene_id": 9, "joins": 7, "via": "music_bridge"}]}]
+      },
+      "notes": "break_candidates are PROSPECTIVE (where a break could cleanly go — the ad-break posture), never a claim about where a network historically broke. Sequences carry a via on every join (music_bridge = a cue that STARTED in the earlier scene; setting; recurrence; cast; micro_scene) and may be ignored by consumers — over-chaining on densely-scored serialized drama is a known, recorded limit gated on a chapters ground truth."
+    },
+    "rundown": {
+      "basename": "rundown.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "NEWS MODE ONLY: the industrialized rundown — CA's discourse stories joined to the video with role-resolved boundaries, plus per-shot roles",
+      "example": {
+        "stories": [
+          {"slug": "HELENE-STORM", "headline": "Hurricane Helene makes landfall", "news_form": "live_two_way", "interstitial": false, "correspondent": "…", "sig_out": null, "start_sec": 71.7, "content_start_sec": 71.7, "speech_start_sec": 72.4, "speech_end_sec": 255.1, "end_sec": 255.9},
+          {"slug": "TEASE-DEEPFAKES", "news_form": "tease", "interstitial": true, "start_sec": 728.3, "content_start_sec": 728.3, "speech_start_sec": 728.9, "speech_end_sec": 741.0, "end_sec": 744.2}
+        ],
+        "shot_roles": [{"shot_id": 12, "role": "studio_anchor_desk", "anchor_set": true}]
+      },
+      "notes": "Three start times per story, consumers choose: start_sec (editorial — the director's cut, START SNAP <=6 s), content_start_sec (first story-role shot: 'the actual conversation begins'), speech_start_sec (first word). Interstitials (tease/promo/headlines_block/handoff_banter) are FIRST-CLASS rows — a tease shares its story's slug (identity) but identity never merges spans. Cueless video between items is assigned by VISUAL ROLE, never adjacency (the measured promo-absorption defect class). Requires the CA default_news variant and enrichment default_news fields upstream."
+    },
+    "manifest": {
+      "basename": "psa_manifest.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Mode + mode evidence + input pointers + product locations",
+      "example": {
+        "workflow_id": "…",
+        "tool_version": "…",
+        "mode": "news",
+        "mode_evidence": {"requested": "auto", "overall_content_type": "News Program"},
+        "inputs": {"shot_segmentation_s3uri": "s3://…", "shot_metadata_s3uri": "s3://…"},
+        "outputs": {"structure": "s3://…/structure.json", "rundown": "s3://…/rundown.json"}
+      },
+      "notes": "PSA is free to recompute: no spend, deterministic over its inputs — a policy change downstream is a re-derive over these products, never a re-run of Layer-1."
+    }
+  }
+}

@@ -1,0 +1,999 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# ============================================================================
+# frame-inspection-on-aws — targeted frame inspection, "the witness"
+# (README.md). Pooled (asset, category, span) requests in, per-category
+# evidence products out.
+#
+# TWO Lambdas out of ONE flat zip (the gateway dispatcher and the
+# operation-routed workflow handler) and ONE state machine whose only wait
+# is a single waitForTaskToken submit to bedrock-inference — completion is
+# PUSH (bedrock's callback_task_token feature), no polling anywhere, and
+# the machine never starts the sibling's state machine directly (README.md
+# §11: the gateway Lambda is the submit brain; raw StartExecution would copy
+# identity/staging logic and cannot absorb closed runs).
+#
+# CONSUMER WIRING (the same shape the bundle uses later): the two sibling
+# gateway-Lambda ARNs arrive as parameters — explicit parameters, never
+# Fn::ImportValue.
+# ============================================================================
+Description: >
+    frame-inspection micro-workflow: speech-diarization transcript in,
+    merged coverage-validated topic segments out; chunks on natural
+    boundaries, renders the registry frame-inspection prompt, submits
+    to bedrock-inference with push-based completion.
+
+Metadata:
+    AWS::CloudFormation::Interface:
+        ParameterGroups:
+            -
+                Label:
+                    default: Resource Naming
+                Parameters:
+                    - ResourcePrefix
+            -
+                Label:
+                    default: S3 Bucket
+                Parameters:
+                    - ProxyBucket
+            -
+                Label:
+                    default: Sibling Services (gateway-tool Lambda ARNs)
+                Parameters:
+                    - BedrockInferenceGatewayLambdaArn
+                    - PromptRegistryGatewayLambdaArn
+        ParameterLabels:
+            ResourcePrefix:
+                default: Resource Name Prefix
+            ProxyBucket:
+                default: Proxy Bucket (transcripts in, outputs out)
+            BedrockInferenceGatewayLambdaArn:
+                default: bedrock-inference GatewayToolLambdaArn output
+            PromptRegistryGatewayLambdaArn:
+                default: prompt-registry AdminToolLambdaArn output
+
+Parameters:
+    ResourcePrefix:
+        Type: String
+        Description: Prefix applied to all resource names.
+        AllowedPattern: "[a-z0-9][a-z0-9-]*"
+    ProxyBucket:
+        Type: String
+        Description: S3 proxy bucket — shot-segmentation artifacts are read from micro-workflow/* and outputs land under micro-workflow/frame-inspection/. No default on purpose.
+    BedrockInferenceGatewayLambdaArn:
+        Type: String
+        Description: The bedrock-inference stack's GatewayToolLambdaArn output. Invoked directly (README.md §11) for run_inference (with callback_task_token) and get_model; must be a deployment whose run_inference supports callback_task_token (alpha.20260817b+).
+        AllowedPattern: "arn:aws[a-z-]*:lambda:.*"
+    PromptRegistryGatewayLambdaArn:
+        Type: String
+        Description: The prompt-registry stack's AdminToolLambdaArn output (2026-09-08 — the fi-* categories are INTERNAL and only the admin surface serves them). Invoked directly for get_prompt; the workflow binds the frame-inspection category's `default` version.
+        AllowedPattern: "arn:aws[a-z-]*:lambda:.*"
+
+Mappings:
+    Solution:
+        Package:
+            GatewayTool: "%%PKG_GATEWAY_TOOL%%"
+        Source:
+            Bucket: "%%BUCKET_NAME%%"
+            KeyPrefix: "%%KEY_PREFIX%%"
+    CodeBuild:
+        Source:
+            Package: "%%PKG_FRAME_INSPECTION%%"
+            Bucket: "%%BUCKET_NAME%%"
+            KeyPrefix: "%%KEY_PREFIX%%"
+        Project:
+            Type: ARM_CONTAINER
+            # SMALL is ample: the build is one pip install into a base
+            # image plus a push — minutes-billed, so size is pure cost
+            ComputeType: BUILD_GENERAL1_SMALL
+            Image: aws/codebuild/amazonlinux2-aarch64-standard:3.0
+    ECR:
+        Repository:
+            Name: frame-inspection-on-aws
+            ImageTag: "%%VERSION%%"
+    Lambda:
+        GatewayTool:
+            Name: gateway-tool
+            Memory: 512
+            Timeout: 60
+        Workflow:
+            Name: workflow
+            Memory: 2048
+            Timeout: 600
+        CallbackWaker:
+            Name: callback-waker
+            Memory: 256
+            Timeout: 60
+    DynamoDB:
+        CallbackTable:
+            Suffix: fi-callback-tokens
+
+Resources:
+    ############################################################################
+    # Gateway tool — inspect_frames / get_job_status / describe_tool
+    ############################################################################
+    GatewayToolLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            # -log suffix + LoggingConfig, never /aws/lambda/{name}: the
+            # canonical group may exist as an orphan from an earlier deploy,
+            # and CFN cannot adopt a group (micro-workflow-bundle/README.md §C8).
+            LogGroupName: !Sub
+                - ${ResourcePrefix}-frame-inspection-${tool}-log
+                - tool: !FindInMap [Lambda, GatewayTool, Name]
+            RetentionInDays: 30
+
+    GatewayToolRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}FrameInspectionGatewayToolPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # Scoped logs, no AWSLambdaBasicExecutionRole (the
+                          # managed policy lets a function that cannot reach
+                          # its declared group silently create an unmanaged
+                          # one).
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt GatewayToolLogGroup.Arn
+                          - Effect: Allow
+                            Action: states:StartExecution
+                            Resource: !Ref FrameInspectionStateMachine
+                          # callback_task_token rows (registered before
+                          # StartExecution; deleted after a synchronous
+                          # absorbed-closed completion).
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:PutItem
+                                - dynamodb:DeleteItem
+                            Resource: !GetAtt CallbackTokensTable.Arn
+                          # Scoped to this account+region's machines
+                          # (corrected 2026-10-09; the token's machine is
+                          # the caller's, unknowable at deploy time). Used
+                          # only on the absorbed-closed sync completion.
+                          - Effect: Allow
+                            Action: states:SendTaskSuccess
+                            # any machine in THIS account+region — the token's machine is the
+                            # caller's (ours or a customer's own), never known at deploy time
+                            Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*
+                          # DescribeExecution / GetExecutionHistory take
+                          # execution ARNs, not the machine ARN.
+                          - Effect: Allow
+                            Action:
+                                - states:DescribeExecution
+                                - states:GetExecutionHistory
+                            Resource: !Sub
+                                - arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${smName}:*
+                                - smName: !GetAtt FrameInspectionStateMachine.Name
+                          # get_job_status lifts small header fields from the
+                          # finished analysis.
+                          - Effect: Allow
+                            Action: s3:GetObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/frame-inspection/*
+                          # Without ListBucket, GetObject on a MISSING key
+                          # answers 403 AccessDenied instead of 404 NoSuchKey
+                          # (measured live on prompt-registry, 2026-08-15).
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            Condition:
+                                StringLike:
+                                    s3:prefix: micro-workflow/*
+
+    GatewayToolLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Single-purpose dispatcher; reserved concurrency unnecessary
+        Properties:
+            # Unnamed on purpose: reached through LoggingConfig, renames stay
+            # one-update operations.
+            Description: !Sub ${ResourcePrefix}-frame-inspection gateway tool (inspect_frames / get_job_status / describe_tool)
+            Runtime: python3.13
+            Architectures:
+                - arm64
+            Handler: lambda_function.lambda_handler
+            Role: !GetAtt GatewayToolRole.Arn
+            Code:
+                S3Bucket: !FindInMap [Solution, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [Solution, Source, KeyPrefix]
+                      pkg: !FindInMap [Solution, Package, GatewayTool]
+            MemorySize: !FindInMap [Lambda, GatewayTool, Memory]
+            Timeout: !FindInMap [Lambda, GatewayTool, Timeout]
+            LoggingConfig:
+                LogGroup: !Ref GatewayToolLogGroup
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    STATE_MACHINE_ARN: !Ref FrameInspectionStateMachine
+                    CALLBACK_TABLE: !Ref CallbackTokensTable
+                    TOOL_VERSION: "%%VERSION%%"
+                    # Must equal the GatewayTarget Name in media-toolkit-gateway.
+                    TARGET_NAME: frame-inspection
+
+    ############################################################################
+    # Workflow Lambda — container image, operation-routed (lambda_function.py -> states/<name>/)
+    ############################################################################
+    WorkflowLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub
+                - ${ResourcePrefix}-frame-inspection-${tool}-log
+                - tool: !FindInMap [Lambda, Workflow, Name]
+            RetentionInDays: 30
+
+    WorkflowRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}FrameInspectionWorkflowPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt WorkflowLogGroup.Arn
+                          # Reads transcripts (any micro-workflow/ output,
+                          # speech-diarization first) and the bedrock runs
+                          # response/summary/usage documents.
+                          - Effect: Allow
+                            Action: s3:GetObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/*
+                          # Writes ONLY its own run prefix and the caller-side
+                          # inference history pointers (the family's shared
+                          # workflow-history convention).
+                          - Effect: Allow
+                            Action: s3:PutObject
+                            Resource:
+                                - !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/frame-inspection/*
+                                - !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/histories/*
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            Condition:
+                                StringLike:
+                                    s3:prefix: micro-workflow/*
+                          # The 8 pattern: sibling gateway Lambdas invoked
+                          # directly — run_inference/get_model on bedrock,
+                          # get_prompt on the registry. Never their state
+                          # machines.
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource:
+                                - !Ref BedrockInferenceGatewayLambdaArn
+                                - !Ref PromptRegistryGatewayLambdaArn
+
+    WorkflowLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Serial workflow states; reserved concurrency unnecessary
+        # PackageType Image (2026-09-05): pyvips (lower-third cropping)
+        # needs libvips, so the workflow states moved to a container —
+        # the gateway + waker stay flat zips. The image is built by THIS
+        # stack's CodeBuild project and hosted on ECR; StartBuild blocks
+        # the stack until the tag exists (the sibling pattern).
+        DependsOn: StartBuild
+        Properties:
+            Description: !Sub ${ResourcePrefix}-frame-inspection workflow states (operation-routed)
+            PackageType: Image
+            Architectures:
+                - arm64
+            Role: !GetAtt WorkflowRole.Arn
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            MemorySize: !FindInMap [Lambda, Workflow, Memory]
+            Timeout: !FindInMap [Lambda, Workflow, Timeout]
+            LoggingConfig:
+                LogGroup: !Ref WorkflowLogGroup
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    TARGET_NAME: frame-inspection
+                    TOOL_VERSION: "%%VERSION%%"
+                    BEDROCK_GATEWAY_ARN: !Ref BedrockInferenceGatewayLambdaArn
+                    PROMPT_REGISTRY_ARN: !Ref PromptRegistryGatewayLambdaArn
+                    # Map sizing: env-tunable per deployment, never per
+                    # request (a per-request knob would enter the
+                    # workflow_id preimage). Category-level selection knobs
+                    # are VERSIONED CONSTANTS in fi_common, not env.
+                    SPANS_PER_BATCH: "4"
+                    IMAGES_PER_RECORD: "18"
+
+
+    ############################################################################
+    # Container build: CodeBuild -> ECR, StartBuild custom resource blocks the
+    # stack until the image tag exists (the face-recognition pattern; the
+    # image tag IS the version, so an unbumped redeploy is a skipped build).
+    ############################################################################
+    CodeBuildRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W11
+                      reason: GetAuthorizationToken requires a wildcard resource (no ARN exists for it)
+        Properties:
+            Path: /
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: codebuild.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}FrameInspectionCodeBuildRolePolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild:*
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub
+                                - arn:aws:s3:::${bucket}
+                                - bucket: !FindInMap [CodeBuild, Source, Bucket]
+                          # Scoped to the staging BUCKET, not the versioned key:
+                          # a key-pinned grant is rewritten on every version
+                          # bump and races IAM propagation (the family's
+                          # measured CopySchema race).
+                          - Effect: Allow
+                            Action: s3:GetObject
+                            Resource: !Sub
+                                - arn:aws:s3:::${bucket}/*
+                                - bucket: !FindInMap [CodeBuild, Source, Bucket]
+                          - Effect: Allow
+                            Action:
+                                # GetAuthorizationToken is the ONLY ECR action
+                                # that requires "*" (CSR scan 2026-10-08)
+                                - ecr:GetAuthorizationToken
+                            Resource: "*"
+                          - Effect: Allow
+                            Action:
+                                - ecr:CreateRepository
+                                - ecr:DescribeImages
+                                - ecr:BatchCheckLayerAvailability
+                                - ecr:CompleteLayerUpload
+                                - ecr:InitiateLayerUpload
+                                - ecr:PutImage
+                                - ecr:UploadLayerPart
+                            Resource: !Sub
+                                - arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${repoName}
+                                - repoName: !FindInMap [ECR, Repository, Name]
+
+    CodeBuildProject:
+        Type: AWS::CodeBuild::Project
+        Properties:
+            Name: !Sub
+                - ${ResourcePrefix}-${repositoryName}
+                - repositoryName: !FindInMap [ECR, Repository, Name]
+            Description: Build and publish the frame-inspection workflow image to ECR
+            ServiceRole: !GetAtt CodeBuildRole.Arn
+            Source:
+                Type: S3
+                Location: !Sub
+                    - ${bucket}/${keyPrefix}/${package}
+                    - bucket: !FindInMap [CodeBuild, Source, Bucket]
+                      keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                      package: !FindInMap [CodeBuild, Source, Package]
+                BuildSpec: |
+                    version: 0.2
+                    phases:
+                        pre_build:
+                            commands:
+                                - echo "== Logging in to Amazon ECR =="
+                                - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+                                - |
+                                    echo "== Creating ECR repository if it does not exist =="
+                                    aws ecr create-repository --region $AWS_REGION --repository-name $IMAGE_REPO_NAME --image-scanning-configuration scanOnPush=true --encryption-configuration encryptionType=AES256; EXITCODE=$?
+                                    if [ $EXITCODE -ne 0 ] && [ $EXITCODE -ne 254 ]; then
+                                        echo "ECR create-repository failed with exit code $EXITCODE"
+                                        exit $EXITCODE
+                                    fi
+                                - |
+                                    echo "== Checking if $IMAGE_REPO_NAME:$IMAGE_TAG already exists =="
+                                    if aws ecr describe-images --region $AWS_REGION --repository-name $IMAGE_REPO_NAME --image-ids imageTag=$IMAGE_TAG 2>/dev/null; then
+                                        echo "Image $IMAGE_REPO_NAME:$IMAGE_TAG already exists — skipping build"
+                                        touch /tmp/skip_build
+                                    else
+                                        echo "Image not found — proceeding with build"
+                                    fi
+                        build:
+                            commands:
+                                - |
+                                    if [ -f /tmp/skip_build ]; then
+                                        echo "== Skipping docker build — image already exists =="
+                                    else
+                                        echo "== Building $IMAGE_REPO_NAME:$IMAGE_TAG [$(date)] =="
+                                        docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+                                        docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                                        echo "== Pushing $IMAGE_REPO_NAME:$IMAGE_TAG [$(date)] =="
+                                        docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                                        echo "== Push complete [$(date)] =="
+                                    fi
+                        post_build:
+                            commands:
+                                - |
+                                    echo "=== post_build CODEBUILD_BUILD_SUCCEEDING=$CODEBUILD_BUILD_SUCCEEDING ==="
+                                    if [ -n "$CFN_ResponseURL" ]; then
+                                        if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then
+                                            echo "== Sending SUCCESS to CloudFormation =="
+                                            curl -s -X PUT -H "Content-Type:" \
+                                                --data-binary "{\"Status\":\"SUCCESS\",\"Reason\":\"Docker image ready\",\"PhysicalResourceId\":\"$CFN_PhysicalResourceId\",\"StackId\":\"$CFN_StackId\",\"RequestId\":\"$CFN_RequestId\",\"LogicalResourceId\":\"$CFN_LogicalResourceId\",\"Data\":{\"ImageUri\":\"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG\"}}" \
+                                                "$CFN_ResponseURL"
+                                        else
+                                            echo "== Sending FAILED to CloudFormation =="
+                                            curl -s -X PUT -H "Content-Type:" \
+                                                --data-binary "{\"Status\":\"FAILED\",\"Reason\":\"Build failed — see CodeBuild logs\",\"PhysicalResourceId\":\"$CFN_PhysicalResourceId\",\"StackId\":\"$CFN_StackId\",\"RequestId\":\"$CFN_RequestId\",\"LogicalResourceId\":\"$CFN_LogicalResourceId\",\"Data\":{}}" \
+                                                "$CFN_ResponseURL"
+                                        fi
+                                    fi
+            Environment:
+                Type: !FindInMap [CodeBuild, Project, Type]
+                ComputeType: !FindInMap [CodeBuild, Project, ComputeType]
+                Image: !FindInMap [CodeBuild, Project, Image]
+                PrivilegedMode: true
+                EnvironmentVariables:
+                    - Name: AWS_REGION
+                      Value: !Ref AWS::Region
+                    - Name: AWS_ACCOUNT_ID
+                      Value: !Ref AWS::AccountId
+                    - Name: IMAGE_REPO_NAME
+                      Value: !FindInMap [ECR, Repository, Name]
+                    - Name: IMAGE_TAG
+                      Value: !FindInMap [ECR, Repository, ImageTag]
+            Artifacts:
+                Type: NO_ARTIFACTS
+            EncryptionKey: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3
+            TimeoutInMinutes: 60
+            QueuedTimeoutInMinutes: 60
+            LogsConfig:
+                CloudWatchLogs:
+                    GroupName: /aws/codebuild
+                    StreamName: !Sub
+                        - ${ResourcePrefix}-${repositoryName}
+                        - repositoryName: !FindInMap [ECR, Repository, Name]
+                    Status: ENABLED
+
+    StartBuildLambdaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: /
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}FrameInspectionStartBuildPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt StartBuildLambdaLogGroup.Arn
+                          - Effect: Allow
+                            Action: codebuild:StartBuild
+                            Resource: !GetAtt CodeBuildProject.Arn
+
+    StartBuildLambdaLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub /aws/lambda/${ResourcePrefix}-frame-inspection-start-build
+            RetentionInDays: 7
+
+    StartBuildLambda:
+        Type: AWS::Lambda::Function
+        DependsOn: StartBuildLambdaLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Single-execution custom resource; reserved concurrency unnecessary
+        Properties:
+            Description: !Sub (${ResourcePrefix} frame-inspection) Start CodeBuild; CodeBuild signals CloudFormation on completion
+            Runtime: python3.13
+            MemorySize: 128
+            Timeout: 60
+            Handler: index.handler
+            Role: !GetAtt StartBuildLambdaRole.Arn
+            LoggingConfig:
+                LogGroup: !Ref StartBuildLambdaLogGroup
+            Code:
+                ZipFile: |
+                    import json
+                    import urllib.request
+                    import boto3
+
+                    def send_cfn_response(event, status, data, reason=''):
+                        body = json.dumps({
+                            'Status': status,
+                            'Reason': reason or 'See CloudWatch Logs',
+                            'PhysicalResourceId': event.get('PhysicalResourceId') or event['LogicalResourceId'],
+                            'StackId': event['StackId'],
+                            'RequestId': event['RequestId'],
+                            'LogicalResourceId': event['LogicalResourceId'],
+                            'Data': data,
+                        }).encode()
+                        req = urllib.request.Request(
+                            event['ResponseURL'], data=body, method='PUT',
+                            headers={'Content-Type': ''})
+                        urllib.request.urlopen(req)
+
+                    def handler(event, context):
+                        print('Event keys:', sorted(event))
+                        try:
+                            if event['RequestType'] == 'Delete':
+                                send_cfn_response(event, 'SUCCESS', {'Status': 'SKIPPED'})
+                                return
+
+                            env_overrides = [
+                                {'name': 'CFN_ResponseURL',        'value': event['ResponseURL'],                                        'type': 'PLAINTEXT'},
+                                {'name': 'CFN_PhysicalResourceId', 'value': event.get('PhysicalResourceId') or context.log_stream_name,  'type': 'PLAINTEXT'},
+                                {'name': 'CFN_StackId',            'value': event['StackId'],                                            'type': 'PLAINTEXT'},
+                                {'name': 'CFN_RequestId',          'value': event['RequestId'],                                          'type': 'PLAINTEXT'},
+                                {'name': 'CFN_LogicalResourceId',  'value': event['LogicalResourceId'],                                  'type': 'PLAINTEXT'},
+                            ]
+
+                            boto3.client('codebuild').start_build(
+                                projectName=event['ResourceProperties']['ProjectName'],
+                                environmentVariablesOverride=env_overrides,
+                            )
+                            # Intentionally do NOT call send_cfn_response here.
+                            # CodeBuild signals CloudFormation from post_build via curl.
+                        except Exception as exc:
+                            print(f'ERROR: {exc}')
+                            send_cfn_response(event, 'FAILED', {}, str(exc))
+
+    StartBuild:
+        Type: Custom::StartBuildDelayResponse
+        Properties:
+            ServiceToken: !GetAtt StartBuildLambda.Arn
+            ProjectName: !Ref CodeBuildProject
+            ImageTag: !FindInMap [ECR, Repository, ImageTag]
+
+    ############################################################################
+    # State machine
+    ############################################################################
+    StateMachineRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: states.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}FrameInspectionStateMachinePolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource: !GetAtt WorkflowLambda.Arn
+
+    FrameInspectionStateMachine:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            # Named like every machine-bearing sibling (micro-workflow-bundle/README.md §C8's
+            # unnamed rule covers LAMBDAS, not machines).
+            StateMachineName: !Sub ${ResourcePrefix}-frame-inspection
+            RoleArn: !GetAtt StateMachineRole.Arn
+            DefinitionSubstitutions:
+                WorkflowLambdaArn: !GetAtt WorkflowLambda.Arn
+            # Inline is the single source of truth for what deploys;
+            # definitions.json is the readability copy — edit BOTH, the
+            # build script fails on drift.
+            DefinitionString: |-
+                {
+                  "Comment": "frame-inspection: pooled (asset, category, span) requests -> frame selection from shot-segmentation's OWN archives (frames.tar.gz @4fps + embeddings.npz; embedding-distance change gate + 6s heartbeat; NO ffmpeg, NO source, NO re-extraction) -> ONE pooled waitForTaskToken submit to bedrock-inference -> salvage-parsed, schema-checked per-category products (credits.json / titles.json / verdicts.json), raw responses joined by POINTER only. conversation-analysis's five-state template with the selection step widened to a Map. Design record: README.md \u00a75-\u00a710. Readability copy of the template's inline DefinitionString; edit BOTH, the build fails on drift.",
+                  "StartAt": "Validate and plan",
+                  "TimeoutSeconds": 108000,
+                  "States": {
+                    "Validate and plan": {
+                      "Type": "Task",
+                      "Comment": "Everything that can refuse refuses HERE, before any inference dollar: every asset's shot-segmentation run validated (window manifests + embeddings.npz + frames tarballs present), auto-trigger spans derived per request (nondiegetic shot_kind runs bridged over <=5s black for credits-read; unreadable_text_present clusters OUTSIDE blocks for title-read) or explicit spans validated (claim-verify REQUIRES explicit spans, each carrying its question), every category bound in prompt-registry, model chain IMAGE-capable. Emits the selection-unit list bounded by IMAGES per unit (<=18, the record size \u2014 a 120s credit tail is many units, a 3s super is one; README.md \u00a710). Persists _plan/plan.json; states pass URIs, never bodies.",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "ValidateAndPlan",
+                          "uuid.$": "$.uuid",
+                          "input.$": "$.input"
+                        }
+                      },
+                      "OutputPath": "$.Payload",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Select frames"
+                    },
+                    "Select frames": {
+                      "Type": "Map",
+                      "Comment": "One iteration per selection-unit batch. Each iteration: fetch the unit's window jsons + embeddings.npz slices, select frames by embedding-distance change gate OR >=6s heartbeat (the heartbeat is load-bearing \u2014 a slow scroll changes too little frame-to-frame and a change-only gate collapsed mitj404's cast roll to nothing, measured 2026-08-29), extract ONLY the chosen JPEGs from _frames.tar.gz, render the converse-shaped record through the copied prompt_render, checkpoint as _records/unit_NNNN.json. record_id = {asset_idx}:{category}:{span_idx}:{chunk} \u2014 the demux key. LambdaResourceTimeoutException retries RESUME (existing side objects are skipped), never restart.",
+                      "MaxConcurrency": 4,
+                      "ItemsPath": "$.batches",
+                      "ItemSelector": {
+                        "operation": "SelectFrames",
+                        "uuid.$": "$.uuid",
+                        "plan_s3uri.$": "$.plan_s3uri",
+                        "batch_index.$": "$$.Map.Item.Value.batch_index",
+                        "unit_indices.$": "$$.Map.Item.Value.unit_indices"
+                      },
+                      "ItemProcessor": {
+                        "ProcessorConfig": {
+                          "Mode": "INLINE"
+                        },
+                        "StartAt": "Select frame batch",
+                        "States": {
+                          "Select frame batch": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                              "FunctionName": "${WorkflowLambdaArn}",
+                              "Payload.$": "$"
+                            },
+                            "Retry": [
+                              {
+                                "ErrorEquals": [
+                                  "LambdaResourceTimeoutException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 10,
+                                "BackoffRate": 1.0
+                              },
+                              {
+                                "ErrorEquals": [
+                                  "Lambda.ServiceException",
+                                  "Lambda.AWSLambdaException",
+                                  "Lambda.SdkClientException",
+                                  "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 3,
+                                "MaxAttempts": 4,
+                                "BackoffRate": 2.0
+                              }
+                            ],
+                            "End": true
+                          }
+                        }
+                      },
+                      "ResultPath": "$.select_results",
+                      "Next": "Stage records"
+                    },
+                    "Stage records": {
+                      "Type": "Task",
+                      "Comment": "Concatenate the unit checkpoints in plan order into ONE pooled records.jsonl \u2014 STREAMED via S3 multipart, never held whole (images inline). Refuses on a missing checkpoint or a record over the image budget. The pooling is the point (README.md \u00a78): one batch job across every request of every asset in the call.",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "StageRecords",
+                          "uuid.$": "$.uuid",
+                          "plan_s3uri.$": "$.plan_s3uri"
+                        }
+                      },
+                      "OutputPath": "$.Payload",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Submit and wait"
+                    },
+                    "Submit and wait": {
+                      "Type": "Task",
+                      "Comment": "The template's shape verbatim: ONE held state, NO polling. The handler invokes bedrock-inference's gateway inline (records_s3uri + callback_task_token + idempotency_token = THIS run's uuid) and writes the history pointer from the TRUE submit response. NO Catch: a timeout FAILS the execution, and a REDRIVE of this state resubmits, absorbs, and is completed synchronously \u2014 redrive IS the reconcile. use_batch defaults TRUE (catalog sweeps); claim-verify inside a waiting AD run passes use_batch=false.",
+                      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "SubmitAndWait",
+                          "uuid.$": "$.uuid",
+                          "plan_s3uri.$": "$.plan_s3uri",
+                          "records_s3uri.$": "$.records_s3uri",
+                          "record_count.$": "$.record_count",
+                          "task_token.$": "$$.Task.Token"
+                        }
+                      },
+                      "ResultPath": "$.wait_result",
+                      "TimeoutSeconds": 93600,
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 5,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Collect and finalize"
+                    },
+                    "Collect and finalize": {
+                      "Type": "Task",
+                      "Comment": "Salvage-parse response.jsonl per record (copied parse_partial_output ladder: strict first, counted recovery tiers), schema-check per category (claim-verify's verdict validated against its enum \u2014 an out-of-enum answer is a parse failure), demux by record_id into per-asset per-category products ({run}/{asset_idx}/credits.json | titles.json | verdicts.json), each carrying gaps[] for spans whose read did not survive \u2014 honest gap, reasoned, never fabricated. Partial success IS success; the semantic retry is the caller's fresh idempotency_token. Raw responses are NEVER copied: the manifest's inference_runs[] points at the bedrock run's own prefix.",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "CollectFinalize",
+                          "uuid.$": "$.uuid",
+                          "plan_s3uri.$": "$.plan_s3uri",
+                          "wait_result.$": "$.wait_result"
+                        }
+                      },
+                      "OutputPath": "$.Payload",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "LambdaResourceTimeoutException"
+                          ],
+                          "IntervalSeconds": 2,
+                          "MaxAttempts": 10,
+                          "BackoffRate": 1.0
+                        },
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Usage tracking"
+                    },
+                    "Usage tracking": {
+                      "Type": "Task",
+                      "Comment": "Aggregates the bedrock run's summaries with the cost_is_complete discipline; success-path only, never raises.",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "UsageTracking",
+                          "uuid.$": "$.uuid",
+                          "plan_s3uri.$": "$.plan_s3uri"
+                        }
+                      },
+                      "OutputPath": "$.Payload",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "End": true
+                    }
+                  }
+                }
+
+    ############################################################################
+    # callback_task_token (copied shape: README.md §11) —
+    # consumers submit with a token and sleep on ONE waitForTaskToken
+    # state; the waker completes every registered token on this machine's
+    # terminal EventBridge event. ALWAYS SendTaskSuccess: a FAILED verdict
+    # is DATA for the consumer's Choice state, never a detonation.
+    ############################################################################
+    CallbackTokensTable:
+        Type: AWS::DynamoDB::Table
+        Metadata:
+            checkov:
+                skip:
+                    - id: CKV_AWS_119
+                      comment: >-
+                        sample posture: table holds rebuildable derived state; default SSE is deliberate (rebuildable derived state; see README.md gotchas)
+                    - id: CKV_AWS_28
+                      comment: >-
+                        sample posture: table is rebuildable derived state designed to delete with the stack; PITR protects nothing irreplaceable here
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W74
+                      reason: Ephemeral task-token rows with a TTL on every item — no customer data
+                    - id: W78
+                      reason: Point-in-time recovery is pointless — a restored row's token belongs to a wait state that already timed out
+                    - id: W28
+                      reason: The explicit name is how the gateway and the waker agree on one table; the TTL is the recovery mechanism
+        Properties:
+            TableName: !Sub
+                - ${ResourcePrefix}-${suffix}
+                - suffix: !FindInMap [DynamoDB, CallbackTable, Suffix]
+            BillingMode: PAY_PER_REQUEST
+            AttributeDefinitions:
+                - { AttributeName: execution_arn, AttributeType: S }
+                - { AttributeName: token_hash, AttributeType: S }
+            KeySchema:
+                - { AttributeName: execution_arn, KeyType: HASH }
+                - { AttributeName: token_hash, KeyType: RANGE }
+            TimeToLiveSpecification:
+                AttributeName: ttl
+                Enabled: true
+
+    CallbackWakerLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub
+                - ${ResourcePrefix}-frame-inspection-${tool}-log
+                - tool: !FindInMap [Lambda, CallbackWaker, Name]
+            RetentionInDays: 30
+
+    CallbackWakerRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W11
+                      reason: states:SendTask* is scoped to this account+region's state machines — the token's machine is the caller's and unknowable at deploy time. This role can only redeem tokens it reads from the callback table, which only the gateway role writes.
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}FrameInspectionCallbackWakerPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt CallbackWakerLogGroup.Arn
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:Query
+                                - dynamodb:DeleteItem
+                            Resource: !GetAtt CallbackTokensTable.Arn
+                          - Effect: Allow
+                            Action: states:SendTaskSuccess
+                            # any machine in THIS account+region — the token's machine is the
+                            # caller's (ours or a customer's own), never known at deploy time
+                            Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*
+
+    CallbackWakerLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Invoked once per terminal execution event; reserved concurrency unnecessary
+        Properties:
+            Description: !Sub ${ResourcePrefix}-frame-inspection callback waker (completes consumer task tokens on terminal events)
+            Runtime: python3.13
+            Architectures:
+                - arm64
+            Handler: callback_waker.lambda_handler
+            Role: !GetAtt CallbackWakerRole.Arn
+            Code:
+                S3Bucket: !FindInMap [Solution, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [Solution, Source, KeyPrefix]
+                      pkg: !FindInMap [Solution, Package, GatewayTool]
+            MemorySize: !FindInMap [Lambda, CallbackWaker, Memory]
+            Timeout: !FindInMap [Lambda, CallbackWaker, Timeout]
+            LoggingConfig:
+                LogGroup: !Ref CallbackWakerLogGroup
+            Environment:
+                Variables:
+                    CALLBACK_TABLE: !Ref CallbackTokensTable
+
+    CallbackCompletionRule:
+        Type: AWS::Events::Rule
+        Properties:
+            Name: !Sub ${ResourcePrefix}-frame-inspection-callback-completion
+            Description: Complete consumer callback task tokens when a witness execution reaches a terminal state
+            EventPattern:
+                source: [aws.states]
+                detail-type: ["Step Functions Execution Status Change"]
+                detail:
+                    status: [SUCCEEDED, FAILED, ABORTED, TIMED_OUT]
+                    stateMachineArn:
+                        - !Ref FrameInspectionStateMachine
+            State: ENABLED
+            Targets:
+                - Id: FrameInspectionCallbackWaker
+                  Arn: !GetAtt CallbackWakerLambda.Arn
+
+    CallbackCompletionRulePermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !GetAtt CallbackWakerLambda.Arn
+            Action: lambda:InvokeFunction
+            Principal: events.amazonaws.com
+            SourceArn: !GetAtt CallbackCompletionRule.Arn
+
+Outputs:
+    GatewayToolLambdaArn:
+        Description: ARN of the gateway tool Lambda — the value media-toolkit-gateway' FrameInspectionToolLambdaArn parameter will consume.
+        Value: !GetAtt GatewayToolLambda.Arn
+    StateMachineArn:
+        Description: ARN of the frame-inspection state machine.
+        Value: !Ref FrameInspectionStateMachine

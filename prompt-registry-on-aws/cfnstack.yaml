@@ -1,0 +1,341 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# ============================================================================
+# prompt-registry-on-aws — versioned, immutable prompt templates on S3.
+#
+# THE SMALLEST STACK IN THE FAMILY, and deliberately so (README.md Design
+# record §3, decision 8): NO state machine, NO container, NO CodeBuild, NO ECR, NO
+# DynamoDB. Two Lambdas out of ONE flat zip — the AgentCore gateway dispatcher
+# (seven synchronous CRUD tools) and the Custom::PromptSeeder that installs
+# the builtin prompts write-if-absent at create/update. S3 is the store AND
+# the index (README.md records why there is no table).
+#
+# Storage: s3://{ProxyBucket}/_promptregistry/{category}/{version}/
+#            source.md       — the authored template, byte-frozen forever
+#            artifact.json   — parsed at save; only lifecycle fields mutate
+#
+# Not a singleton: two stacks sharing one ProxyBucket share one registry,
+# which is the same deliberate arrangement as bedrock-inference's model
+# registry — the seeder's write-if-absent makes that safe.
+# ============================================================================
+Description: >
+    prompt-registry micro-workflow: versioned immutable prompt templates on
+    S3, parsed once at save time; seven synchronous gateway tools; no state
+    machine.
+
+Metadata:
+    AWS::CloudFormation::Interface:
+        ParameterGroups:
+            -
+                Label:
+                    default: Resource Naming
+                Parameters:
+                    - ResourcePrefix
+            -
+                Label:
+                    default: S3 Bucket
+                Parameters:
+                    - ProxyBucket
+            -
+                Label:
+                    default: Seeder
+                Parameters:
+                    - PromptSeedMode
+        ParameterLabels:
+            ResourcePrefix:
+                default: Resource Name Prefix
+            ProxyBucket:
+                default: Proxy Bucket (holds _promptregistry/)
+            PromptSeedMode:
+                default: Builtin Seed Mode (overwrite-builtins is the dev backdoor)
+
+Parameters:
+    ResourcePrefix:
+        Type: String
+        Description: Prefix applied to all resource names.
+        AllowedPattern: "[a-z0-9][a-z0-9-]*"
+    ProxyBucket:
+        Type: String
+        Description: S3 proxy bucket holding the prompt registry under _promptregistry/ (the same ProxyBucket the other micro-workflows write to). No default on purpose — a typo would deploy clean and seed prompts into a bucket nobody reads.
+    PromptSeedMode:
+        Type: String
+        Description: >-
+            Seeder behavior for builtin prompts that ALREADY exist.
+            write-if-absent (the only prod-sane value) never overwrites
+            anything. overwrite-builtins rewrites a shipped prompt in place
+            ONLY when the existing artifact is origin builtin AND its source
+            bytes changed; user-put versions are never touched, and the
+            put_prompt API stays fully immutable in both modes. DEFAULTS TO
+            overwrite-builtins PRE-GA (user decision 2026-08-18 - the
+            prompts are under heavy development and every deploy should
+            reseed changed builtins); FLIP THE DEFAULT TO write-if-absent AT
+            GA - the test named for that obligation fails until it is done.
+        Default: overwrite-builtins
+        AllowedValues:
+            - write-if-absent
+            - overwrite-builtins
+
+Mappings:
+    Solution:
+        Package:
+            GatewayTool: "%%PKG_GATEWAY_TOOL%%"
+        Source:
+            Bucket: "%%BUCKET_NAME%%"
+            KeyPrefix: "%%KEY_PREFIX%%"
+    Lambda:
+        GatewayTool:
+            Name: gateway-tool
+            Memory: 512
+            Timeout: 60
+        Seeder:
+            Name: prompt-seeder
+            Memory: 256
+            Timeout: 300
+
+Resources:
+    ############################################################################
+    # Gateway tool — the seven-tool dispatcher
+    ############################################################################
+    GatewayToolLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            # -log suffix + LoggingConfig, never /aws/lambda/{name}: the
+            # canonical group may exist as an orphan from an earlier deploy,
+            # and CFN cannot adopt a group (micro-workflow-bundle/README.md §C8).
+            LogGroupName: !Sub
+                - ${ResourcePrefix}-prompt-registry-${tool}-log
+                - tool: !FindInMap [Lambda, GatewayTool, Name]
+            RetentionInDays: 30
+
+    GatewayToolRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}PromptRegistryGatewayToolPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # Scoped logs, no AWSLambdaBasicExecutionRole: that
+                          # managed policy grants logs:CreateLogGroup on every
+                          # group, letting a function that cannot reach its
+                          # declared group silently create an unmanaged one
+                          # (micro-workflow-bundle/README.md §C8).
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource:
+                                - !GetAtt GatewayToolLogGroup.Arn
+                                - !GetAtt AdminGatewayToolLogGroup.Arn
+                          # The registry prefix and nothing else — this role
+                          # cannot touch workflow outputs or other stacks'
+                          # artifacts in the shared bucket.
+                          - Effect: Allow
+                            Action:
+                                - s3:GetObject
+                                - s3:PutObject
+                                - s3:DeleteObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/_promptregistry/*
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            Condition:
+                                StringLike:
+                                    s3:prefix: _promptregistry/*
+
+    GatewayToolLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Synchronous CRUD tool; no reserved concurrency needed
+        Properties:
+            # Unnamed on purpose: reached through LoggingConfig, renames stay
+            # one-update operations, and there is no 64-char budget to manage.
+            Description: !Sub ${ResourcePrefix}-prompt-registry gateway tool (put/get/list/promote/delete/deprecate/describe)
+            Runtime: python3.13
+            Architectures:
+                - arm64
+            Handler: lambda_function.lambda_handler
+            Role: !GetAtt GatewayToolRole.Arn
+            Code:
+                S3Bucket: !FindInMap [Solution, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [Solution, Source, KeyPrefix]
+                      pkg: !FindInMap [Solution, Package, GatewayTool]
+            MemorySize: !FindInMap [Lambda, GatewayTool, Memory]
+            Timeout: !FindInMap [Lambda, GatewayTool, Timeout]
+            LoggingConfig:
+                LogGroup: !Ref GatewayToolLogGroup
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    TOOL_VERSION: "%%VERSION%%"
+                    # Must equal the GatewayTarget Name in media-toolkit-gateway.
+                    TARGET_NAME: prompt-registry
+                    # the agent-facing surface: categories whose default
+                    # version declares Audience: workflow-internal are
+                    # invisible here (admin function below serves them)
+                    SERVE_INTERNAL: "false"
+
+    ############################################################################
+    # Admin surface (2026-09-08, the hybrid-search-admin pattern): the SAME
+    # zip and role as GatewayToolLambda, differing only in SERVE_INTERNAL —
+    # internal categories (Audience: workflow-internal) are served here and
+    # nowhere else. Registered in media-toolkit-gateway as the OPTIONAL
+    # prompt-registry-admin target (attach only for superusers); workflow
+    # children also point their PROMPT_REGISTRY ARNs here (internal callers
+    # are trusted by definition).
+    ############################################################################
+    AdminGatewayToolLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub ${ResourcePrefix}-prompt-registry-admin-tool-log
+            RetentionInDays: 30
+
+    AdminGatewayToolLambda:
+        Type: AWS::Lambda::Function
+        Properties:
+            Description: !Sub ${ResourcePrefix}-prompt-registry ADMIN gateway tool (full surface incl. internal categories)
+            Runtime: python3.13
+            Architectures:
+                - arm64
+            Handler: lambda_function.lambda_handler
+            Role: !GetAtt GatewayToolRole.Arn
+            Code:
+                S3Bucket: !FindInMap [Solution, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [Solution, Source, KeyPrefix]
+                      pkg: !FindInMap [Solution, Package, GatewayTool]
+            MemorySize: !FindInMap [Lambda, GatewayTool, Memory]
+            Timeout: !FindInMap [Lambda, GatewayTool, Timeout]
+            LoggingConfig:
+                LogGroup: !Ref AdminGatewayToolLogGroup
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    TOOL_VERSION: "%%VERSION%%"
+                    # Must equal the ADMIN GatewayTarget Name in
+                    # media-toolkit-gateway.
+                    TARGET_NAME: prompt-registry-admin
+                    SERVE_INTERNAL: "true"
+
+    ############################################################################
+    # Custom::PromptSeeder — builtin prompts, write-if-absent
+    ############################################################################
+    SeederLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub
+                - ${ResourcePrefix}-prompt-registry-${tool}-log
+                - tool: !FindInMap [Lambda, Seeder, Name]
+            RetentionInDays: 30
+
+    SeederRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}PromptRegistrySeederPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt SeederLogGroup.Arn
+                          # Get for the write-if-absent existence check, Put
+                          # for the pair; no Delete — the seeder never removes
+                          # anything, by design.
+                          - Effect: Allow
+                            Action:
+                                - s3:GetObject
+                                - s3:PutObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/_promptregistry/*
+                          # ListBucket is NOT for listing: without it, S3
+                          # answers GetObject on a MISSING key with 403
+                          # AccessDenied instead of 404 NoSuchKey, and the
+                          # existence check reads that as a permission error.
+                          # Measured live on the first deploy (2026-08-15):
+                          # the seed failed on its first prompt.
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            Condition:
+                                StringLike:
+                                    s3:prefix: _promptregistry/*
+
+    SeederLambda:
+        Type: AWS::Lambda::Function
+        # Explicit DependsOn: this function is invoked by a custom resource
+        # DURING create — without it Lambda's first invocation can win the
+        # race and auto-create an unmanaged group that blocks the next deploy
+        # (the bundle's log-group hygiene rule).
+        DependsOn: SeederLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Invoked once per stack operation by CloudFormation
+        Properties:
+            Description: !Sub ${ResourcePrefix}-prompt-registry builtin prompt seeder (Custom::PromptSeeder)
+            Runtime: python3.13
+            Architectures:
+                - arm64
+            Handler: seed_prompts.lambda_handler
+            Role: !GetAtt SeederRole.Arn
+            Code:
+                S3Bucket: !FindInMap [Solution, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [Solution, Source, KeyPrefix]
+                      pkg: !FindInMap [Solution, Package, GatewayTool]
+            MemorySize: !FindInMap [Lambda, Seeder, Memory]
+            Timeout: !FindInMap [Lambda, Seeder, Timeout]
+            LoggingConfig:
+                LogGroup: !Ref SeederLogGroup
+
+    PromptSeeder:
+        Type: Custom::PromptSeeder
+        Properties:
+            ServiceToken: !GetAtt SeederLambda.Arn
+            Bucket: !Ref ProxyBucket
+            # Changing .version is what re-runs the seed on update (CFN
+            # re-invokes a custom resource only when its Properties change);
+            # write-if-absent makes the re-run harmless. Flipping SeedMode
+            # also changes Properties, so switching to overwrite-builtins
+            # re-runs the seed in the same update — no version bump needed
+            # to apply the backdoor.
+            SeedMode: !Ref PromptSeedMode
+            Version: "%%VERSION%%"
+
+Outputs:
+    GatewayToolLambdaArn:
+        Description: ARN of the gateway tool Lambda — the value media-toolkit-gateway' PromptRegistryToolLambdaArn parameter consumes.
+        Value: !GetAtt GatewayToolLambda.Arn
+    AdminToolLambdaArn:
+        Description: ARN of the ADMIN gateway tool Lambda (full surface incl. internal categories) — media-toolkit-gateway' PromptRegistryAdminToolLambdaArn parameter and every workflow child's PROMPT_REGISTRY ARN consume this.
+        Value: !GetAtt AdminGatewayToolLambda.Arn
+    RegistryPrefix:
+        Description: The S3 prefix (under ProxyBucket) holding the registry.
+        Value: _promptregistry/

@@ -1,0 +1,51 @@
+{
+  // StateCheckAndPreprocess — minimal realistic input
+  //    Two scenarios shown:
+  //      Scenario A: MP4 / any non-WAV → needs_conversion=true
+  //      Scenario B: 16kHz mono WAV   → needs_conversion=false (fast-path)
+  //
+  //    Use Scenario A as the default test input.
+  "operation": "StateCheckAndPreprocess",
+  "uuid": "8f3a1c2d-0001-0000-0000-000000000000",
+
+  "input": {
+    "s3uri": "s3://<your-ingest-bucket>/uploads/interview.mp4", // Scenario A: MP4 needs conversion
+    // "s3uri": "s3://<your-ingest-bucket>/uploads/mono16k.wav"   // Scenario B: compatible WAV, bypass
+
+    // input_config — fully optional; all fields have defaults (see lib/input_schema.py)
+    "input_config": {
+      "model_id": "bandit_v2", // Fixed value. Informative only
+
+      "chunk_alignment_secs": 8, // Fixed value. Bandit model chunk size
+
+      "fixed_chunk_size_secs": 180 // Configurable chunk size per iterator. Default to 3 mins
+    }
+  },
+
+  "output": {
+    "s3uri": "s3://<your-proxy-bucket>/path/to/output/prefix", // mandatory
+
+    // output_config — fully optional; all fields have defaults
+    "output_config": {
+      // Enable speech stem output and output sample frequence
+      "speech_stem": true,
+      "speech_resampl_freq": 16000, // 8000, 16000, 44100, 48000, 96000
+
+      // Enable music stem output and output sample frequence
+      "music_stem": true,
+      "music_resampl_freq": 48000,
+
+      // Enable sfx stem output and output sample frequence
+      "sfx_stem": true,
+      "sfx_resampl_freq": 32000,
+
+      // Gated mix substitution (opt-in): audio_speech_safe.wav — the speech
+      // stem with attenuated original mix patched into separator-deleted
+      // spans; additive, never replaces audio_speech.wav
+      "speech_safe": false,
+      "speech_safe_resampl_freq": 48000
+    }
+  },
+
+  "data": {}
+}

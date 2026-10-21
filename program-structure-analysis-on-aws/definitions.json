@@ -1,0 +1,53 @@
+{
+  "Comment": "program-structure-analysis: sibling run pointers -> CODE-ONLY Layer-2 rollup (no model calls anywhere; every judgment already happened in Layer-1/CA). Two states: refuse-before-work planning + one assembly pass. Products: structure.json (CPL markers, break candidates, narrative sequences; acts deliberately ABSENT on masters - a measured negative result, README.md §8) and rundown.json (news mode: shot roles + stories with three timestamps + first-class interstitials). Readability copy of the template's inline DefinitionString; edit BOTH, the build fails on drift.",
+  "StartAt": "Validate and plan",
+  "TimeoutSeconds": 900,
+  "States": {
+    "Validate and plan": {
+      "Type": "Task",
+      "Comment": "Refusals: required pointers present and well-formed; mode resolved (explicit > CA overall_content_type > narrative) with the evidence recorded; news mode without CA refuses (the stories ARE CA's segments). Persists _plan/plan.json.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "ValidateAndPlan",
+          "uuid.$": "$.uuid",
+          "input.$": "$.input"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "Assemble"
+    },
+    "Assemble": {
+      "Type": "Task",
+      "Comment": "The whole rollup in one pass, pure code, seconds of runtime. NOT a Map on purpose: the §10 chunking rule targets long-running legs and this is bounded by one episode's JSON, not the catalogue.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "Assemble",
+          "uuid.$": "$.uuid",
+          "plan_s3uri.$": "$.plan_s3uri"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    }
+  }
+}

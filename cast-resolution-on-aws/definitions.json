@@ -1,0 +1,184 @@
+{
+  "Comment": "cast-resolution: sibling run prefixes in, person entities + pinned remap tables out. SIX linear states, the family shape (CA §8): every wait is ONE held waitForTaskToken state completed by a service-side waker (bedrock-inference for the two enrichment rounds, frame-inspection for the witness reads), NO polling and NO Choice states anywhere — skips are SELF-COMPLETED tokens carrying the reason as data. ONE BIND: addressee resolution runs BEFORE BindPersons so its output joins the bind as ordinary cues, and everything after BindPersons only AMENDS the written products (post-review architecture, 2026-09-05 — no second pipeline, so enrichment can never lose evidence Bind paid for). State count follows the record-dependency rule: independent records pool into one submission (adjudication + critique share round 2); dependent rounds get their own state. Caller flags (normalized into the identity hash, ONE default home pb_common.DEFAULT_FLAGS, all true): read_onscreen_text, llm_enrichment, use_batch (witness-read economics; enrichment rounds are tiny text and always sync). Timeouts are CA-sized DEADMEN: witness held state 93600s (batch SLA), enrichment held states 3600s (sync rounds), machine 108000s. Readability copy of the template's inline DefinitionString; edit BOTH, the build fails on drift.",
+  "StartAt": "Validate sources",
+  "TimeoutSeconds": 108000,
+  "States": {
+    "Validate sources": {
+      "Type": "Task",
+      "Comment": "Everything that can refuse refuses HERE: input shape, own-bucket rule, sibling artifact existence, the provenance pin, and flag normalization. Persists _plan/plan.json; states pass URIs, never bodies.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "ValidateSources",
+          "uuid.$": "$.uuid",
+          "input.$": "$.input"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "Resolve addressees"
+    },
+    "Read on-screen text": {
+      "Type": "Task",
+      "Comment": "HELD: credits/chyrons/titles get read by the frame-inspection witness during this state. Submits with callback_task_token + idempotency_token = THIS run's uuid; fi's waker completes the token with the terminal status AS DATA. Self-completed skips: read_onscreen_text=false, no witness/capability, nothing to read, all ledgered (prior products handed over), submit failure. NO Catch: a REDRIVE resubmits and absorbs — redrive IS the reconcile.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "ReadOnscreenText",
+          "uuid.$": "$.uuid",
+          "plan_s3uri.$": "$.plan_s3uri",
+          "task_token.$": "$$.Task.Token"
+        }
+      },
+      "ResultPath": "$.reads_result",
+      "TimeoutSeconds": 93600,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "Bind persons"
+    },
+    "Bind persons": {
+      "Type": "Task",
+      "Comment": "THE pipeline, one retry unit (~0.4s, $0 beyond what earlier states spent): sources, cues (round-1 addressees injected as ordinary cues), vocative voting, co-occurrence, persons with the TOOTH-1 critic inside, witness-product consumption via fi's manifest, cast pairing, roles, read-ledger append. WRITES persons.json (provenance pin included) + remap tables + usage (witness + round-1 costs; pre_enrichment_total recorded so ApplyEnrichment recomputes idempotently) — the durability line: the final product only gains from here, never loses.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "BindPersons",
+          "uuid.$": "$.uuid",
+          "plan_s3uri.$": "$.plan_s3uri",
+          "reads_result.$": "$.reads_result",
+          "addressees_result.$": "$.addressees_result"
+        }
+      },
+      "ResultSelector": {
+        "summary.$": "$.Payload"
+      },
+      "ResultPath": "$.bind_result",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "Adjudicate cast"
+    },
+    "Resolve addressees": {
+      "Type": "Task",
+      "Comment": "HELD, enrichment round 1 (P2-b), runs FIRST because it needs only the transcript: who is being ADDRESSED in dialogue. Unresolved vocative sites (adjacency voting first, its names never re-asked) go to bedrock-inference with callback_task_token; sync, tiny text records. BindPersons consumes the answers as ordinary cues — one bind, no re-bind. Self-completed skips: llm_enrichment=false, no transcript/cues, nothing unresolved, submit failure — every path reaches the reads.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "ResolveAddressees",
+          "plan_s3uri.$": "$.plan_s3uri",
+          "task_token.$": "$$.Task.Token"
+        }
+      },
+      "ResultPath": "$.addressees_result",
+      "TimeoutSeconds": 3600,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "Read on-screen text"
+    },
+    "Adjudicate cast": {
+      "Type": "Task",
+      "Comment": "HELD, enrichment round 2 (P2-a + tooth-2): builds cast-adjudication dossiers and report-only critique records from the SHIPPED persons.json (never a re-bind) and submits them as ONE pooled run — the two families are independent, so they share the submission (the batching rule). Context artifacts are written only when a submission exists. Nothing to ask self-completes with adjudication=skipped.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "AdjudicateCast",
+          "plan_s3uri.$": "$.plan_s3uri",
+          "task_token.$": "$$.Task.Token"
+        }
+      },
+      "ResultPath": "$.adjudication_result",
+      "TimeoutSeconds": 3600,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "Apply enrichment"
+    },
+    "Apply enrichment": {
+      "Type": "Task",
+      "Comment": "The enrichment consumer, AMENDS ONLY: firewall the verdicts (verbatim universe + citations + agreement), apply assignments onto the persons.json BindPersons wrote (provenance pin carries through), re-run the tooth-1 critic (demote-only), attach report-only tooth-2 flags, rewrite persons.json + remap tables, and recompute usage from the recorded pre-enrichment base + round-2 cost — idempotent, a retried apply writes the same numbers. A skipped/failed round 2 is a no-op: round 1's results and cost are already in Bind's products.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "ApplyEnrichment",
+          "plan_s3uri.$": "$.plan_s3uri",
+          "adjudication_result.$": "$.adjudication_result"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    }
+  }
+}

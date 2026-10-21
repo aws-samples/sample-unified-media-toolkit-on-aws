@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unified Media Toolkit · model comparison</title>
+<style>
+/* House metadata-viz design system. Models carry identity by COLUMN
+   position + label, never by color. Color meaning on this page: the warning
+   hue marks DIVERGENCE (one meaning per page). Table view is the
+   accessibility relief — it renders every compared value.
+   Layout (v2, user design): video | scoreboard, then the full shot strip
+   (one frame per shot, clickable, playhead-synced), then the selected
+   shot's frame strip + the model metadata comparison matrix. */
+.viz-root {
+  color-scheme: dark;
+  --surface-1: #1a1a19; --page: #0d0d0d;
+  --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #898781;
+  --grid: #2c2c2a; --baseline: #383835; --border: rgba(255,255,255,0.10);
+  --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+  --good: #0ca30c; --warning: #fab219;
+  --div-bg: rgba(250,178,25,0.12);
+}
+:root[data-theme="light"] .viz-root {
+  color-scheme: light;
+  --surface-1: #fcfcfb; --page: #f9f9f7;
+  --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #898781;
+  --grid: #e1e0d9; --baseline: #c3c2b7; --border: rgba(11,11,11,0.10);
+  --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a;
+  --good: #006300; --warning: #b97c00;
+  --div-bg: rgba(185,124,0,0.12);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--page); color: var(--text-primary); font-size: 13px; }
+.viz-root { display: flex; flex-direction: column; height: 100vh;
+  background: var(--page); }
+header.bar { display: flex; align-items: center; gap: 10px;
+  padding: 8px 16px; border-bottom: 1px solid var(--border);
+  background: var(--surface-1); flex-shrink: 0; }
+header.bar h1 { font-size: 14px; margin: 0; font-weight: 650; }
+header.bar .sub { color: var(--text-muted); font-size: 11px; margin-top: 2px; }
+.spacer { flex: 1; }
+.pill { border: 1px solid var(--border); border-radius: 999px;
+  padding: 3px 10px; font-size: 11px; color: var(--text-secondary);
+  white-space: nowrap; font-variant-numeric: tabular-nums; }
+button { background: var(--surface-1); color: var(--text-secondary);
+  border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px;
+  font-size: 11px; cursor: pointer; }
+button[aria-pressed="true"] { color: var(--text-primary);
+  border-color: var(--text-muted); }
+.tc { font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+  color: var(--text-muted); font-variant-numeric: tabular-nums; }
+
+/* row 1: video | scoreboard */
+.top { display: grid; grid-template-columns: minmax(320px, 40%) 1fr;
+  gap: 1px; background: var(--border); flex-shrink: 0; }
+.player-pane, .score-pane { background: var(--page); min-width: 0;
+  display: flex; flex-direction: column; overflow: hidden; }
+.video-wrap { background: #000; display: flex; align-items: center;
+  justify-content: center; }
+video { max-width: 100%; max-height: 30vh; display: block; }
+.controls { display: flex; align-items: center; gap: 10px; padding: 6px 12px; }
+.score-pane { padding: 8px 16px; overflow: auto; }
+.score-pane h2 { font-size: 10px; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--text-muted); margin: 0 0 4px;
+  font-weight: 600; }
+#score table { border-collapse: collapse; font-size: 11px; }
+#score th { color: var(--text-muted); font-weight: 600; font-size: 10px;
+  text-transform: uppercase; letter-spacing: .06em; text-align: left;
+  padding: 3px 14px 3px 0; }
+#score td { padding: 3px 14px 3px 0; border-top: 1px solid var(--grid);
+  font-variant-numeric: tabular-nums; white-space: nowrap; }
+#score td.m { font-weight: 650; color: var(--text-primary); }
+#score .base { color: var(--text-muted); font-size: 10px; }
+#score td.warn { color: var(--warning); font-weight: 650; }
+
+/* row 2: shot strip — one frame per shot */
+#shotstrip { flex-shrink: 0; background: var(--surface-1);
+  border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+  padding: 6px 12px; overflow-x: auto; white-space: nowrap; }
+#shotstrip .sh { display: inline-block; margin-right: 3px; cursor: pointer;
+  text-align: center; }
+#shotstrip img { height: 44px; display: block;
+  border: 2px solid transparent; border-radius: 3px; }
+#shotstrip .sh .id { font-size: 9px; color: var(--text-muted);
+  font-family: ui-monospace, Menlo, monospace; }
+#shotstrip .sh.playing img { border-color: var(--text-muted); }
+#shotstrip .sh.sel img { border-color: var(--warning); }
+#shotstrip .sh.sel .id { color: var(--warning); font-weight: 700; }
+
+/* row 3: selected shot — frame strip + comparison matrix */
+#detail { flex: 1; min-height: 0; overflow: auto;
+  background: var(--page); padding: 8px 16px 14px; }
+#mx-head { display: flex; align-items: center; gap: 10px;
+  margin-bottom: 6px; position: sticky; left: 0; }
+#mx-head strong { font-size: 12px; }
+#framestrip { margin-bottom: 8px; }
+#framestrip img { max-height: 110px; max-width: 100%;
+  border: 1px solid var(--border); border-radius: 3px; }
+#matrix table { border-collapse: collapse; font-size: 12px; }
+#matrix th, #matrix td { text-align: center; padding: 3px 10px;
+  border-bottom: 1px solid var(--grid); vertical-align: top;
+  font-variant-numeric: tabular-nums; max-width: 230px;
+  overflow-wrap: break-word; }
+#matrix th { color: var(--text-muted); font-weight: 600; font-size: 10px;
+  text-transform: uppercase; letter-spacing: .06em; position: sticky;
+  top: 0; background: var(--page); }
+#matrix th:first-child, #matrix td.f { text-align: left; }
+#matrix td.f { color: var(--text-secondary); font-weight: 600;
+  white-space: nowrap; padding-left: 0; }
+#matrix tr.desc td { text-align: left; color: var(--text-primary);
+  font-size: 12px; line-height: 1.45; }
+#matrix tr.desc td.f { color: var(--text-secondary); }
+#matrix tr.eq td { color: var(--text-muted); }
+#matrix tr.eq td.f { color: var(--text-muted); font-weight: 400; }
+#matrix td.dv { background: var(--div-bg);
+  box-shadow: inset 0 0 0 1px var(--warning); border-radius: 2px; }
+#matrix .mark { color: var(--warning); font-weight: 700; }
+.note { color: var(--text-muted); font-size: 11px; padding: 6px 16px 8px;
+  flex-shrink: 0; background: var(--surface-1);
+  border-top: 1px solid var(--border); }
+
+#tableview { display: none; padding: 12px 16px; overflow: auto;
+  background: var(--surface-1); border-top: 1px solid var(--border);
+  max-height: 50vh; flex-shrink: 0; }
+#tableview.on { display: block; }
+#tableview table { border-collapse: collapse; font-size: 11px; width: 100%; }
+#tableview th, #tableview td { text-align: left; padding: 3px 8px;
+  border-bottom: 1px solid var(--grid); vertical-align: top;
+  font-variant-numeric: tabular-nums; }
+#tableview th { color: var(--text-muted); font-weight: 600; font-size: 10px;
+  text-transform: uppercase; letter-spacing: .06em; position: sticky; top: 0;
+  background: var(--surface-1); }
+#tableview td.dv { background: var(--div-bg); }
+</style>
+</head>
+<body class="viz-root" data-palette="#3987e5,#d95926,#199e70">
+<div class="viz-root">
+
+<header class="bar">
+  <div>
+    <h1 id="hdr-title">Model comparison</h1>
+    <div class="sub" id="hdr-sub"></div>
+  </div>
+  <div class="spacer"></div>
+  <span class="pill" id="pill-models"></span>
+  <span class="pill" id="pill-shots"></span>
+  <span class="pill" id="pill-base"></span>
+  <button id="btn-table" aria-pressed="false">Table view</button>
+  <button id="btn-theme">Light</button>
+</header>
+
+<div class="top">
+  <div class="player-pane">
+    <div class="video-wrap">
+      <video id="v" controls preload="metadata" playsinline></video>
+    </div>
+    <div class="controls">
+      <span class="tc" id="tc">00:00 / 00:00</span>
+      <button id="btn-cc" aria-pressed="true">Subtitles: On</button>
+      <div class="spacer"></div>
+      <button id="btn-follow" aria-pressed="false">Follow playback</button>
+    </div>
+  </div>
+  <div class="score-pane">
+    <h2>Runs</h2>
+    <div id="score"></div>
+  </div>
+</div>
+
+<div id="shotstrip"></div>
+
+<div id="detail">
+  <div id="mx-head">
+    <strong id="mx-title">Select a shot above</strong>
+    <span class="tc" id="mx-ts"></span>
+    <div class="spacer"></div>
+    <button id="btn-prev">◀ prev shot</button>
+    <button id="btn-next">next shot ▶</button>
+    <button id="btn-eq" aria-pressed="false">Hide equal rows</button>
+  </div>
+  <div id="framestrip"></div>
+  <div id="matrix"></div>
+</div>
+
+<div class="note" id="note"></div>
+<div id="tableview"></div>
+</div>
+
+<script>
+const DATA = /*__DATA__*/;
+
+const $ = s => document.querySelector(s);
+const DUR = DATA.meta.duration_sec;
+const MODELS = DATA.models;                 // builder puts baseline FIRST
+const MKEYS = MODELS.map(m => m.key);
+const hms = t => `${String(Math.floor(t/60)).padStart(2,'0')}:` +
+                 `${String(Math.floor(t%60)).padStart(2,'0')}`;
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');
+
+/* header */
+$('#hdr-title').textContent = 'Model comparison · ' + DATA.meta.title;
+$('#hdr-sub').textContent = DATA.meta.subtitle;
+$('#pill-models').textContent = MODELS.length + ' models';
+$('#pill-shots').textContent = DATA.shots.length + ' shots';
+$('#pill-base').textContent = 'baseline: ' + MODELS[0].label;
+$('#note').textContent = DATA.meta.note;
+
+/* scoreboard */
+$('#score').innerHTML = '<table><thead><tr><th>model</th><th>mode</th>' +
+  '<th>cost</th><th>in tok</th><th>out tok</th><th>wall</th>' +
+  '<th>coverage</th><th>scenes</th><th>status</th></tr></thead><tbody>' +
+  MODELS.map((m, i) =>
+    `<tr><td class="m">${esc(m.label)}` +
+    `${i === 0 ? ' <span class="base">· baseline</span>' : ''}</td>` +
+    `<td>${m.mode}</td><td>$${m.cost.toFixed(4)}</td>` +
+    `<td>${m.tokens_in.toLocaleString()}</td>` +
+    `<td>${m.tokens_out.toLocaleString()}</td>` +
+    `<td>${hms(m.wall_sec)}</td>` +
+    `<td${m.gaps ? ' class="warn"' : ''}>${m.coverage}</td>` +
+    `<td>${m.scenes}</td>` +
+    `<td${m.stops_ok ? '' : ' class="warn"'}>${esc(m.stops)}</td></tr>`
+  ).join('') + '</tbody></table>';
+
+/* video */
+const v = $('#v');
+v.src = DATA.media.video;
+v.addEventListener('loadedmetadata', () =>
+  $('#tc').textContent = `${hms(0)} / ${hms(v.duration)}`);
+/* shot-scoped playback: selecting a shot plays ONLY that span and pauses
+   at its end. Scrubbing outside the shot via the native controls releases
+   the clamp; Follow (continuous mode) never clamps. */
+let clamp = null;       // {start, end} of the selected shot
+let ourSeek = false;    // distinguishes our seeks from user scrubbing
+const seek = t => { ourSeek = true;
+  v.currentTime = Math.max(0, t); v.play(); };
+v.addEventListener('seeked', () => {
+  if (ourSeek) { ourSeek = false; return; }
+  if (clamp && (v.currentTime < clamp.start - 0.3 ||
+                v.currentTime > clamp.end + 0.3)) clamp = null;
+});
+
+if (DATA.vtt) {
+  const tr = document.createElement('track');
+  tr.kind = 'subtitles'; tr.label = 'Diarized transcript';
+  tr.srclang = 'en'; tr.default = true;
+  tr.src = URL.createObjectURL(new Blob([DATA.vtt], { type: 'text/vtt' }));
+  v.appendChild(tr);
+  tr.addEventListener('load', () => v.textTracks[0].mode = 'showing');
+  $('#btn-cc').onclick = e => {
+    const on = v.textTracks[0].mode !== 'showing';
+    v.textTracks[0].mode = on ? 'showing' : 'hidden';
+    e.target.setAttribute('aria-pressed', on);
+    e.target.textContent = on ? 'Subtitles: On' : 'Subtitles: Off';
+  };
+} else { $('#btn-cc').style.display = 'none'; }
+
+/* row 2: shot strip — one frame per shot, clickable, playhead-synced */
+let selected = null;
+const strip = $('#shotstrip');
+DATA.shots.forEach(s => {
+  const d = document.createElement('span');
+  d.className = 'sh'; d.dataset.sid = s.id;
+  d.title = `shot ${s.id} · ${s.ts}–${hms(s.end)}`;
+  d.innerHTML = (s.thumb ? `<img src="${s.thumb}">` :
+                 `<img width="60" height="44">`) +
+                `<span class="id">${s.id}</span>`;
+  d.onclick = () => { openShot(s.id); seek(s.start + 0.05); };
+  strip.appendChild(d);
+});
+function markStrip(cls, sid) {
+  strip.querySelectorAll('.sh.' + cls)
+       .forEach(el => el.classList.remove(cls));
+  if (sid === null) return;
+  const el = strip.querySelector(`.sh[data-sid="${sid}"]`);
+  if (el) { el.classList.add(cls);
+    el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); }
+}
+
+/* row 3: selected shot — frame strip + matrix */
+function openShot(id) {
+  selected = id;
+  const s = DATA.shots.find(x => x.id === id);
+  clamp = { start: s.start, end: s.end };
+  markStrip('sel', id);
+  $('#mx-title').textContent = 'Shot ' + s.id;
+  $('#mx-ts').textContent =
+    `${s.ts}–${hms(s.end)} · ${s.div.length} fields diverge`;
+  $('#framestrip').innerHTML = s.grid
+    ? `<img src="${s.grid}" title="shot ${s.id} selected frames">` : '';
+  const hideEq = $('#btn-eq').getAttribute('aria-pressed') === 'true';
+  const rows = DATA.fields
+    .map(f => {
+      const vals = MKEYS.map(k => s.v[f] ? (s.v[f][k] ?? '—') : '—');
+      const uniq = new Set(vals.map(x => JSON.stringify(x)));
+      return { f, vals, dv: uniq.size > 1 };
+    })
+    .sort((a, b) => (b.dv - a.dv));
+  $('#matrix').innerHTML = '<table><thead><tr><th>field</th>' +
+    MODELS.map((m, i) =>
+      `<th>${esc(m.label)}${i === 0 ? ' ·b' : ''}</th>`).join('') +
+    '</tr></thead><tbody>' +
+    rows.filter(r => !hideEq || r.dv).map(r => {
+      const base = JSON.stringify(r.vals[0]);
+      return `<tr class="${r.dv ? '' : 'eq'}"><td class="f">` +
+        `${r.dv ? '<span class="mark">≠</span> ' : ''}${esc(r.f)}</td>` +
+        r.vals.map(x =>
+          `<td class="${r.dv && JSON.stringify(x) !== base ? 'dv' : ''}">` +
+          `${esc(x)}</td>`).join('') + '</tr>';
+    }).join('') +
+    /* description: pinned last, unscored (free text always differs) */
+    `<tr class="desc"><td class="f">description</td>` +
+    MKEYS.map(k =>
+      `<td>${esc(s.desc[k] ?? '—')}</td>`).join('') + '</tr>' +
+    '</tbody></table>';
+}
+$('#btn-eq').onclick = e => {
+  const b = e.target, on = b.getAttribute('aria-pressed') !== 'true';
+  b.setAttribute('aria-pressed', on);
+  if (selected !== null) openShot(selected);
+};
+function step(dir) {
+  const ids = DATA.shots.map(s => s.id);
+  let i = ids.indexOf(selected);
+  i = i === -1 ? 0 : (i + dir + ids.length) % ids.length;
+  const s = DATA.shots[i];
+  openShot(s.id); seek(s.start + 0.05);
+}
+$('#btn-prev').onclick = () => step(-1);
+$('#btn-next').onclick = () => step(1);
+
+/* playhead → strip highlight; Follow also opens the matrix for the
+   current shot (off by default — matrix churn while playing is noisy) */
+v.addEventListener('timeupdate', () => {
+  $('#tc').textContent = `${hms(v.currentTime)} / ${hms(v.duration || DUR)}`;
+  const follow =
+    $('#btn-follow').getAttribute('aria-pressed') === 'true';
+  /* ourSeek guard: while our seek to the clicked shot is still in
+     flight, timeupdate reports the OLD position — clamping on it would
+     pause a backward jump at the new shot's end before it ever plays.
+     Fallback re-arm: once the playhead reports inside the clamp, the
+     seek has landed even if 'seeked' never fired. */
+  if (ourSeek && clamp && v.currentTime >= clamp.start &&
+      v.currentTime < clamp.end) ourSeek = false;
+  if (!follow && !ourSeek && clamp &&
+      v.currentTime >= clamp.end - 0.04) {
+    v.pause();
+    v.currentTime = Math.max(clamp.start, clamp.end - 0.04);
+  }
+  const cur = DATA.shots.find(s =>
+    v.currentTime >= s.start && v.currentTime < s.end);
+  markStrip('playing', cur ? cur.id : null);
+  if (cur && selected !== cur.id && follow) openShot(cur.id);
+});
+$('#btn-follow').onclick = e => {
+  const b = e.target;
+  b.setAttribute('aria-pressed',
+    b.getAttribute('aria-pressed') === 'true' ? 'false' : 'true');
+};
+
+/* table view: shot × field rows, model columns, divergent cells marked */
+const tv = $('#tableview');
+tv.innerHTML = '<table><thead><tr><th>time</th><th>shot</th><th>field</th>' +
+  MODELS.map(m => `<th>${esc(m.label)}</th>`).join('') +
+  '<th>divergent</th></tr></thead><tbody>' +
+  DATA.shots.map(s => DATA.fields.map(f => {
+    const vals = MKEYS.map(k => s.v[f] ? (s.v[f][k] ?? '—') : '—');
+    const uniq = new Set(vals.map(x => JSON.stringify(x)));
+    const dv = uniq.size > 1, base = JSON.stringify(vals[0]);
+    return `<tr><td>${s.ts}</td><td>${s.id}</td><td>${esc(f)}</td>` +
+      vals.map(x => `<td class="${dv && JSON.stringify(x) !== base ?
+        'dv' : ''}">${esc(x)}</td>`).join('') +
+      `<td>${dv ? 'yes' : ''}</td></tr>`;
+  }).join('')).join('') + '</tbody></table>';
+$('#btn-table').onclick = e => {
+  tv.classList.toggle('on');
+  e.target.setAttribute('aria-pressed', tv.classList.contains('on'));
+};
+
+/* theme */
+$('#btn-theme').onclick = e => {
+  const root = document.documentElement;
+  const light = root.getAttribute('data-theme') !== 'light';
+  root.setAttribute('data-theme', light ? 'light' : 'dark');
+  e.target.textContent = light ? 'Dark' : 'Light';
+};
+
+openShot(DATA.shots[0].id);
+</script>
+</body>
+</html>

@@ -1,0 +1,48 @@
+{
+    "name": "hybrid-search",
+    "desc": "Hybrid search engine powered by lanceDB",
+    "enableFeature": true,
+    "primaryModel": "global.amazon.nova-2-lite-v1:0",
+    "secondaryModel": "global.anthropic.claude-sonnet-4-6",
+    "promptS3Key": "_promptconfig/baseline/hybrid-search/default.md",
+    "schemas": [
+        "shot",
+        "scene",
+        "segment",
+        "utterance",
+        "topic"
+    ],
+    "shot": "_lancedb_index/schema/default_shot.json",
+    "scene": "_lancedb_index/schema/default_scene.json",
+    "segment": "_lancedb_index/schema/default_segment.json",
+    "utterance": "_lancedb_index/schema/default_utterance.json",
+    "topic": "_lancedb_index/schema/default_topic.json",
+    "refresh": true,
+    "retrievalPaths": {
+        "visual": {
+            "shot_ann": 0.7,
+            "scene_ann": 0.5,
+            "segment_ann": 0.3
+        },
+        "entity_fts": {
+            "scene_named_entities_fts": 0.9,
+            "topic_named_entities_fts": 0.8
+        },
+        "dialogue": {
+            "utterance_text_fts": 0.8,
+            "utterance_ann": 0.4,
+            "topic_text_fts": 0.6,
+            "topic_ann": 0.4
+        },
+        "text_overlay": {
+            "scene_text_fts": 0.7,
+            "segment_text_fts": 0.6
+        }
+    },
+    "imageRetrievalPaths": {
+        "visual": {
+            "shot_ann": 0.7,
+            "scene_ann": 0.5
+        }
+    }
+}

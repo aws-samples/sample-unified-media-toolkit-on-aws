@@ -1,0 +1,73 @@
+// shot-segmentation-on-aws — input event schema
+//
+// Required fields: uuid, input.s3uri, output.s3uri
+// Optional: input.bucket + input.key (derived from s3uri if absent;
+//   required by the ASL "Probe file size" SDK HeadObject state, so the
+//   gateway_tool always includes them).
+//
+// All input_config fields are optional — defaults apply if omitted.
+
+{
+  "uuid":   "550e8400-e29b-41d4-a716-446655440000",
+  "input":  {
+    "s3uri":  "s3://<your-ingest-bucket>/media/interview.mxf",
+    "input_config": { // OPTIONAL
+      // Transcode segment length in seconds.
+      // Larger values reduce Map state overhead; smaller values increase
+      // concurrency and reduce per-segment failure blast radius.
+      // Range: >= 60.  Default: 1200 (20 minutes).
+      "segment_duration_secs": 1200,
+
+      // Frame sampling rate for the coarse DINOv2 grid (frames per second).
+      // Higher values improve shot-boundary recall at increased cost.
+      // Range: >= 1.  Default: 4.
+      "coarse_fps": 4,
+
+      // Cosine distance threshold for triggering zoom-in frame sampling
+      // around a potential shot boundary.
+      // Range: (0, 1].  Default: 0.10.
+      "cosdist_threshold": 0.10,
+
+      // Cosine distance threshold for calling a shot boundary.
+      // Lower = more cuts detected.  Range: (0, 1].  Default: 0.20.
+      "shot_boundary_threshold": 0.20,
+
+      // Black frame detection — per-pixel intensity threshold (0-1 scale).
+      // Pixels below this value count as "black".  Default: 0.04.
+      "black_pixel_threshold": 0.04,
+
+      // Black frame detection — minimum percentage of pixels that must be
+      // black for the frame to be classified as a black frame.  Default: 99.5.
+      "black_coverage_pct": 99.5,
+
+      // Black frame detection — maximum luma-histogram entropy (bits) for a
+      // black frame.  A backstop, not the decision: black_coverage_pct and
+      // black_max_bright_pixel already confine luma to codes 0-30, which no
+      // picture survives.  Default: 0.20, correct for clean digital sources.
+      //
+      // RAISE THIS for content redigitised from tape.  Tape black is dithered
+      // across several low luma codes by transport and encoder noise and
+      // measures 0.4-2.8 bits even when every pixel sits below luma 17, so
+      // 0.20 rejects genuine black — flat-black shots come back typed
+      // "content" and drag the start of whatever segment they head.  Pass
+      // 3.50 for that material (criteria 1+2 cap entropy at log2(31) = 4.95,
+      // so 3.50 still binds while clearing the observed spread).
+      "black_entropy_max": 0.20,
+
+      // Maximum cosine distance for two shots to be considered "recurring"
+      // (i.e. part of the same recurrence group, e.g. a studio backdrop).
+      // Lower = stricter grouping.  Range: [0, 1).  Default: 0.05.
+      "max_recurrence_threshold": 0.05,
+
+      // Minimum number of shots required to form a recurrence group.
+      // Range: >= 2.  Default: 3.
+      "min_recurrence_count": 3
+    }
+  },
+  "output": {
+    "s3uri": "s3://<your-proxy-bucket>/550e8400-e29b-41d4-a716-446655440000",
+    "output_config": { // RESERVED
+    }
+  },
+  "data": {}
+}

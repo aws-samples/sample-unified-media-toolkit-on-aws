@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>__TITLE__ — AD review</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 -apple-system, "Segoe UI", sans-serif;
+         background: #111; color: #ddd; display: flex; height: 100vh; }
+  #left { flex: 1 1 54%; display: flex; flex-direction: column; padding: 16px; min-width: 0; }
+  #vwrap { position: relative; }
+  video { width: 100%; max-height: calc(100vh - 210px); background: #000; border-radius: 8px; display: block; }
+  #cap { position: absolute; left: 50%; transform: translateX(-50%); bottom: 56px;
+         max-width: 86%; background: rgba(0,0,0,.75); color: #ffd75e; font-style: italic;
+         padding: 4px 12px; border-radius: 6px; font-size: 17px; text-align: center;
+         pointer-events: none; display: none; }
+  h1 { font-size: 16px; margin: 0 0 10px; color: #fff; }
+  #meta { color: #888; font-size: 12px; margin-top: 8px; }
+  #tally { margin-top: 10px; font-size: 12px; color: #aaa; }
+  #tally b { color: #fff; font-weight: 600; }
+  .btn { background: #232323; color: #ddd; border: 1px solid #3a3a3a; border-radius: 6px;
+         padding: 5px 10px; cursor: pointer; font: inherit; font-size: 12px; }
+  .btn:hover { background: #2e2e2e; }
+  #export { margin-top: 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  #exported { color: #6fbf5f; font-size: 12px; }
+
+  #right { flex: 1 1 46%; display: flex; flex-direction: column; border-left: 1px solid #2a2a2a; min-width: 0; }
+  #filters { padding: 12px 12px 8px; display: flex; gap: 6px; flex-wrap: wrap; border-bottom: 1px solid #2a2a2a; }
+  .chip { background: #1b1b1b; border: 1px solid #2a2a2a; color: #aaa; border-radius: 999px;
+          padding: 3px 10px; font-size: 12px; cursor: pointer; }
+  .chip.on { background: #263a4a; border-color: #4a7796; color: #cfe8ff; }
+  #list { flex: 1; overflow-y: auto; padding: 10px 12px 40px; }
+
+  .row { background: #191919; border: 1px solid #2a2a2a; border-left-width: 3px;
+         border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; }
+  .row.active { background: #14261a; border-color: #3f7a34; }
+  .row.hide { display: none; }
+  .row.ship { border-left-color: #3f7a34; }
+  .row.ship_minor { border-left-color: #4a5a4a; }
+  .row.review_tradeoff { border-left-color: #b8892a; }
+  .row.fix_required { border-left-color: #b04242; }
+  .row.no_window { border-left-color: #8a4fb0; }
+  .hd { display: flex; gap: 8px; align-items: center; font-size: 12px; }
+  .hd .n { color: #666; font-variant-numeric: tabular-nums; min-width: 24px; }
+  .go { color: #ffd75e; background: none; border: none; font: inherit; cursor: pointer;
+        font-variant-numeric: tabular-nums; padding: 0; }
+  .go:hover { text-decoration: underline; }
+  .tag { border-radius: 4px; padding: 1px 6px; font-size: 11px; letter-spacing: .02em; }
+  .tag.ship { background: #1e3a18; color: #8fd97f; }
+  .tag.ship_minor { background: #242a24; color: #8a9a8a; }
+  .tag.review_tradeoff { background: #3d2f10; color: #e8bf6a; }
+  .tag.fix_required { background: #3d1717; color: #f08b8b; }
+  .tag.no_window { background: #2e1a3d; color: #cf9ff0; }
+  .tag.imp { background: #1c2f3d; color: #90c8ef; }
+  .tag.state { background: #262626; color: #999; }
+  .grow { flex: 1; }
+  .dur { color: #666; font-variant-numeric: tabular-nums; }
+  .txt { margin: 6px 0 4px; font-size: 14px; }
+  .txt.none { color: #777; font-style: italic; }
+  .txt.dropped { color: #b58f8f; text-decoration: line-through; }
+  .why, .vio { font-size: 12px; margin: 2px 0 0 2px; }
+  .why { color: #8fa9bd; }
+  .vio { color: #d99; }
+  .vio .sev { color: #777; }
+  .orc { font-size: 12px; margin: 2px 0 0 2px; color: #9a8fbd; }
+  .dec { display: flex; gap: 6px; align-items: center; margin-top: 7px; }
+  .dec .btn.on-yes { background: #1e3a18; border-color: #4f8c3f; color: #b6e8a6; }
+  .dec .btn.on-no { background: #3d1717; border-color: #a04a4a; color: #f0b0b0; }
+  .dec input { flex: 1; background: #131313; border: 1px solid #2f2f2f; color: #ddd;
+               border-radius: 6px; padding: 5px 8px; font: inherit; font-size: 12px; min-width: 0; }
+  .dec input.has { border-color: #4a7796; }
+</style>
+</head>
+<body>
+<div id="left">
+  <h1>__TITLE__ <span style="color:#888">(__NCUES__ cues shipped)</span></h1>
+  <div id="vwrap">
+    <video id="v" controls preload="auto">
+      <source src="__VIDEO__" type="video/mp4">
+    </video>
+    <div id="cap"></div>
+  </div>
+  <div id="tally"></div>
+  <div id="export">
+    <button class="btn" id="dl">Download decisions JSON</button>
+    <button class="btn" id="cp">Copy to clipboard</button>
+    <button class="btn" id="clr">Clear all</button>
+    <span id="exported"></span>
+  </div>
+  <div id="meta">Open this file directly (double-click) — no server needed.
+  Click a timestamp to jump 1.5&nbsp;s ahead. Decisions save in this browser as you click;
+  Download/Copy to hand them back. Rows with no cue text are obligations the run did
+  not manage to voice — they are the point of the queue, not noise.</div>
+</div>
+<div id="right">
+  <div id="filters"></div>
+  <div id="list"></div>
+</div>
+<script>
+const CUES = __CUES__;
+const KEY = 'adreview:' + document.title;
+const DEC = JSON.parse(localStorage.getItem(KEY) || '{}');
+const v = document.getElementById('v'), cap = document.getElementById('cap');
+const list = document.getElementById('list');
+const esc = s => String(s ?? '').replace(/[&<>"']/g,
+  c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+let pendingSeek = null, filter = 'all';
+
+function seekTo(t) {
+  if (v.readyState >= 1) { v.currentTime = t; v.play(); }
+  else { pendingSeek = t; v.load(); }
+}
+v.addEventListener('loadedmetadata', () => {
+  if (pendingSeek !== null) { v.currentTime = pendingSeek; pendingSeek = null; v.play(); }
+});
+
+// ── filters: the queue's whole purpose is to be worked down, so the default
+// view is everything but the chips let a reviewer take the urgent slice first.
+const FILTERS = [
+  ['all', 'All', () => true],
+  ['todo', 'Not decided', c => !DEC[c.id] || !DEC[c.id].decision],
+  ['fix', 'Fix required', c => c.disposition === 'fix_required' || c.disposition === 'no_window'],
+  ['trade', 'Trade-offs', c => c.disposition === 'review_tradeoff'],
+  ['unshipped', 'Not shipped', c => c.state !== 'placed'],
+  ['no', 'Not approved', c => DEC[c.id] && DEC[c.id].decision === 'no'],
+];
+const fbar = document.getElementById('filters');
+FILTERS.forEach(([k, label, fn]) => {
+  const b = document.createElement('button');
+  b.className = 'chip' + (k === 'all' ? ' on' : ''); b.dataset.k = k;
+  b.onclick = () => { filter = k; applyFilter();
+    document.querySelectorAll('.chip').forEach(e => e.classList.toggle('on', e.dataset.k === k)); };
+  fbar.appendChild(b);
+});
+function applyFilter() {
+  const fn = FILTERS.find(f => f[0] === filter)[2];
+  CUES.forEach(c => document.getElementById('row' + c.n).classList.toggle('hide', !fn(c)));
+  FILTERS.forEach(([k, label, f]) => {
+    document.querySelector('.chip[data-k="' + k + '"]').textContent =
+      label + ' ' + CUES.filter(f).length;
+  });
+  tally();
+}
+
+function tally() {
+  const n = s => CUES.filter(s).length;
+  const done = n(c => DEC[c.id] && DEC[c.id].decision);
+  document.getElementById('tally').innerHTML =  // nosemgrep: html.security.audit.insecure-document-method
+    '<b>' + done + '</b> of ' + CUES.length + ' rows decided &nbsp;&bull;&nbsp; '
+    + '<b>' + n(c => DEC[c.id] && DEC[c.id].decision === 'yes') + '</b> approved, '
+    + '<b>' + n(c => DEC[c.id] && DEC[c.id].decision === 'no') + '</b> not approved, '
+    + '<b>' + n(c => DEC[c.id] && DEC[c.id].comment) + '</b> with comments';
+}
+
+function save() { localStorage.setItem(KEY, JSON.stringify(DEC)); }
+
+CUES.forEach(c => {
+  const d = document.createElement('div');
+  d.className = 'row ' + c.disposition; d.id = 'row' + c.n;
+  const state = c.state === 'placed' ? '' :
+    '<span class="tag state">' + esc(c.state.toUpperCase()) + '</span>';
+  const txt = c.text ? '<div class="txt' + (c.state === 'placed' ? '' : ' dropped') + '">'
+                       + esc(c.text) + '</div>'
+                     : '<div class="txt none">(no cue written for this obligation)</div>';
+  d.innerHTML =  // nosemgrep: html.security.audit.insecure-document-method
+    '<div class="hd"><span class="n">' + esc(c.n) + '</span>'
+    + '<button class="go">' + esc(c.ts) + '</button>'
+    + '<span class="tag ' + esc(c.disposition) + '">' + esc(c.disposition.replace(/_/g, ' ')) + '</span>'
+    + (c.important ? '<span class="tag imp">important ' + c.necessity.toFixed(2) + '</span>' : '')
+    + state + '<span class="grow"></span>'
+    + '<span class="dur">' + (c.dur ? c.dur.toFixed(1) + 's' : '') + '</span></div>'
+    + txt
+    + c.why_needed.map(w => '<div class="why">&#9656; ' + esc(w) + '</div>').join('')
+    + c.violations.map(x => '<div class="vio">&#9888; ' + esc(x.kind.replace(/_/g, ' '))
+        + ' <span class="sev">[' + esc(x.severity) + ']</span> '
+        + esc(x.note || [x.overlap_sec !== undefined ? x.overlap_sec + 's into speech' : '',
+                         x.needed_tempo !== undefined ? 'needs x' + x.needed_tempo + ' tempo, '
+                            + x.avail_sec + 's available' : ''].filter(Boolean).join('; '))
+        + '</div>').join('')
+    + (c.oracle || []).map(o => '<div class="orc">&#9432; ' + esc(o) + '</div>').join('')
+    + '<div class="dec">'
+    + '<button class="btn yes">&#10003; Approve</button>'
+    + '<button class="btn no">&#10007; Not approved</button>'
+    + '<input placeholder="comment (what is wrong, or what it should say)">'
+    + '</div>';
+  d.querySelector('.go').onclick = () => seekTo(Math.max(0, c.at - 1.5));
+  const yes = d.querySelector('.yes'), no = d.querySelector('.no'),
+        inp = d.querySelector('input');
+  const rec = () => DEC[c.id] || (DEC[c.id] = {});
+  function paint() {
+    const e = DEC[c.id] || {};
+    yes.classList.toggle('on-yes', e.decision === 'yes');
+    no.classList.toggle('on-no', e.decision === 'no');
+    inp.classList.toggle('has', !!e.comment);
+  }
+  function set(val) {
+    const e = rec();
+    e.decision = (e.decision === val) ? null : val;   // click again to un-decide
+    // The export must stand alone — a bare {id: "no"} would send me hunting the
+    // run's own files to learn what I was told about.
+    Object.assign(e, {at: c.at, ts: c.ts, text: c.text, state: c.state,
+                      disposition: c.disposition, decided_at: new Date().toISOString()});
+    save(); paint(); applyFilter();
+  }
+  yes.onclick = () => set('yes');
+  no.onclick = () => set('no');
+  inp.value = (DEC[c.id] || {}).comment || '';
+  inp.oninput = () => { const e = rec();
+    e.comment = inp.value;
+    Object.assign(e, {at: c.at, ts: c.ts, text: c.text, state: c.state,
+                      disposition: c.disposition});
+    save(); paint(); tally(); };
+  paint();
+  list.appendChild(d);
+});
+
+function payload() {
+  const rows = CUES.filter(c => DEC[c.id] && (DEC[c.id].decision || DEC[c.id].comment))
+                   .map(c => ({id: c.id, ...DEC[c.id]}));
+  return JSON.stringify({asset: document.title.replace(' — AD review', ''),
+                         reviewed_at: new Date().toISOString(),
+                         total_rows: CUES.length, decided: rows.length,
+                         decisions: rows}, null, 1);
+}
+function flash(m) { const e = document.getElementById('exported');
+  e.textContent = m; setTimeout(() => e.textContent = '', 3000); }
+document.getElementById('dl').onclick = () => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([payload()], {type: 'application/json'}));
+  a.download = document.title.replace(/[^a-z0-9]+/gi, '_') + '.json';
+  a.click(); flash('downloaded');
+};
+document.getElementById('cp').onclick = () =>
+  navigator.clipboard.writeText(payload()).then(() => flash('copied'),
+                                                () => flash('clipboard blocked — use Download'));
+document.getElementById('clr').onclick = () => {
+  if (!confirm('Clear every decision and comment for this asset?')) return;
+  Object.keys(DEC).forEach(k => delete DEC[k]); save();
+  document.querySelectorAll('.row').forEach(r => {
+    r.querySelector('.yes').classList.remove('on-yes');
+    r.querySelector('.no').classList.remove('on-no');
+    r.querySelector('input').value = ''; r.querySelector('input').classList.remove('has');
+  });
+  applyFilter(); flash('cleared');
+};
+
+applyFilter();
+setInterval(() => {
+  const t = v.currentTime;
+  let active = null;
+  for (const c of CUES) if (c.state === 'placed' && t >= c.at - 0.2 && t <= c.at + c.dur + 0.4) { active = c; break; }
+  if (active) { cap.textContent = active.text; cap.style.display = 'block'; }
+  else cap.style.display = 'none';
+  document.querySelectorAll('.row.active').forEach(e => e.classList.remove('active'));
+  if (active) {
+    const el = document.getElementById('row' + active.n);
+    el.classList.add('active');
+    const r = el.getBoundingClientRect(), lr = list.getBoundingClientRect();
+    if (r.top < lr.top || r.bottom > lr.bottom) el.scrollIntoView({block: 'center', behavior: 'smooth'});
+  }
+}, 200);
+</script>
+</body>
+</html>

@@ -1,0 +1,189 @@
+{
+    "Comment": "Hybrid search ANN rebuild (README.md Design record). Per-physical-table Map: acquire THAT table's lock (LockHeldError retry, never queues) -> optimize + IVF_PQ rebuild -> release. Rebuilds across collections/tables run concurrently.",
+    "StartAt": "Get indices to rebuild",
+    "States": {
+        "Get indices to rebuild": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "ResultSelector": {
+                "index_keys.$": "$.Payload"
+            },
+            "ResultPath": "$",
+            "Parameters": {
+                "FunctionName": "${RebuildLambdaArn}",
+                "Payload": {
+                    "operation": "StateGetIndicesToRebuild",
+                    "force.$": "$.force"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 1.5
+                }
+            ],
+            "Next": "(Map) Rebuild tables"
+        },
+        "(Map) Rebuild tables": {
+            "Type": "Map",
+            "MaxConcurrency": 8,
+            "ItemsPath": "$.index_keys",
+            "ItemSelector": {
+                "index_key.$": "$$.Map.Item.Value",
+                "force.$": "$$.Execution.Input.force",
+                "execution_arn.$": "$$.Execution.Id"
+            },
+            "ItemProcessor": {
+                "ProcessorConfig": {
+                    "Mode": "INLINE"
+                },
+                "StartAt": "Acquire table lock",
+                "States": {
+                    "Acquire table lock": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "ResultPath": null,
+                        "Parameters": {
+                            "FunctionName": "${RebuildLambdaArn}",
+                            "Payload": {
+                                "operation": "StateAcquireLock",
+                                "index_key.$": "$.index_key",
+                                "execution_arn.$": "$.execution_arn"
+                            }
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "LockHeldError",
+                                    "RuntimeError"
+                                ],
+                                "IntervalSeconds": 60,
+                                "MaxAttempts": 10,
+                                "BackoffRate": 1
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException",
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 5,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 1.5
+                            }
+                        ],
+                        "Next": "Rebuild table"
+                    },
+                    "Rebuild table": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "ResultPath": "$.rebuild_result",
+                        "ResultSelector": {
+                            "skipped.$": "$.Payload.skipped"
+                        },
+                        "Parameters": {
+                            "FunctionName": "${RebuildLambdaArn}",
+                            "Payload": {
+                                "operation": "StateRebuildIndex",
+                                "index_key.$": "$.index_key",
+                                "force.$": "$.force"
+                            }
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException",
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 5,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 1.5
+                            }
+                        ],
+                        "Catch": [
+                            {
+                                "ErrorEquals": [
+                                    "States.ALL"
+                                ],
+                                "ResultPath": "$.rebuild_error",
+                                "Next": "Release table lock (on error)"
+                            }
+                        ],
+                        "Next": "Release table lock"
+                    },
+                    "Release table lock": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "ResultPath": null,
+                        "Parameters": {
+                            "FunctionName": "${RebuildLambdaArn}",
+                            "Payload": {
+                                "operation": "StateReleaseLock",
+                                "index_key.$": "$.index_key",
+                                "execution_arn.$": "$.execution_arn"
+                            }
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException",
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 1.5
+                            }
+                        ],
+                        "End": true
+                    },
+                    "Release table lock (on error)": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "ResultPath": null,
+                        "Parameters": {
+                            "FunctionName": "${RebuildLambdaArn}",
+                            "Payload": {
+                                "operation": "StateReleaseLock",
+                                "index_key.$": "$.index_key",
+                                "execution_arn.$": "$.execution_arn"
+                            }
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException",
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 3,
+                                "BackoffRate": 1.5
+                            }
+                        ],
+                        "Next": "Fail table"
+                    },
+                    "Fail table": {
+                        "Type": "Fail",
+                        "Error": "RebuildTableFailed",
+                        "Cause": "StateRebuildIndex failed after releasing the table lock"
+                    }
+                }
+            },
+            "ResultPath": "$.rebuild_results",
+            "End": true
+        }
+    }
+}

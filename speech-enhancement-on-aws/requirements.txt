@@ -1,0 +1,16 @@
+# requirements.txt
+# Pinned for reproducibility. All packages are CPU-only builds.
+# boto3/botocore are included in the Lambda base image but pinned here
+# so the version is explicit and not silently upgraded by AWS.
+
+# ── AWS ───────────────────────────────────────────────────────────────────────
+boto3==1.40.4
+botocore==1.40.4
+
+# ── Numerics ──────────────────────────────────────────────────────────────────
+numpy==2.4.2           # cp313 aarch64 manylinux wheel; compatible with ort 1.19+ and ctranslate2 4.x
+scipy==1.17.1          # cp313 aarch64 manylinux wheel; numpy 2.x compatible
+
+# ── ONNX runtime (CPU only) ───────────────────────────────────────────────────
+# Do NOT install onnxruntime-gpu — it attempts CUDA init and crashes on Lambda.
+onnxruntime==1.24.2

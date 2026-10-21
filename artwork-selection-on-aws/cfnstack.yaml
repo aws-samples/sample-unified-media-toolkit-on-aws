@@ -1,0 +1,502 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# ============================================================================
+# artwork-selection-on-aws — selects representative artwork frames for a
+# media asset (README.md). Code filters/ranks candidate shots per archetype
+# from sibling run outputs; ONE vision pass (via bedrock-inference) orders
+# each pre-qualified slate and flags unusable frames.
+#
+# TWO Lambdas out of ONE flat zip (the gateway dispatcher and the
+# operation-routed workflow handler) and ONE six-state machine. Sibling
+# ARNs are explicit parameters, never Fn::ImportValue (the CA way). Both
+# are REQUIRED here: the vision rerank is the validated core of the
+# product (metadata-only ranking ships bad frames — measured), so a
+# deployment without bedrock-inference would be a worse product
+# masquerading as a degraded mode. The RUNTIME still degrades per run
+# (skips with a named reason) when prompts or submissions fail.
+# ============================================================================
+Description: >
+    artwork-selection micro-workflow: sibling run prefixes in
+    (shot-segmentation, shot-metadata-enrichment; cast-resolution and
+    program-structure optional), ranked diverse artwork candidate slates
+    out. Code qualifies, the model only orders.
+
+Metadata:
+    AWS::CloudFormation::Interface:
+        ParameterGroups:
+            -
+                Label:
+                    default: Resource Naming
+                Parameters:
+                    - ResourcePrefix
+            -
+                Label:
+                    default: S3 Bucket
+                Parameters:
+                    - ProxyBucket
+            -
+                Label:
+                    default: Sibling Gateways
+                Parameters:
+                    - BedrockInferenceGatewayLambdaArn
+                    - PromptRegistryGatewayLambdaArn
+        ParameterLabels:
+            ResourcePrefix:
+                default: Resource Name Prefix
+            ProxyBucket:
+                default: Proxy Bucket (sibling outputs in, outputs out)
+
+Parameters:
+    ResourcePrefix:
+        Type: String
+        Description: Prefix applied to all resource names.
+        AllowedPattern: "[a-z0-9][a-z0-9-]*"
+    ProxyBucket:
+        Type: String
+        Description: S3 proxy bucket — sibling run outputs are read from micro-workflow/* and outputs land under micro-workflow/artwork-selection/. No default on purpose.
+    BedrockInferenceGatewayLambdaArn:
+        Type: String
+        Description: The bedrock-inference stack's GatewayToolLambdaArn output. REQUIRED — the vision rerank is the validated core of the product (and the brief translation rides the same gateway); runs still degrade per run with a named reason when a submission fails.
+    PromptRegistryGatewayLambdaArn:
+        Type: String
+        Description: The prompt-registry stack's AdminToolLambdaArn output (the ADMIN surface — artwork-rerank / artwork-brief are INTERNAL categories, invisible on the standard target). REQUIRED — ValidateAndCompilePlan binds both before any state runs; binding failures degrade, never refuse.
+
+Mappings:
+    Solution:
+        Package:
+            GatewayTool: "%%PKG_GATEWAY_TOOL%%"
+            Workflow: "%%PKG_WORKFLOW%%"
+        Source:
+            Bucket: "%%BUCKET_NAME%%"
+            KeyPrefix: "%%KEY_PREFIX%%"
+    Lambda:
+        GatewayTool:
+            Name: gateway-tool
+            Memory: 512
+            Timeout: 60
+        Workflow:
+            Name: workflow
+            Memory: 1024
+            Timeout: 300
+
+Resources:
+    ############################################################################
+    # Gateway tool — select_artwork / get_job_status / describe_tool
+    ############################################################################
+    GatewayToolLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            # -log suffix + LoggingConfig, never /aws/lambda/{name}: the
+            # canonical group may exist as an orphan from an earlier deploy,
+            # and CFN cannot adopt a group (micro-workflow-bundle/README.md §C8).
+            LogGroupName: !Sub
+                - ${ResourcePrefix}-artwork-selection-${tool}-log
+                - tool: !FindInMap [Lambda, GatewayTool, Name]
+            RetentionInDays: 30
+
+    GatewayToolRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}ArtworkSelectionGatewayToolPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # Scoped logs, no AWSLambdaBasicExecutionRole (the
+                          # managed policy lets a function that cannot reach
+                          # its declared group silently create an unmanaged
+                          # one).
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt GatewayToolLogGroup.Arn
+                          - Effect: Allow
+                            Action: states:StartExecution
+                            Resource: !Ref ArtworkSelectionStateMachine
+                          # DescribeExecution / GetExecutionHistory take
+                          # execution ARNs, not the machine ARN.
+                          - Effect: Allow
+                            Action:
+                                - states:DescribeExecution
+                                - states:GetExecutionHistory
+                            Resource: !Sub
+                                - arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${smName}:*
+                                - smName: !GetAtt ArtworkSelectionStateMachine.Name
+                          # get_job_status lifts small header fields from the
+                          # finished product and lists which outputs exist.
+                          - Effect: Allow
+                            Action: s3:GetObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/artwork-selection/*
+                          # Without ListBucket, GetObject on a MISSING key
+                          # answers 403 AccessDenied instead of 404 NoSuchKey.
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            Condition:
+                                StringLike:
+                                    s3:prefix: micro-workflow/*
+
+    GatewayToolLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Single-purpose dispatcher; reserved concurrency unnecessary
+        Properties:
+            # Unnamed on purpose: reached through LoggingConfig, renames stay
+            # one-update operations.
+            Description: !Sub ${ResourcePrefix}-artwork-selection gateway tool (select_artwork / get_job_status / describe_tool)
+            Runtime: python3.13
+            Architectures:
+                - arm64
+            Handler: lambda_function.lambda_handler
+            Role: !GetAtt GatewayToolRole.Arn
+            Code:
+                S3Bucket: !FindInMap [Solution, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [Solution, Source, KeyPrefix]
+                      pkg: !FindInMap [Solution, Package, GatewayTool]
+            MemorySize: !FindInMap [Lambda, GatewayTool, Memory]
+            Timeout: !FindInMap [Lambda, GatewayTool, Timeout]
+            LoggingConfig:
+                LogGroup: !Ref GatewayToolLogGroup
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    STATE_MACHINE_ARN: !Ref ArtworkSelectionStateMachine
+                    TOOL_VERSION: "%%VERSION%%"
+                    # Must equal the GatewayTarget Name in media-toolkit-gateway.
+                    TARGET_NAME: artwork-selection
+
+    ############################################################################
+    # Workflow Lambda — one zip, operation-routed (states/router.py)
+    ############################################################################
+    WorkflowLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub
+                - ${ResourcePrefix}-artwork-selection-${tool}-log
+                - tool: !FindInMap [Lambda, Workflow, Name]
+            RetentionInDays: 30
+
+    WorkflowRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}ArtworkSelectionWorkflowPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt WorkflowLogGroup.Arn
+                          # Reads sibling run outputs (any micro-workflow/
+                          # prefix — shot-segmentation shots + frame
+                          # archives, enrichment, cast, program structure).
+                          - Effect: Allow
+                            Action: s3:GetObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/*
+                          # Writes ONLY its own run prefix.
+                          - Effect: Allow
+                            Action: s3:PutObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/artwork-selection/*
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            Condition:
+                                StringLike:
+                                    s3:prefix: micro-workflow/*
+                          # The held states SELF-COMPLETE their tokens on the
+                          # skip/degrade paths. SendTaskSuccess cannot be
+                          # resource-scoped (a task token is a bearer
+                          # credential, not an ARN).
+                          - Effect: Allow
+                            Action: states:SendTaskSuccess
+                            # any machine in THIS account+region — the token's machine is the
+                            # caller's (ours or a customer's own), never known at deploy time
+                            Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*
+                          # ValidateAndCompilePlan binds the two internal
+                          # prompt categories at refuse-before-spend time
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource: !Ref PromptRegistryGatewayLambdaArn
+                          # the two held states invoke the bedrock-inference
+                          # gateway the same way (the family's sibling-invoke
+                          # pattern, never its state machine)
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource: !Ref BedrockInferenceGatewayLambdaArn
+
+    WorkflowLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Serial workflow states; reserved concurrency unnecessary
+        Properties:
+            Description: !Sub ${ResourcePrefix}-artwork-selection workflow states (operation-routed)
+            Runtime: python3.13
+            Architectures:
+                - arm64
+            Handler: lambda_function.lambda_handler
+            Role: !GetAtt WorkflowRole.Arn
+            Code:
+                S3Bucket: !FindInMap [Solution, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [Solution, Source, KeyPrefix]
+                      pkg: !FindInMap [Solution, Package, Workflow]
+            MemorySize: !FindInMap [Lambda, Workflow, Memory]
+            Timeout: !FindInMap [Lambda, Workflow, Timeout]
+            LoggingConfig:
+                LogGroup: !Ref WorkflowLogGroup
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    TARGET_NAME: artwork-selection
+                    TOOL_VERSION: "%%VERSION%%"
+                    BEDROCK_GATEWAY_ARN: !Ref BedrockInferenceGatewayLambdaArn
+                    PROMPT_REGISTRY_ARN: !Ref PromptRegistryGatewayLambdaArn
+
+    ############################################################################
+    # State machine
+    ############################################################################
+    StateMachineRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: states.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}ArtworkSelectionStateMachinePolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource: !GetAtt WorkflowLambda.Arn
+
+    ArtworkSelectionStateMachine:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            StateMachineName: !Sub ${ResourcePrefix}-artwork-selection
+            RoleArn: !GetAtt StateMachineRole.Arn
+            DefinitionSubstitutions:
+                WorkflowLambdaArn: !GetAtt WorkflowLambda.Arn
+            # Inline is the single source of truth for what deploys;
+            # definitions.json is the readability copy — edit BOTH, the
+            # build script fails on drift.
+            DefinitionString: |-
+                {
+                  "Comment": "artwork-selection: sibling run prefixes in, a ranked diverse artwork slate out. SIX linear states, the family shape: every wait is ONE held waitForTaskToken state completed by bedrock-inference's waker, NO polling and NO Choice states \u2014 skips are SELF-COMPLETED tokens carrying the reason as data. Code decides (eligibility, archetype queries, ranking, dedup); the model only ORDERS pre-qualified candidates: the brief translation can re-weight within the closed vocabulary but never reach eligibility, and the vision rerank can reorder and flag within a slate but never add to it. Both held rounds submit one record each (tiny text; one staged vision record via records_s3uri \u2014 base64 frames blow the 256 KB invoke payload); use_batch is a CALLER flag (default false = sync). Timeouts are deadmen sized for the worst legitimate case: held states 93600s (the batch SLA ceiling, since use_batch=true parks a round on a batch job), machine 108000s. Readability copy of the template's inline DefinitionString; edit BOTH, the build fails on drift.",
+                  "StartAt": "Validate sources and compile plan",
+                  "TimeoutSeconds": 108000,
+                  "States": {
+                    "Validate sources and compile plan": {
+                      "Type": "Task",
+                      "Comment": "Everything that can refuse refuses HERE: input shape, own-bucket rule, sibling artifact existence (shots + shot metadata required; cast persons + program structure optional), the provenance pin, flag normalization, archetype plan compilation (explicit list, else genre profile), prompt binding (degrades \u2014 the held states skip with a named reason). Persists _plan/plan.json; states pass URIs, never bodies.",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "ValidateAndCompilePlan",
+                          "uuid.$": "$.uuid",
+                          "input.$": "$.input"
+                        }
+                      },
+                      "OutputPath": "$.Payload",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Translate brief to plan amendments"
+                    },
+                    "Translate brief to plan amendments": {
+                      "Type": "Task",
+                      "Comment": "HELD: the one editorial seat. The free-text selection_brief goes to bedrock-inference (one text record, caller-flagged batch/sync) for translation into the closed vocabulary; the filter state validates the result \u2014 amendments re-weight, they never reach eligibility. Self-completed skips: no brief, no bedrock gateway, prompts not bound, submit failure \u2014 every path reaches the filter.",
+                      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "TranslateBriefToPlanAmendments",
+                          "plan_s3uri.$": "$.plan_s3uri",
+                          "task_token.$": "$$.Task.Token"
+                        }
+                      },
+                      "ResultPath": "$.brief_result",
+                      "TimeoutSeconds": 93600,
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 5,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Filter and rank candidate shots"
+                    },
+                    "Filter and rank candidate shots": {
+                      "Type": "Task",
+                      "Comment": "THE selection, pure code, one retry unit: Layer A eligibility (hard filter, genre-independent \u2014 slates, on-screen text, brands, screen-in-screen, short shots, spoiler cut, program-structure spans), archetype queries over the closed vocabulary, stability ranking, cross-archetype dedup. Brief amendments are validated against the closed vocabulary before use. WRITES candidates.json.",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "FilterRankCandidateShots",
+                          "plan_s3uri.$": "$.plan_s3uri",
+                          "brief_result.$": "$.brief_result"
+                        }
+                      },
+                      "OutputPath": "$.Payload",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Grab candidate frames"
+                    },
+                    "Grab candidate frames": {
+                      "Type": "Task",
+                      "Comment": "Pure code, stdlib only: middle JPEG of each candidate shot's frame archive (shot-segmentation per-shot tar.gz, proxy resolution) -> frames/ under the run prefix. A broken archive drops the frame, never the run. full_res source extraction is a fast-follow \u2014 the parameter is refused at the gateway until then.",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "GrabCandidateFrames",
+                          "plan_s3uri.$": "$.plan_s3uri",
+                          "candidates_s3uri.$": "$.candidates_s3uri"
+                        }
+                      },
+                      "OutputPath": "$.Payload",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Rerank frames by vision"
+                    },
+                    "Rerank frames by vision": {
+                      "Type": "Task",
+                      "Comment": "HELD: the ONE model seat, judging only what metadata cannot see (sharpness, blur, eyes, composition). ONE staged vision record over every grabbed frame (records_s3uri \u2014 the frames cannot ride the invoke payload), all archetype groups in one request, ranked WITHIN each; the judge cannot add a frame, pick a slate, or violate the spoiler policy \u2014 it never saw those. Self-completed skips: no frames, no bedrock gateway, prompts not bound, submit failure.",
+                      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "RerankFramesByVision",
+                          "plan_s3uri.$": "$.plan_s3uri",
+                          "candidates_s3uri.$": "$.candidates_s3uri",
+                          "task_token.$": "$$.Task.Token"
+                        }
+                      },
+                      "ResultPath": "$.rerank_result",
+                      "TimeoutSeconds": 93600,
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 5,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Assemble artwork candidates"
+                    },
+                    "Assemble artwork candidates": {
+                      "Type": "Task",
+                      "Comment": "The product writer, AMENDS ONLY: vision ranking reorders within each archetype, unusable flags attach, the top reason is recorded \u2014 never adds, never re-qualifies. A skipped/failed rerank ships the metadata order with the reason on record: the slate is always delivered. WRITES artwork_candidates.json.",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "AssembleArtworkCandidates",
+                          "plan_s3uri.$": "$.plan_s3uri",
+                          "candidates_s3uri.$": "$.candidates_s3uri",
+                          "rerank_result.$": "$.rerank_result"
+                        }
+                      },
+                      "OutputPath": "$.Payload",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "End": true
+                    }
+                  }
+                }
+Outputs:
+    GatewayToolLambdaArn:
+        Description: ARN of the gateway tool Lambda — the value media-toolkit-gateway' ArtworkSelectionToolLambdaArn parameter will consume.
+        Value: !GetAtt GatewayToolLambda.Arn
+    StateMachineArn:
+        Description: ARN of the artwork-selection state machine.
+        Value: !Ref ArtworkSelectionStateMachine

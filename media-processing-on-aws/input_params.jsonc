@@ -1,0 +1,94 @@
+{
+  "operation": "StateProbeMediaFile", // Inserted in Step Function state definition
+  "uuid": "{uuid}", // Mandatory
+  "input": {
+    "s3uri": "s3://<your-ingest-bucket>/path/to/source.mxf", // Mandatory
+    "input_config": { // Optional
+      // Manually select audio tracks to map instead of 16-32 PCM Mono tracks in MXF or ProRes formats
+      // If not specified or use_channel_mapping is False, auto-detect. Prioritize stereo or multi-channels.
+      // Ignore Dolby-E channel as ffmpeg cannot decode it.
+      // If not found, use the first two PCM mono channels.
+      "use_channel_mapping": true, // Default to false,
+      "audio_channel_mapping": [
+        1,
+        2
+      ],
+      // Limit to partial video processing
+      "use_partial": true, // Default to false,
+      "mark_in_out": [
+        0,
+        1800
+      ],
+      // Input cropping (remove VBI noise)
+      "crop_x": 0, // Default to 0
+      "crop_y": 0, // Default to 0
+      // Recommended output dimension - The actual output dimension is derived based on:
+      // - if input resolution is smaller, no upscale
+      // - always maintain input aspect ratio
+      // - portriat mode, flip the width and height
+      "width": 960, // Default to 960
+      "height": 540 // Default to 540
+    }
+  },
+  "output": {
+    "s3uri": "s3://<your-proxy-bucket>/output/prefix", // Mandatory
+    "output_groups": [ // OPTIONAL - if output_groups is not specified or empty, default to generate mp4 proxy video
+      // video output - If specified
+      {
+        "group_name": "proxy", // Mandatory. Append to s3uri. Output to {s3uri}/{group_name}/
+        "format": "mp4", // Mandatory
+        "name": "transcoded", // Optional. Default to transcoded
+        "codec": "libopenh264", // Optional. libopenh264 is the only valid value.
+        "gop_seconds": 2.0, // Optional. Default to 2.0
+        "motion_factor": 1.6 // Optional. Default to 1.6
+      },
+      // audio output (wav) - If specified
+      {
+        "group_name": "audio_only", // Mandatory. Append to s3uri. Output to {s3uri}/{group_name}/
+        "format": "wav", // Mandatory
+        "name": "audio", // Optional. Default to audio
+        "sampling_rate": 48000, // Optional. Default to 48000
+        "codec": "pcm_s16le", // Optional. Default to pcm_s16le
+        "audio_channels": 1 // Optional. Default to 1
+      },
+      // audio output (m4a) - If specified
+      {
+        "group_name": "audio_m4a", // Mandatory. Append to s3uri. Output to {s3uri}/{group_name}/
+        "format": "m4a", // Mandatory
+        "name": "audio", // Optional. Default to audio
+        "sampling_rate": 48000, // Optional. Default to 48000
+        "codec": "aac", // Optional. Default to aac
+        "audio_bitrate": 96, // Optional. Default to 96
+        "audio_channels": 2 // Optional. Default to 2
+      },
+      // frame capture output - If specified
+      {
+        "group_name": "frame_capture", // Mandatory. Append to s3uri. Output to {s3uri}/{group_name}/
+        "format": "jpeg", // Mandatory - jpeg|png. Default to "jpeg"
+        // Below are OPTIONAL
+        "name": "frame", // Internal appended {name}_%07d.jpg
+        "frame_interval_sec": 1 // 0.5 -> 2 frames per second, 1 -> 1 frame per second, 2 -> 1 frame every 2 seconds, and so forth. Default to 1.
+      },
+      // technical metadata output - If specified.
+      // Fully served by StateProbeMediaFile: ffprobe always, plus mxf2raw
+      // automatically when the source is MXF (the mxf block is present only then).
+      // A metadata-ONLY request skips the Map and merge states entirely — two
+      // Lambda invocations, no transcode. crop_x/crop_y/width/height are ignored.
+      {
+        "group_name": "metadata", // Mandatory. Append to s3uri. Output to {s3uri}/{group_name}/{name}.json
+        "format": "metadata", // Mandatory
+        // Below are OPTIONAL
+        "name": "metadata", // Output file basename. Default to "metadata"
+        // "default" -> format + streams + chapters + programs
+        // "full"    -> additionally surfaces per-stream disposition and tags.
+        // Same single ffprobe call either way — "full" is a filtering decision.
+        // Frame- and packet-level detail is NOT offered at any level: every such
+        // mode reads the entire file (including -skip_frame nokey).
+        "detail": "default" // Optional - default|full. Default to "default"
+      }
+    ]
+  },
+  "data": {
+    // data generated from different states
+  }
+}

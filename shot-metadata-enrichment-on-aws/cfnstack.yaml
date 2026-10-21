@@ -1,0 +1,856 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# ============================================================================
+# shot-metadata-enrichment-on-aws — llm-prompt-driven micro-workflow on the
+# conversation-analysis template (README.md §10). Shot-segmentation run in,
+# per-shot metadata documents + deterministically assembled scenes out.
+#
+# TWO Lambdas — the gateway dispatcher (flat zip) and the operation-routed
+# workflow handler (CONTAINER IMAGE: pyvips for the reference-face gallery;
+# CodeBuild+ECR via face-recognition's StartBuildDelayResponse pattern) —
+# and ONE state machine whose only wait
+# is a single waitForTaskToken submit to bedrock-inference — completion is
+# PUSH (bedrock's callback_task_token feature), no polling anywhere, and
+# the machine never starts the sibling's state machine directly (the
+# gateway Lambda is the submit brain; raw StartExecution would copy
+# identity/staging logic and cannot absorb closed runs). The template's
+# render step is widened to a Map over window batches (image records are
+# heavy; iterations checkpoint per window and resume on
+# LambdaResourceTimeoutException).
+#
+# CONSUMER WIRING (the same shape the bundle uses later): the two sibling
+# gateway-Lambda ARNs arrive as parameters — explicit parameters, never
+# Fn::ImportValue.
+# ============================================================================
+Description: >
+    shot-metadata-enrichment micro-workflow: shot-segmentation run in,
+    per-shot metadata + assembled scenes out; renders image-bearing windows
+    of labeled frames (with optional face-recognition and transcript joins)
+    through the registry shot-metadata-enrichment prompt and submits to
+    bedrock-inference with push-based completion, batch by default.
+
+Metadata:
+    AWS::CloudFormation::Interface:
+        ParameterGroups:
+            -
+                Label:
+                    default: Resource Naming
+                Parameters:
+                    - ResourcePrefix
+            -
+                Label:
+                    default: S3 Bucket
+                Parameters:
+                    - ProxyBucket
+            -
+                Label:
+                    default: Sibling Services (gateway-tool Lambda ARNs)
+                Parameters:
+                    - BedrockInferenceGatewayLambdaArn
+                    - PromptRegistryGatewayLambdaArn
+        ParameterLabels:
+            ResourcePrefix:
+                default: Resource Name Prefix
+            ProxyBucket:
+                default: Proxy Bucket (shot-segmentation runs in, outputs out)
+            BedrockInferenceGatewayLambdaArn:
+                default: bedrock-inference GatewayToolLambdaArn output
+            PromptRegistryGatewayLambdaArn:
+                default: prompt-registry GatewayToolLambdaArn output
+
+Parameters:
+    ResourcePrefix:
+        Type: String
+        Description: Prefix applied to all resource names.
+        AllowedPattern: "[a-z0-9][a-z0-9-]*"
+    ProxyBucket:
+        Type: String
+        Description: S3 proxy bucket — transcripts are read from micro-workflow/* and outputs land under micro-workflow/shot-metadata-enrichment/. No default on purpose.
+    BedrockInferenceGatewayLambdaArn:
+        Type: String
+        Description: The bedrock-inference stack's GatewayToolLambdaArn output. Invoked directly (README.md §10) for run_inference (with callback_task_token) and get_model; must be a deployment whose run_inference supports callback_task_token (alpha.20260817b+).
+        AllowedPattern: "arn:aws[a-z-]*:lambda:.*"
+    PromptRegistryGatewayLambdaArn:
+        Type: String
+        Description: The prompt-registry stack's GatewayToolLambdaArn output. Invoked directly for get_prompt; the workflow binds the shot-metadata-enrichment category's `default` version.
+        AllowedPattern: "arn:aws[a-z-]*:lambda:.*"
+
+Mappings:
+    Solution:
+        Package:
+            GatewayTool: "%%PKG_GATEWAY_TOOL%%"
+            # Docker source (Dockerfile + requirements + lib/ + states/) —
+            # the workflow Lambda ships as a CONTAINER IMAGE (user decision
+            # 2026-08-19, replacing the zip-vendored pyvips wheel whose
+            # version pairing broke at runtime; see Dockerfile header).
+            WorkflowImage: "%%PKG_WORKFLOW_IMAGE%%"
+        Source:
+            Bucket: "%%BUCKET_NAME%%"
+            KeyPrefix: "%%KEY_PREFIX%%"
+    CodeBuild:
+        Project:
+            Type: ARM_CONTAINER
+            ComputeType: BUILD_GENERAL1_LARGE
+            Image: aws/codebuild/amazonlinux2-aarch64-standard:3.0
+    ECR:
+        Repository:
+            Name: shot-metadata-enrichment-on-aws
+            ImageTag: "%%VERSION%%"
+    Lambda:
+        GatewayTool:
+            Name: gateway-tool
+            Memory: 512
+            Timeout: 60
+        Workflow:
+            Name: workflow
+            # 2048/900: the render Map iterations thread tarball fetches and
+            # compose pyvips galleries; 900 s + the LambdaResourceTimeoutException
+            # checkpoint discipline bounds any single invocation.
+            Memory: 2048
+            Timeout: 900
+
+Resources:
+    ############################################################################
+    # Gateway tool — enrich_shot_metadata / get_job_status / describe_tool
+    ############################################################################
+    GatewayToolLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            # -log suffix + LoggingConfig, never /aws/lambda/{name}: the
+            # canonical group may exist as an orphan from an earlier deploy,
+            # and CFN cannot adopt a group (micro-workflow-bundle/README.md §C8).
+            LogGroupName: !Sub
+                - ${ResourcePrefix}-shot-metadata-enrichment-${tool}-log
+                - tool: !FindInMap [Lambda, GatewayTool, Name]
+            RetentionInDays: 30
+
+    GatewayToolRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}ShotMetadataEnrichmentGatewayToolPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # Scoped logs, no AWSLambdaBasicExecutionRole (the
+                          # managed policy lets a function that cannot reach
+                          # its declared group silently create an unmanaged
+                          # one).
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt GatewayToolLogGroup.Arn
+                          - Effect: Allow
+                            Action: states:StartExecution
+                            Resource: !Ref ShotMetadataEnrichmentStateMachine
+                          # DescribeExecution / GetExecutionHistory take
+                          # execution ARNs, not the machine ARN.
+                          - Effect: Allow
+                            Action:
+                                - states:DescribeExecution
+                                - states:GetExecutionHistory
+                            Resource: !Sub
+                                - arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${smName}:*
+                                - smName: !GetAtt ShotMetadataEnrichmentStateMachine.Name
+                          # get_job_status lifts small header fields from the
+                          # finished analysis.
+                          - Effect: Allow
+                            Action: s3:GetObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/shot-metadata-enrichment/*
+                          # Without ListBucket, GetObject on a MISSING key
+                          # answers 403 AccessDenied instead of 404 NoSuchKey
+                          # (measured live on prompt-registry, 2026-08-15).
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            Condition:
+                                StringLike:
+                                    s3:prefix: micro-workflow/*
+
+    GatewayToolLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Single-purpose dispatcher; reserved concurrency unnecessary
+        Properties:
+            # Unnamed on purpose: reached through LoggingConfig, renames stay
+            # one-update operations.
+            Description: !Sub ${ResourcePrefix}-shot-metadata-enrichment gateway tool (enrich_shot_metadata / get_job_status / describe_tool)
+            Runtime: python3.13
+            Architectures:
+                - arm64
+            Handler: lambda_function.lambda_handler
+            Role: !GetAtt GatewayToolRole.Arn
+            Code:
+                S3Bucket: !FindInMap [Solution, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [Solution, Source, KeyPrefix]
+                      pkg: !FindInMap [Solution, Package, GatewayTool]
+            MemorySize: !FindInMap [Lambda, GatewayTool, Memory]
+            Timeout: !FindInMap [Lambda, GatewayTool, Timeout]
+            LoggingConfig:
+                LogGroup: !Ref GatewayToolLogGroup
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    STATE_MACHINE_ARN: !Ref ShotMetadataEnrichmentStateMachine
+                    TOOL_VERSION: "%%VERSION%%"
+                    # Must equal the GatewayTarget Name in media-toolkit-gateway.
+                    TARGET_NAME: shot-metadata-enrichment
+
+    ############################################################################
+    # CodeBuild — builds the workflow container image (face-recognition's
+    # StartBuildDelayResponse pattern verbatim: pre_build skips when the
+    # image tag already exists in ECR; post_build always signals
+    # CloudFormation via $CFN_ResponseURL).
+    ############################################################################
+    # CodeBuild IAM Role
+    CodeBuildRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W11
+                      reason: GetAuthorizationToken requires a wildcard resource (no ARN exists for it)
+        Properties:
+            Path: /
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: codebuild.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}ShotMetadataEnrichmentCodeBuildRolePolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild:*
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub
+                                - arn:aws:s3:::${bucket}
+                                - bucket: !FindInMap [Solution, Source, Bucket]
+                          # Scoped to the staging BUCKET, not the versioned key: a
+                          # key-pinned grant is rewritten on every version bump and the
+                          # build that reads the new key starts seconds later, racing IAM
+                          # propagation (a lost race denies an object that exists and is
+                          # readable). Bucket-wide is already the ListBucket scope above.
+                          - Effect: Allow
+                            Action: s3:GetObject
+                            Resource: !Sub
+                                - arn:aws:s3:::${bucket}/*
+                                - bucket: !FindInMap [Solution, Source, Bucket]
+                          # GetAuthorizationToken, DescribeImages, and CreateRepository require Resource: "*"
+                          - Effect: Allow
+                            Action:
+                                # GetAuthorizationToken is the ONLY ECR action
+                                # that requires "*" (CSR scan 2026-10-08)
+                                - ecr:GetAuthorizationToken
+                            Resource: "*"
+                          - Effect: Allow
+                            Action:
+                                - ecr:CreateRepository
+                                - ecr:DescribeImages
+                                - ecr:BatchCheckLayerAvailability
+                                - ecr:CompleteLayerUpload
+                                - ecr:InitiateLayerUpload
+                                - ecr:PutImage
+                                - ecr:UploadLayerPart
+                            Resource: !Sub
+                                - arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${repoName}
+                                - repoName: !FindInMap [ECR, Repository, Name]
+
+    ################################################################################
+    # CodeBuild Project — ARM_CONTAINER native linux/arm64 build.
+    # pre_build: skip when IMAGE_REPO_NAME:IMAGE_TAG exists in ECR.
+    # post_build: always signals CloudFormation via $CFN_ResponseURL.
+    # No model seeding — all ML is Amazon Rekognition APIs.
+    ################################################################################
+    CodeBuildProject:
+        Type: AWS::CodeBuild::Project
+        Properties:
+            Name: !Sub
+                - ${ResourcePrefix}-${repositoryName}
+                - repositoryName: !FindInMap [ECR, Repository, Name]
+            Description: Build and publish the shot-metadata-enrichment workflow docker image to ECR
+            ServiceRole: !GetAtt CodeBuildRole.Arn
+            Source:
+                Type: S3
+                Location: !Sub
+                    - ${bucket}/${keyPrefix}/${package}
+                    - bucket: !FindInMap [Solution, Source, Bucket]
+                      keyPrefix: !FindInMap [Solution, Source, KeyPrefix]
+                      package: !FindInMap [Solution, Package, WorkflowImage]
+                BuildSpec: |
+                    version: 0.2
+                    phases:
+                        pre_build:
+                            commands:
+                                - echo "== Logging in to Amazon ECR =="
+                                - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+                                - |
+                                    echo "== Creating ECR repository if it does not exist =="
+                                    aws ecr create-repository --region $AWS_REGION --repository-name $IMAGE_REPO_NAME --image-scanning-configuration scanOnPush=true --encryption-configuration encryptionType=AES256; EXITCODE=$?
+                                    if [ $EXITCODE -ne 0 ] && [ $EXITCODE -ne 254 ]; then
+                                        echo "ECR create-repository failed with exit code $EXITCODE"
+                                        exit $EXITCODE
+                                    fi
+                                - |
+                                    echo "== Checking if $IMAGE_REPO_NAME:$IMAGE_TAG already exists =="
+                                    if aws ecr describe-images --region $AWS_REGION --repository-name $IMAGE_REPO_NAME --image-ids imageTag=$IMAGE_TAG 2>/dev/null; then
+                                        echo "Image $IMAGE_REPO_NAME:$IMAGE_TAG already exists — skipping build"
+                                        touch /tmp/skip_build
+                                    else
+                                        echo "Image not found — proceeding with build"
+                                    fi
+                        build:
+                            commands:
+                                - |
+                                    if [ -f /tmp/skip_build ]; then
+                                        echo "== Skipping docker build — image already exists =="
+                                    else
+                                        echo "== Building $IMAGE_REPO_NAME:$IMAGE_TAG [$(date)] =="
+                                        docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+                                        docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                                        echo "== Pushing $IMAGE_REPO_NAME:$IMAGE_TAG [$(date)] =="
+                                        docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                                        echo "== Push complete [$(date)] =="
+                                    fi
+                        post_build:
+                            commands:
+                                - |
+                                    echo "=== post_build CODEBUILD_BUILD_SUCCEEDING=$CODEBUILD_BUILD_SUCCEEDING ==="
+                                    if [ -n "$CFN_ResponseURL" ]; then
+                                        if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then
+                                            echo "== Sending SUCCESS to CloudFormation =="
+                                            curl -s -X PUT -H "Content-Type:" \
+                                                --data-binary "{\"Status\":\"SUCCESS\",\"Reason\":\"Docker image ready\",\"PhysicalResourceId\":\"$CFN_PhysicalResourceId\",\"StackId\":\"$CFN_StackId\",\"RequestId\":\"$CFN_RequestId\",\"LogicalResourceId\":\"$CFN_LogicalResourceId\",\"Data\":{\"ImageUri\":\"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG\"}}" \
+                                                "$CFN_ResponseURL"
+                                        else
+                                            echo "== Sending FAILED to CloudFormation =="
+                                            curl -s -X PUT -H "Content-Type:" \
+                                                --data-binary "{\"Status\":\"FAILED\",\"Reason\":\"Build failed — see CodeBuild logs\",\"PhysicalResourceId\":\"$CFN_PhysicalResourceId\",\"StackId\":\"$CFN_StackId\",\"RequestId\":\"$CFN_RequestId\",\"LogicalResourceId\":\"$CFN_LogicalResourceId\",\"Data\":{}}" \
+                                                "$CFN_ResponseURL"
+                                        fi
+                                    fi
+            Environment:
+                Type: !FindInMap [CodeBuild, Project, Type]
+                ComputeType: !FindInMap [CodeBuild, Project, ComputeType]
+                Image: !FindInMap [CodeBuild, Project, Image]
+                PrivilegedMode: true
+                EnvironmentVariables:
+                    - Name: AWS_REGION
+                      Value: !Ref AWS::Region
+                    - Name: AWS_ACCOUNT_ID
+                      Value: !Ref AWS::AccountId
+                    - Name: IMAGE_REPO_NAME
+                      Value: !FindInMap [ECR, Repository, Name]
+                    - Name: IMAGE_TAG
+                      Value: !FindInMap [ECR, Repository, ImageTag]
+            Artifacts:
+                Type: NO_ARTIFACTS
+            EncryptionKey: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3
+            TimeoutInMinutes: 60
+            QueuedTimeoutInMinutes: 60
+            LogsConfig:
+                CloudWatchLogs:
+                    GroupName: /aws/codebuild
+                    StreamName: !Sub
+                        - ${ResourcePrefix}-${repositoryName}
+                        - repositoryName: !FindInMap [ECR, Repository, Name]
+                    Status: ENABLED
+
+    ################################################################################
+    # StartBuild Lambda (StartBuildDelayResponse pattern)
+    ################################################################################
+    StartBuildLambdaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: /
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}ShotMetadataEnrichmentStartBuildPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # Scoped to the declared group, and NO
+                          # logs:CreateLogGroup: the group is a stack resource,
+                          # so this function must never create one. Withholding
+                          # the permission is what makes "it silently logged
+                          # somewhere else" impossible.
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt StartBuildLambdaLogGroup.Arn
+                          - Effect: Allow
+                            Action: codebuild:StartBuild
+                            Resource: !GetAtt CodeBuildProject.Arn
+
+    # StartBuildLambda is UNNAMED — CFN generates its physical name, so
+    # /aws/lambda/{FunctionName} is unknowable at author time. LoggingConfig
+    # below decouples the group from the function name, which is the only way
+    # an unnamed function can write to a declared, stack-owned group. Without
+    # one, Lambda auto-creates a group with retentionInDays=None (billed
+    # forever) that survives stack deletion.
+    StartBuildLambdaLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub ${ResourcePrefix}-shot-metadata-enrichment-start-build-log
+            RetentionInDays: 7
+
+    StartBuildLambda:
+        Type: AWS::Lambda::Function
+        DependsOn: StartBuildLambdaLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Single-execution custom resource; reserved concurrency unnecessary
+        Properties:
+            Description: !Sub (${ResourcePrefix} shot-metadata-enrichment) Start CodeBuild; CodeBuild signals CloudFormation on completion
+            Runtime: python3.13
+            MemorySize: 128
+            Timeout: 60
+            Handler: index.handler
+            Role: !GetAtt StartBuildLambdaRole.Arn
+            LoggingConfig:
+                LogGroup: !Ref StartBuildLambdaLogGroup
+            Code:
+                ZipFile: |
+                    import json
+                    import urllib.request
+                    import boto3
+
+                    def send_cfn_response(event, status, data, reason=''):
+                        body = json.dumps({
+                            'Status': status,
+                            'Reason': reason or 'See CloudWatch Logs',
+                            'PhysicalResourceId': event.get('PhysicalResourceId') or event['LogicalResourceId'],
+                            'StackId': event['StackId'],
+                            'RequestId': event['RequestId'],
+                            'LogicalResourceId': event['LogicalResourceId'],
+                            'Data': data,
+                        }).encode()
+                        req = urllib.request.Request(
+                            event['ResponseURL'], data=body, method='PUT',
+                            headers={'Content-Type': ''})
+                        urllib.request.urlopen(req)
+
+                    def handler(event, context):
+                        print('Event keys:', sorted(event))
+                        try:
+                            if event['RequestType'] == 'Delete':
+                                send_cfn_response(event, 'SUCCESS', {'Status': 'SKIPPED'})
+                                return
+
+                            env_overrides = [
+                                {'name': 'CFN_ResponseURL',        'value': event['ResponseURL'],                                        'type': 'PLAINTEXT'},
+                                {'name': 'CFN_PhysicalResourceId', 'value': event.get('PhysicalResourceId') or context.log_stream_name,  'type': 'PLAINTEXT'},
+                                {'name': 'CFN_StackId',            'value': event['StackId'],                                            'type': 'PLAINTEXT'},
+                                {'name': 'CFN_RequestId',          'value': event['RequestId'],                                          'type': 'PLAINTEXT'},
+                                {'name': 'CFN_LogicalResourceId',  'value': event['LogicalResourceId'],                                  'type': 'PLAINTEXT'},
+                            ]
+
+                            boto3.client('codebuild').start_build(
+                                projectName=event['ResourceProperties']['ProjectName'],
+                                environmentVariablesOverride=env_overrides,
+                            )
+                            # Intentionally do NOT call send_cfn_response here.
+                            # CodeBuild signals CloudFormation from post_build via curl.
+                        except Exception as exc:
+                            print(f'ERROR: {exc}')
+                            send_cfn_response(event, 'FAILED', {}, str(exc))
+
+    StartBuild:
+        Type: Custom::StartBuildDelayResponse
+        Properties:
+            ServiceToken: !GetAtt StartBuildLambda.Arn
+            ProjectName: !Ref CodeBuildProject
+            ImageTag: !FindInMap [ECR, Repository, ImageTag]
+
+
+    ############################################################################
+    # Workflow Lambda — CONTAINER IMAGE (pyvips), operation-routed (lambda_function.py -> states/<name>/)
+    ############################################################################
+    WorkflowLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub
+                - ${ResourcePrefix}-shot-metadata-enrichment-${tool}-log
+                - tool: !FindInMap [Lambda, Workflow, Name]
+            RetentionInDays: 30
+
+    WorkflowRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}ShotMetadataEnrichmentWorkflowPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt WorkflowLogGroup.Arn
+                          # Reads transcripts (any micro-workflow/ output,
+                          # speech-diarization first) and the bedrock runs
+                          # response/summary/usage documents.
+                          - Effect: Allow
+                            Action: s3:GetObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/*
+                          # Writes ONLY its own run prefix and the caller-side
+                          # inference history pointers (README.md §10).
+                          - Effect: Allow
+                            Action:
+                                - s3:PutObject
+                                # records.jsonl streams via multipart (an
+                                # image record is MBs); abort is the cleanup
+                                # path when staging raises mid-stream.
+                                - s3:AbortMultipartUpload
+                            Resource:
+                                - !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/shot-metadata-enrichment/*
+                                - !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/histories/*
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            Condition:
+                                StringLike:
+                                    s3:prefix: micro-workflow/*
+                          # The 8 pattern: sibling gateway Lambdas invoked
+                          # directly — run_inference/get_model on bedrock,
+                          # get_prompt on the registry. Never their state
+                          # machines.
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource:
+                                - !Ref BedrockInferenceGatewayLambdaArn
+                                - !Ref PromptRegistryGatewayLambdaArn
+
+    WorkflowLambda:
+        Type: AWS::Lambda::Function
+        DependsOn: StartBuild
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Map concurrency is bounded in the ASL; reserved concurrency unnecessary
+        Properties:
+            Description: !Sub ${ResourcePrefix}-shot-metadata-enrichment workflow states (operation-routed; container image for pyvips — the Dockerfile CMD is lambda_function.lambda_handler)
+            PackageType: Image
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            Architectures:
+                - arm64
+            Role: !GetAtt WorkflowRole.Arn
+            MemorySize: !FindInMap [Lambda, Workflow, Memory]
+            Timeout: !FindInMap [Lambda, Workflow, Timeout]
+            LoggingConfig:
+                LogGroup: !Ref WorkflowLogGroup
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    TARGET_NAME: shot-metadata-enrichment
+                    TOOL_VERSION: "%%VERSION%%"
+                    BEDROCK_GATEWAY_ARN: !Ref BedrockInferenceGatewayLambdaArn
+                    PROMPT_REGISTRY_ARN: !Ref PromptRegistryGatewayLambdaArn
+                    # §3 windowing + Map batching config: env-tunable per
+                    # deployment, never per request (a per-request knob
+                    # would enter the workflow_id preimage).
+                    WINDOW_SHOT_TARGET: "16"
+                    WINDOW_IMAGE_BUDGET: "100"
+                    WINDOWS_PER_BATCH: "10"
+                    RENDER_THREADS: "3"
+
+    ############################################################################
+    # State machine
+    ############################################################################
+    StateMachineRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: states.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}ShotMetadataEnrichmentStateMachinePolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource: !GetAtt WorkflowLambda.Arn
+
+    ShotMetadataEnrichmentStateMachine:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            StateMachineName: !Sub ${ResourcePrefix}-shot-metadata-enrichment
+            RoleArn: !GetAtt StateMachineRole.Arn
+            DefinitionSubstitutions:
+                WorkflowLambdaArn: !GetAtt WorkflowLambda.Arn
+            # Inline is the single source of truth for what deploys;
+            # definitions.json is the readability copy — edit BOTH, the
+            # build script fails on drift.
+            DefinitionString: |-
+                {
+                  "Comment": "shot-metadata-enrichment: shots.json -> image-bounded window plan -> Map-rendered image records (checkpointed, OOM-bounded batches) -> ONE waitForTaskToken submit to bedrock-inference (no polling) -> coverage + pairing repair + scene assembly. conversation-analysis's five-state template with the render step widened to a Map + a stage state (user decision 2026-08-19: Map + small thread pool; per-window side-object checkpoints make LambdaResourceTimeoutException retries resume, not restart). Readability copy of the template's inline DefinitionString; edit BOTH, the build fails on drift.",
+                  "StartAt": "Validate and plan",
+                  "TimeoutSeconds": 108000,
+                  "States": {
+                    "Validate and plan": {
+                      "Type": "Task",
+                      "Comment": "Everything that can refuse refuses HERE, before any inference dollar: shots.json fetch+validate, the optional face/transcript joins, get_prompt (binds `default`, checks the 7-token values catalog), IMAGE-capable model-chain validation against bedrock's registry, the image-bounded window plan (10-shot target inside the 20-image budget incl. gallery), Map batches, history scope. Persists _plan/plan.json; states pass URIs, never bodies.",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "ValidateAndPlan",
+                          "uuid.$": "$.uuid",
+                          "input.$": "$.input"
+                        }
+                      },
+                      "OutputPath": "$.Payload",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Render windows"
+                    },
+                    "Render windows": {
+                      "Type": "Map",
+                      "Comment": "One iteration per window batch (WINDOWS_PER_BATCH, default 10) — the OOM-bounded unit: each iteration threads RENDER_THREADS (default 3) tarball fetches, renders through the copied prompt_render module, and checkpoints every window as _records/window_NNN.json. LambdaResourceTimeoutException retries RESUME (existing side objects are skipped), they never restart.",
+                      "MaxConcurrency": 4,
+                      "ItemsPath": "$.batches",
+                      "ItemSelector": {
+                        "operation": "RenderWindows",
+                        "uuid.$": "$.uuid",
+                        "plan_s3uri.$": "$.plan_s3uri",
+                        "batch_index.$": "$$.Map.Item.Value.batch_index",
+                        "window_indices.$": "$$.Map.Item.Value.window_indices"
+                      },
+                      "ItemProcessor": {
+                        "ProcessorConfig": {
+                          "Mode": "INLINE"
+                        },
+                        "StartAt": "Render window batch",
+                        "States": {
+                          "Render window batch": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                              "FunctionName": "${WorkflowLambdaArn}",
+                              "Payload.$": "$"
+                            },
+                            "Retry": [
+                              {
+                                "ErrorEquals": [
+                                  "LambdaResourceTimeoutException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 10,
+                                "BackoffRate": 1.0
+                              },
+                              {
+                                "ErrorEquals": [
+                                  "Lambda.ServiceException",
+                                  "Lambda.AWSLambdaException",
+                                  "Lambda.SdkClientException",
+                                  "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 3,
+                                "MaxAttempts": 4,
+                                "BackoffRate": 2.0
+                              }
+                            ],
+                            "End": true
+                          }
+                        }
+                      },
+                      "ResultPath": "$.render_results",
+                      "Next": "Stage records"
+                    },
+                    "Stage records": {
+                      "Type": "Task",
+                      "Comment": "Concatenate the per-window checkpoints, in window order, into records.jsonl — STREAMED via S3 multipart (an image record is MBs; a long asset's set is never held whole). Refuses on a missing window checkpoint and on an image over-budget (defence in depth beside bedrock's own max_images guard).",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "StageRecords",
+                          "uuid.$": "$.uuid",
+                          "plan_s3uri.$": "$.plan_s3uri"
+                        }
+                      },
+                      "OutputPath": "$.Payload",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Submit and wait"
+                    },
+                    "Submit and wait": {
+                      "Type": "Task",
+                      "Comment": "The template's §8 shape verbatim: ONE held state, NO polling. The handler invokes bedrock-inference's gateway Lambda inline (records_s3uri + callback_task_token + idempotency_token = THIS run's uuid) and writes the history pointer from the TRUE submit response. bedrock's waker completes the token with the terminal status as DATA. NO Catch: a timeout FAILS the execution, and a REDRIVE of this state resubmits, absorbs, and is completed synchronously — redrive IS the reconcile. use_batch defaults TRUE here (plan.json carries the explicit bool).",
+                      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "SubmitAndWait",
+                          "uuid.$": "$.uuid",
+                          "plan_s3uri.$": "$.plan_s3uri",
+                          "records_s3uri.$": "$.records_s3uri",
+                          "record_count.$": "$.record_count",
+                          "task_token.$": "$$.Task.Token"
+                        }
+                      },
+                      "ResultPath": "$.wait_result",
+                      "TimeoutSeconds": 93600,
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 5,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Collect and finalize"
+                    },
+                    "Collect and finalize": {
+                      "Type": "Task",
+                      "Comment": "ONE state for both halves: parse the per-window JSONL (fence-tolerant, nothing more), validate coverage per shot_id, apply the §4 pairing repair (`false` wins in BOTH directions, repairs COUNTED — the rate is an interleaved-genre detector), assemble scenes from the repaired flags, write shots + scenes + window-manifest. Unanswered shot_ids land in shots_gap HONESTLY — partial success is success; the rerun is the caller's fresh idempotency_token. A terminally FAILED bedrock run raises and propagates as itself.",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "CollectAndFinalize",
+                          "uuid.$": "$.uuid",
+                          "plan_s3uri.$": "$.plan_s3uri",
+                          "wait_result.$": "$.wait_result"
+                        }
+                      },
+                      "OutputPath": "$.Payload",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Next": "Usage tracking"
+                    },
+                    "Usage tracking": {
+                      "Type": "Task",
+                      "Comment": "Aggregates the run's summary/usage documents into the usage label. Success path only; the handler never raises — as the terminal state, an exception here would fail an execution whose products are already written.",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${WorkflowLambdaArn}",
+                        "Payload": {
+                          "operation": "UsageTracking",
+                          "uuid.$": "$.uuid",
+                          "plan_s3uri.$": "$.plan_s3uri"
+                        }
+                      },
+                      "OutputPath": "$.Payload",
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "Lambda.ServiceException",
+                            "Lambda.AWSLambdaException",
+                            "Lambda.SdkClientException",
+                            "Lambda.TooManyRequestsException"
+                          ],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 4,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "End": true
+                    }
+                  }
+                }
+Outputs:
+    GatewayToolLambdaArn:
+        Description: ARN of the gateway tool Lambda — the value media-toolkit-gateway' ShotMetadataEnrichmentToolLambdaArn parameter will consume.
+        Value: !GetAtt GatewayToolLambda.Arn
+    StateMachineArn:
+        Description: ARN of the shot-metadata-enrichment state machine.
+        Value: !Ref ShotMetadataEnrichmentStateMachine

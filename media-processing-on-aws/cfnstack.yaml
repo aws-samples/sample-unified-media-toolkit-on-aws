@@ -1,0 +1,1619 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Build and deploy media-processing container to ECR. Version %%VERSION%%
+
+Mappings:
+    CodeBuild:
+        Source:
+            Package: "%%PKG_MEDIA_PROCESSING%%"
+            GatewayToolPackage: "%%PKG_GATEWAY_TOOL%%"
+            Bucket: "%%BUCKET_NAME%%"
+            KeyPrefix: "%%KEY_PREFIX%%"
+        Project:
+            Type: ARM_CONTAINER
+            ComputeType: BUILD_GENERAL1_LARGE
+            Image: aws/codebuild/amazonlinux2-aarch64-standard:3.0
+    ECR:
+        Repository:
+            Name: media-processing-on-aws
+            ImageTag: "%%VERSION%%"
+    Lambda:
+        Function:
+            Name: media-processing
+            Description: Media Processing (probe, chunk-transcode, merge)
+        GatewayTool:
+            Name: gateway-tool
+            Description: AgentCore Gateway dispatcher — process_media + get_job_status
+            Memory: 256
+            Timeout: 30
+        HalfCore:
+            Memory: 896
+            Name: half-core
+        OneCore:
+            Memory: 1792
+            Name: 1-core
+        TwoCores:
+            Memory: 3584
+            Name: 2-cores
+        ThreeCores:
+            Memory: 5376
+            Name: 3-cores
+        FourCores:
+            Memory: 7168
+            Name: 4-cores
+        FiveCores:
+            Memory: 8960
+            Name: 5-cores
+        SixCores:
+            Memory: 10240
+            Name: 6-cores
+
+Parameters:
+    ResourcePrefix:
+        Type: String
+        Description: Prefix for resource names
+    IngestBucket:
+        Type: String
+        Description: S3 ingest bucket containing source media files
+    ProxyBucket:
+        Type: String
+        Description: S3 proxy bucket that Lambda functions read and write output files to
+
+Resources:
+
+    # =========================================================================
+    # Proxy bucket validator — verifies the ProxyBucket exists and is owned by
+    # this account (creates it if absent).  Runs on Create/Update; no-op on
+    # Delete.  Workflow Lambdas DependsOn the custom resource so nothing
+    # touches the bucket before it is validated.
+    # Handler code lives in gateway_tool/bucket_validator.py, shipped in the
+    # same zip as the gateway tool Lambda.
+    # =========================================================================
+    ProxyBucketValidatorRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: ProxyBucketValidation
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # Scoped to the declared group, and deliberately NOT
+                          # AWSLambdaBasicExecutionRole: that managed policy
+                          # grants logs:CreateLogGroup on every group, which
+                          # lets a function that cannot reach its declared
+                          # group silently create an unmanaged one instead of
+                          # failing visibly.
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt ProxyBucketValidatorLogGroup.Arn
+                          - Effect: Allow
+                            Action:
+                                - s3:ListBucket
+                                - s3:CreateBucket
+                                - s3:PutBucketPublicAccessBlock
+                            Resource: !Sub "arn:aws:s3:::${ProxyBucket}"
+
+    # Declared so retention is bounded and the group dies with the stack.
+    # Otherwise Lambda auto-creates /aws/lambda/<fn> on first invocation with
+    # never-expire retention and no stack ownership: the logs are billed
+    # forever and the orphan outlives the stack, which then blocks the next
+    # create-stack at this name with "already exists".
+    #
+    # Safe to declare the canonical /aws/lambda/{FunctionName} here ONLY
+    # because the function was renamed to -bucket-check in the same change, so
+    # this name has never existed. Declaring a name that a previous deploy
+    # already auto-created fails the update at pre-flight validation, with no
+    # per-resource event naming the culprit. Do not "restore" the old
+    # -proxy-bucket-validator name without also suffixing this group.
+    ProxyBucketValidatorLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub "/aws/lambda/${ResourcePrefix}-media-processing-bucket-check"
+            RetentionInDays: 7
+
+    ProxyBucketValidatorFunction:
+        Type: AWS::Lambda::Function
+        DependsOn: ProxyBucketValidatorLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Custom resource Lambda runs once at deploy time; VPC placement adds no security value for a one-shot S3 control-plane call.
+                    - id: W92
+                      reason: Custom resource Lambda is invoked exclusively by CloudFormation during stack operations; reserved concurrency is unnecessary.
+        Properties:
+            FunctionName: !Sub "${ResourcePrefix}-media-processing-bucket-check"
+            Description: "Custom resource: verifies the proxy bucket exists and is owned by this account; creates it if absent"
+            Runtime: python3.13
+            Architectures: [arm64]
+            Handler: bucket_validator.handler
+            Role: !GetAtt ProxyBucketValidatorRole.Arn
+            Timeout: 60
+            MemorySize: 128
+            Code:
+                S3Bucket: !FindInMap [CodeBuild, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                      pkg: !FindInMap [CodeBuild, Source, GatewayToolPackage]
+
+    ProxyBucketValidator:
+        Type: Custom::ProxyBucketValidator
+        Properties:
+            ServiceToken: !GetAtt ProxyBucketValidatorFunction.Arn
+            BucketName: !Ref ProxyBucket
+            AccountId: !Ref AWS::AccountId
+            Region: !Ref AWS::Region
+
+
+    ################################################################################
+    # CodeBuild IAM Role
+    ################################################################################
+    CodeBuildRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W11
+                        reason: GetAuthorizationToken requires a wildcard resource (no ARN exists for it)
+        Properties:
+            Path: /
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service: codebuild.amazonaws.com
+                        Action: sts:AssumeRole
+            Policies:
+                -
+                    PolicyName: !Sub ${ResourcePrefix}CodeBuildRolePolicy
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                            -
+                                Effect: Allow
+                                Action:
+                                    - logs:CreateLogGroup
+                                    - logs:CreateLogStream
+                                    - logs:PutLogEvents
+                                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild:*
+                            -
+                                Effect: Allow
+                                Action: s3:ListBucket
+                                Resource: !Sub
+                                    - arn:aws:s3:::${bucket}
+                                    - bucket: !FindInMap [CodeBuild, Source, Bucket]
+                            # Scoped to the staging BUCKET, not the versioned key: a
+                            # key-pinned grant is rewritten on every version bump and the
+                            # build that reads the new key starts seconds later, racing IAM
+                            # propagation (a lost race denies an object that exists and is
+                            # readable). Bucket-wide is already the ListBucket scope above.
+                            -
+                                Effect: Allow
+                                Action: s3:GetObject
+                                Resource: !Sub
+                                    - arn:aws:s3:::${bucket}/*
+                                    - bucket: !FindInMap [CodeBuild, Source, Bucket]
+                            -
+                                Effect: Allow
+                                # GetAuthorizationToken is the ONLY ECR action
+                                # that requires "*" (no resource ARN exists);
+                                # repo-scoped actions live in the next statement
+                                # (CSR scan 2026-10-08)
+                                Action:
+                                    - ecr:GetAuthorizationToken
+                                Resource: "*"
+                            -
+                                Effect: Allow
+                                Action:
+                                    - ecr:CreateRepository
+                                    - ecr:DescribeImages
+                                    - ecr:BatchCheckLayerAvailability
+                                    - ecr:CompleteLayerUpload
+                                    - ecr:InitiateLayerUpload
+                                    - ecr:PutImage
+                                    - ecr:UploadLayerPart
+                                Resource: !Sub
+                                    - arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${repoName}
+                                    - repoName: !FindInMap [ECR, Repository, Name]
+
+    ################################################################################
+    # CodeBuild Project
+    #
+    # ARM_CONTAINER for native linux/arm64 build — no QEMU cross-compilation.
+    # Skip logic: pre_build checks if IMAGE_REPO_NAME:IMAGE_TAG already exists;
+    # writes /tmp/skip_build if so. post_build always signals CloudFormation.
+    ################################################################################
+    CodeBuildProject:
+        Type: AWS::CodeBuild::Project
+        Properties:
+            Name: !Sub
+                - ${ResourcePrefix}-${repositoryName}
+                - repositoryName: !FindInMap [ECR, Repository, Name]
+            Description: !Sub
+                - Build and publish ${desc} docker image to Amazon ECR
+                - desc: !FindInMap [Lambda, Function, Description]
+            ServiceRole: !GetAtt CodeBuildRole.Arn
+            Source:
+                Type: S3
+                Location: !Sub
+                    - ${bucket}/${keyPrefix}/${package}
+                    - bucket: !FindInMap [CodeBuild, Source, Bucket]
+                      keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                      package: !FindInMap [CodeBuild, Source, Package]
+                BuildSpec: |
+                    version: 0.2
+                    phases:
+                        pre_build:
+                            commands:
+                                - echo "== Logging in to Amazon ECR =="
+                                - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+                                - |
+                                    echo "== Creating ECR repository if it does not exist =="
+                                    aws ecr create-repository --region $AWS_REGION --repository-name $IMAGE_REPO_NAME --image-scanning-configuration scanOnPush=true --encryption-configuration encryptionType=AES256; EXITCODE=$?
+                                    if [ $EXITCODE -ne 0 ] && [ $EXITCODE -ne 254 ]; then
+                                        echo "ECR create-repository failed with exit code $EXITCODE"
+                                        exit $EXITCODE
+                                    fi
+                                - |
+                                    echo "== Checking if $IMAGE_REPO_NAME:$IMAGE_TAG already exists =="
+                                    if aws ecr describe-images --region $AWS_REGION --repository-name $IMAGE_REPO_NAME --image-ids imageTag=$IMAGE_TAG 2>/dev/null; then
+                                        echo "Image $IMAGE_REPO_NAME:$IMAGE_TAG already exists — skipping build"
+                                        touch /tmp/skip_build
+                                    else
+                                        echo "Image not found — proceeding with build"
+                                    fi
+                        build:
+                            commands:
+                                - |
+                                    if [ -f /tmp/skip_build ]; then
+                                        echo "== Skipping docker build — image already exists =="
+                                    else
+                                        echo "== Building $IMAGE_REPO_NAME:$IMAGE_TAG [$(date)] =="
+                                        docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+                                        docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                                        echo "== Pushing $IMAGE_REPO_NAME:$IMAGE_TAG [$(date)] =="
+                                        docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                                        echo "== Push complete [$(date)] =="
+                                    fi
+                        post_build:
+                            commands:
+                                - |
+                                    echo "=== post_build CODEBUILD_BUILD_SUCCEEDING=$CODEBUILD_BUILD_SUCCEEDING ==="
+                                    if [ -n "$CFN_ResponseURL" ]; then
+                                        if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then
+                                            echo "== Sending SUCCESS to CloudFormation =="
+                                            curl -s -X PUT -H "Content-Type:" \
+                                                --data-binary "{\"Status\":\"SUCCESS\",\"Reason\":\"Docker image ready\",\"PhysicalResourceId\":\"$CFN_PhysicalResourceId\",\"StackId\":\"$CFN_StackId\",\"RequestId\":\"$CFN_RequestId\",\"LogicalResourceId\":\"$CFN_LogicalResourceId\",\"Data\":{\"ImageUri\":\"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG\"}}" \
+                                                "$CFN_ResponseURL"
+                                        else
+                                            echo "== Sending FAILED to CloudFormation =="
+                                            curl -s -X PUT -H "Content-Type:" \
+                                                --data-binary "{\"Status\":\"FAILED\",\"Reason\":\"Docker build failed — see CodeBuild logs\",\"PhysicalResourceId\":\"$CFN_PhysicalResourceId\",\"StackId\":\"$CFN_StackId\",\"RequestId\":\"$CFN_RequestId\",\"LogicalResourceId\":\"$CFN_LogicalResourceId\",\"Data\":{}}" \
+                                                "$CFN_ResponseURL"
+                                        fi
+                                    fi
+            Environment:
+                Type: !FindInMap [CodeBuild, Project, Type]
+                ComputeType: !FindInMap [CodeBuild, Project, ComputeType]
+                Image: !FindInMap [CodeBuild, Project, Image]
+                PrivilegedMode: true
+                EnvironmentVariables:
+                    -
+                        Name: AWS_REGION
+                        Value: !Ref AWS::Region
+                    -
+                        Name: AWS_ACCOUNT_ID
+                        Value: !Ref AWS::AccountId
+                    -
+                        Name: IMAGE_REPO_NAME
+                        Value: !FindInMap [ECR, Repository, Name]
+                    -
+                        Name: IMAGE_TAG
+                        Value: !FindInMap [ECR, Repository, ImageTag]
+            Artifacts:
+                Type: NO_ARTIFACTS
+            EncryptionKey: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3
+            TimeoutInMinutes: 90
+            QueuedTimeoutInMinutes: 60
+            LogsConfig:
+                CloudWatchLogs:
+                    GroupName: /aws/codebuild
+                    StreamName: !Sub
+                        - ${ResourcePrefix}-${repositoryName}
+                        - repositoryName: !FindInMap [ECR, Repository, Name]
+                    Status: ENABLED
+
+    ################################################################################
+    # StartBuild Lambda IAM Role
+    ################################################################################
+    StartBuildLambdaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: /
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service: lambda.amazonaws.com
+                        Action: sts:AssumeRole
+            Policies:
+                -
+                    PolicyName: !Sub ${ResourcePrefix}StartBuildPolicy
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                            # Scoped to the declared group, and NO
+                            # logs:CreateLogGroup: the group is a stack
+                            # resource, so this function must never create one.
+                            # Withholding the permission is what makes "it
+                            # silently logged somewhere else" impossible.
+                            -
+                                Effect: Allow
+                                Action:
+                                    - logs:CreateLogStream
+                                    - logs:PutLogEvents
+                                Resource: !GetAtt StartBuildLambdaLogGroup.Arn
+                            -
+                                Effect: Allow
+                                Action: codebuild:StartBuild
+                                Resource: !GetAtt CodeBuildProject.Arn
+
+    ################################################################################
+    # StartBuild Lambda — inlined, no S3 package required
+    ################################################################################
+    # StartBuildLambda is UNNAMED — CFN generates its physical name, so
+    # /aws/lambda/{FunctionName} is unknowable at author time. LoggingConfig
+    # below decouples the group from the function name, which is the only way
+    # an unnamed function can write to a declared, stack-owned group. Without
+    # one, Lambda auto-creates a group with retentionInDays=None (billed
+    # forever) that survives stack deletion.
+    StartBuildLambdaLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub /aws/lambda/${ResourcePrefix}-media-processing-start-build
+            RetentionInDays: 7
+
+    StartBuildLambda:
+        Type: AWS::Lambda::Function
+        DependsOn: StartBuildLambdaLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W89
+                        reason: Not using VPC
+                    -
+                        id: W92
+                        reason: Single-execution custom resource; reserved concurrency unnecessary
+        Properties:
+            Description: !Sub
+                - (${ResourcePrefix} ${repositoryName}) Start CodeBuild; CodeBuild signals CloudFormation on completion
+                - repositoryName: !FindInMap [ECR, Repository, Name]
+            Runtime: python3.13
+            MemorySize: 128
+            Timeout: 60
+            Handler: index.handler
+            Role: !GetAtt StartBuildLambdaRole.Arn
+            LoggingConfig:
+                LogGroup: !Ref StartBuildLambdaLogGroup
+            Code:
+                ZipFile: |
+                    import json
+                    import urllib.request
+                    import boto3
+
+                    def send_cfn_response(event, status, data, reason=''):
+                        body = json.dumps({
+                            'Status': status,
+                            'Reason': reason or 'See CloudWatch Logs',
+                            'PhysicalResourceId': event.get('PhysicalResourceId') or event['LogicalResourceId'],
+                            'StackId': event['StackId'],
+                            'RequestId': event['RequestId'],
+                            'LogicalResourceId': event['LogicalResourceId'],
+                            'Data': data,
+                        }).encode()
+                        req = urllib.request.Request(
+                            event['ResponseURL'], data=body, method='PUT',
+                            headers={'Content-Type': ''})
+                        urllib.request.urlopen(req)
+
+                    def handler(event, context):
+                        print('Event keys:', sorted(event))
+                        try:
+                            if event['RequestType'] == 'Delete':
+                                send_cfn_response(event, 'SUCCESS', {'Status': 'SKIPPED'})
+                                return
+
+                            env_overrides = [
+                                {'name': 'CFN_ResponseURL',        'value': event['ResponseURL'],                                        'type': 'PLAINTEXT'},
+                                {'name': 'CFN_PhysicalResourceId', 'value': event.get('PhysicalResourceId') or context.log_stream_name,  'type': 'PLAINTEXT'},
+                                {'name': 'CFN_StackId',            'value': event['StackId'],                                            'type': 'PLAINTEXT'},
+                                {'name': 'CFN_RequestId',          'value': event['RequestId'],                                          'type': 'PLAINTEXT'},
+                                {'name': 'CFN_LogicalResourceId',  'value': event['LogicalResourceId'],                                  'type': 'PLAINTEXT'},
+                            ]
+
+                            boto3.client('codebuild').start_build(
+                                projectName=event['ResourceProperties']['ProjectName'],
+                                environmentVariablesOverride=env_overrides,
+                            )
+                        except Exception as exc:
+                            print(f'ERROR: {exc}')
+                            send_cfn_response(event, 'FAILED', {}, str(exc))
+
+    ################################################################################
+    # Custom Resource
+    ################################################################################
+    StartBuild:
+        Type: Custom::StartBuildDelayResponse
+        Properties:
+            ServiceToken: !GetAtt StartBuildLambda.Arn
+            ProjectName: !Ref CodeBuildProject
+            ImageTag: !FindInMap [ECR, Repository, ImageTag]
+
+    ################################################################################
+    # Lambda CloudWatch Log Groups
+    ################################################################################
+    MediaProcessingHalfCoreLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${name}-${core}
+                - name: !FindInMap [Lambda, Function, Name]
+                  core: !FindInMap [Lambda, HalfCore, Name]
+            RetentionInDays: 7
+
+    MediaProcessing1CoreLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${name}-${core}
+                - name: !FindInMap [Lambda, Function, Name]
+                  core: !FindInMap [Lambda, OneCore, Name]
+            RetentionInDays: 7
+
+    MediaProcessing2CoresLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${name}-${core}
+                - name: !FindInMap [Lambda, Function, Name]
+                  core: !FindInMap [Lambda, TwoCores, Name]
+            RetentionInDays: 7
+
+    MediaProcessing3CoresLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${name}-${core}
+                - name: !FindInMap [Lambda, Function, Name]
+                  core: !FindInMap [Lambda, ThreeCores, Name]
+            RetentionInDays: 7
+
+    MediaProcessing4CoresLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${name}-${core}
+                - name: !FindInMap [Lambda, Function, Name]
+                  core: !FindInMap [Lambda, FourCores, Name]
+            RetentionInDays: 7
+
+    MediaProcessing5CoresLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${name}-${core}
+                - name: !FindInMap [Lambda, Function, Name]
+                  core: !FindInMap [Lambda, FiveCores, Name]
+            RetentionInDays: 7
+
+    MediaProcessing6CoresLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${name}-${core}
+                - name: !FindInMap [Lambda, Function, Name]
+                  core: !FindInMap [Lambda, SixCores, Name]
+            RetentionInDays: 7
+
+    ################################################################################
+    # Lambda Execution Role (shared across all 7 functions)
+    ################################################################################
+    MediaProcessingRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W76
+                        reason: Fine-grained permissions for media processing workflow
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service: lambda.amazonaws.com
+                        Action: sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+            Policies:
+                -
+                    PolicyName: MediaProcessingPolicy
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                            # CloudWatch Logs
+                            -
+                                Effect: Allow
+                                Action:
+                                    - logs:CreateLogGroup
+                                    - logs:CreateLogStream
+                                    - logs:PutLogEvents
+                                Resource:
+                                    - !GetAtt MediaProcessingHalfCoreLogGroup.Arn
+                                    - !GetAtt MediaProcessing1CoreLogGroup.Arn
+                                    - !GetAtt MediaProcessing2CoresLogGroup.Arn
+                                    - !GetAtt MediaProcessing3CoresLogGroup.Arn
+                                    - !GetAtt MediaProcessing4CoresLogGroup.Arn
+                                    - !GetAtt MediaProcessing5CoresLogGroup.Arn
+                                    - !GetAtt MediaProcessing6CoresLogGroup.Arn
+                            # S3 — read source files from ingest bucket
+                            -
+                                Effect: Allow
+                                Action: s3:ListBucket
+                                Resource: !Sub arn:aws:s3:::${IngestBucket}
+                            -
+                                Effect: Allow
+                                Action:
+                                    - s3:GetObject
+                                    - s3:PutObject
+                                    - s3:HeadObject
+                                Resource: !Sub arn:aws:s3:::${IngestBucket}/*
+                            # S3 — read and write to proxy bucket
+                            -
+                                Effect: Allow
+                                Action: s3:ListBucket
+                                Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            -
+                                Effect: Allow
+                                Action:
+                                    - s3:GetObject
+                                    - s3:HeadObject
+                                    - s3:PutObject
+                                    - s3:CopyObject
+                                    - s3:DeleteObject
+                                    - s3:CreateMultipartUpload
+                                    - s3:UploadPart
+                                    - s3:CompleteMultipartUpload
+                                    - s3:AbortMultipartUpload
+                                    - s3:ListMultipartUploadParts
+                                Resource: !Sub arn:aws:s3:::${ProxyBucket}/*
+                            # Step Functions — usage tracking reads execution history
+                            -
+                                Effect: Allow
+                                Action: states:GetExecutionHistory
+                                Resource: !Sub
+                                    - arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${ResourcePrefix}-${name}:*
+                                    - name: !FindInMap [Lambda, Function, Name]
+                            # Lambda — usage tracking reads function configuration for memory/arch
+                            -
+                                Effect: Allow
+                                Action: lambda:GetFunctionConfiguration
+                                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ResourcePrefix}-*
+
+    ################################################################################
+    # Lambda Functions
+    # All DependsOn StartBuild to ensure the ECR image exists before creation.
+    # PackageType: Image + arm64 architecture matches the CodeBuild ARM_CONTAINER build.
+    ################################################################################
+
+    MediaProcessingLambdaHalfCore:
+        Type: AWS::Lambda::Function
+        DependsOn:
+            - ProxyBucketValidator
+            - StartBuild
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W89
+                        reason: Workflow not using VPC
+                    -
+                        id: W92
+                        reason: Workflow not limiting simultaneous executions
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${name}-${core}
+                - name: !FindInMap [Lambda, Function, Name]
+                  core: !FindInMap [Lambda, HalfCore, Name]
+            Description: !Sub
+                - (${ResourcePrefix}) ${desc} — half-core (896 MB)
+                - desc: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Role: !GetAtt MediaProcessingRole.Arn
+            MemorySize: !FindInMap [Lambda, HalfCore, Memory]
+            Timeout: 900
+            Architectures:
+                - arm64
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repositoryName}:${imageTag}
+                    - repositoryName: !FindInMap [ECR, Repository, Name]
+                      imageTag: !FindInMap [ECR, Repository, ImageTag]
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    CHUNK_TRANSCODE_FUNCTION_ARN: !GetAtt MediaProcessingLambda3Cores.Arn
+                    CHUNK_TRANSCODE_FUNCTION_ARN_LARGE: !GetAtt MediaProcessingLambda5Cores.Arn
+            TracingConfig:
+                Mode: Active
+
+    MediaProcessingLambda1Core:
+        Type: AWS::Lambda::Function
+        DependsOn:
+            - ProxyBucketValidator
+            - StartBuild
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W89
+                        reason: Workflow not using VPC
+                    -
+                        id: W92
+                        reason: Workflow not limiting simultaneous executions
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${name}-${core}
+                - name: !FindInMap [Lambda, Function, Name]
+                  core: !FindInMap [Lambda, OneCore, Name]
+            Description: !Sub
+                - (${ResourcePrefix}) ${desc} — 1-core (1792 MB)
+                - desc: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Role: !GetAtt MediaProcessingRole.Arn
+            MemorySize: !FindInMap [Lambda, OneCore, Memory]
+            Timeout: 900
+            Architectures:
+                - arm64
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repositoryName}:${imageTag}
+                    - repositoryName: !FindInMap [ECR, Repository, Name]
+                      imageTag: !FindInMap [ECR, Repository, ImageTag]
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    CHUNK_TRANSCODE_FUNCTION_ARN: !GetAtt MediaProcessingLambda3Cores.Arn
+                    CHUNK_TRANSCODE_FUNCTION_ARN_LARGE: !GetAtt MediaProcessingLambda5Cores.Arn
+            TracingConfig:
+                Mode: Active
+
+    MediaProcessingLambda2Cores:
+        Type: AWS::Lambda::Function
+        DependsOn:
+            - ProxyBucketValidator
+            - StartBuild
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W89
+                        reason: Workflow not using VPC
+                    -
+                        id: W92
+                        reason: Workflow not limiting simultaneous executions
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${name}-${core}
+                - name: !FindInMap [Lambda, Function, Name]
+                  core: !FindInMap [Lambda, TwoCores, Name]
+            Description: !Sub
+                - (${ResourcePrefix}) ${desc} — 2-cores (3584 MB)
+                - desc: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Role: !GetAtt MediaProcessingRole.Arn
+            MemorySize: !FindInMap [Lambda, TwoCores, Memory]
+            Timeout: 900
+            Architectures:
+                - arm64
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repositoryName}:${imageTag}
+                    - repositoryName: !FindInMap [ECR, Repository, Name]
+                      imageTag: !FindInMap [ECR, Repository, ImageTag]
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    CHUNK_TRANSCODE_FUNCTION_ARN: !GetAtt MediaProcessingLambda3Cores.Arn
+                    CHUNK_TRANSCODE_FUNCTION_ARN_LARGE: !GetAtt MediaProcessingLambda5Cores.Arn
+            TracingConfig:
+                Mode: Active
+
+    MediaProcessingLambda3Cores:
+        Type: AWS::Lambda::Function
+        DependsOn:
+            - ProxyBucketValidator
+            - StartBuild
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W89
+                        reason: Workflow not using VPC
+                    -
+                        id: W92
+                        reason: Workflow not limiting simultaneous executions
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${name}-${core}
+                - name: !FindInMap [Lambda, Function, Name]
+                  core: !FindInMap [Lambda, ThreeCores, Name]
+            Description: !Sub
+                - (${ResourcePrefix}) ${desc} — 3-cores (5376 MB)
+                - desc: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Role: !GetAtt MediaProcessingRole.Arn
+            MemorySize: !FindInMap [Lambda, ThreeCores, Memory]
+            Timeout: 900
+            Architectures:
+                - arm64
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repositoryName}:${imageTag}
+                    - repositoryName: !FindInMap [ECR, Repository, Name]
+                      imageTag: !FindInMap [ECR, Repository, ImageTag]
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    CHUNK_TRANSCODE_FUNCTION_ARN_LARGE: !GetAtt MediaProcessingLambda5Cores.Arn
+            EphemeralStorage:
+                Size: 4096
+            TracingConfig:
+                Mode: Active
+
+    MediaProcessingLambda4Cores:
+        Type: AWS::Lambda::Function
+        DependsOn:
+            - ProxyBucketValidator
+            - StartBuild
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W89
+                        reason: Workflow not using VPC
+                    -
+                        id: W92
+                        reason: Workflow not limiting simultaneous executions
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${name}-${core}
+                - name: !FindInMap [Lambda, Function, Name]
+                  core: !FindInMap [Lambda, FourCores, Name]
+            Description: !Sub
+                - (${ResourcePrefix}) ${desc} — 4-cores (7168 MB)
+                - desc: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Role: !GetAtt MediaProcessingRole.Arn
+            MemorySize: !FindInMap [Lambda, FourCores, Memory]
+            Timeout: 900
+            Architectures:
+                - arm64
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repositoryName}:${imageTag}
+                    - repositoryName: !FindInMap [ECR, Repository, Name]
+                      imageTag: !FindInMap [ECR, Repository, ImageTag]
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+            EphemeralStorage:
+                Size: 4096
+            TracingConfig:
+                Mode: Active
+
+    MediaProcessingLambda5Cores:
+        Type: AWS::Lambda::Function
+        DependsOn:
+            - ProxyBucketValidator
+            - StartBuild
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W89
+                        reason: Workflow not using VPC
+                    -
+                        id: W92
+                        reason: Workflow not limiting simultaneous executions
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${name}-${core}
+                - name: !FindInMap [Lambda, Function, Name]
+                  core: !FindInMap [Lambda, FiveCores, Name]
+            Description: !Sub
+                - (${ResourcePrefix}) ${desc} — 5-cores (8960 MB)
+                - desc: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Role: !GetAtt MediaProcessingRole.Arn
+            MemorySize: !FindInMap [Lambda, FiveCores, Memory]
+            Timeout: 900
+            Architectures:
+                - arm64
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repositoryName}:${imageTag}
+                    - repositoryName: !FindInMap [ECR, Repository, Name]
+                      imageTag: !FindInMap [ECR, Repository, ImageTag]
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+            EphemeralStorage:
+                Size: 4096
+            TracingConfig:
+                Mode: Active
+
+    MediaProcessingLambda6Cores:
+        Type: AWS::Lambda::Function
+        DependsOn:
+            - ProxyBucketValidator
+            - StartBuild
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W89
+                        reason: Workflow not using VPC
+                    -
+                        id: W92
+                        reason: Workflow not limiting simultaneous executions
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${name}-${core}
+                - name: !FindInMap [Lambda, Function, Name]
+                  core: !FindInMap [Lambda, SixCores, Name]
+            Description: !Sub
+                - (${ResourcePrefix}) ${desc} — 6-cores (10240 MB)
+                - desc: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Role: !GetAtt MediaProcessingRole.Arn
+            MemorySize: !FindInMap [Lambda, SixCores, Memory]
+            Timeout: 900
+            Architectures:
+                - arm64
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repositoryName}:${imageTag}
+                    - repositoryName: !FindInMap [ECR, Repository, Name]
+                      imageTag: !FindInMap [ECR, Repository, ImageTag]
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+            EphemeralStorage:
+                Size: 4096
+            TracingConfig:
+                Mode: Active
+
+    ################################################################################
+    # Step Functions CloudWatch Log Group
+    ################################################################################
+    MediaProcessingStateMachineLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/states/${ResourcePrefix}-${name}
+                - name: !FindInMap [Lambda, Function, Name]
+            RetentionInDays: 7
+
+    ################################################################################
+    # Step Functions Execution Role
+    ################################################################################
+    MediaProcessingStateMachineRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W11
+                        reason: X-ray tracing and CloudWatch Logs delivery require wildcard resources
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -
+                        Effect: Allow
+                        Action: sts:AssumeRole
+                        Principal:
+                            Service: !Sub states.${AWS::Region}.amazonaws.com
+            Policies:
+                -
+                    PolicyName: !Sub ${ResourcePrefix}SFNPolicy
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                            -
+                                Effect: Allow
+                                Action: lambda:InvokeFunction
+                                Resource:
+                                    - !GetAtt MediaProcessingLambdaHalfCore.Arn
+                                    - !GetAtt MediaProcessingLambda1Core.Arn
+                                    - !GetAtt MediaProcessingLambda2Cores.Arn
+                                    - !GetAtt MediaProcessingLambda3Cores.Arn
+                                    - !GetAtt MediaProcessingLambda4Cores.Arn
+                                    - !GetAtt MediaProcessingLambda5Cores.Arn
+                                    - !GetAtt MediaProcessingLambda6Cores.Arn
+                            -
+                                Effect: Allow
+                                Action:
+                                    - logs:CreateLogDelivery
+                                    - logs:GetLogDelivery
+                                    - logs:UpdateLogDelivery
+                                    - logs:DeleteLogDelivery
+                                    - logs:ListLogDeliveries
+                                    - logs:PutLogEvents
+                                    - logs:PutResourcePolicy
+                                    - logs:DescribeResourcePolicies
+                                    - logs:DescribeLogGroups
+                                Resource: "*"
+                            -
+                                Effect: Allow
+                                Action:
+                                    - xray:PutTraceSegments
+                                    - xray:PutTelemetryRecords
+                                    - xray:GetSamplingRules
+                                    - xray:GetSamplingTargets
+                                Resource: "*"
+
+    ################################################################################
+    # Step Functions State Machine
+    #
+    # ${MediaProcessingLambdaXxx.Arn} references resolved by CloudFormation !Sub.
+    # Keeping the definition inline is deliberate: !Sub validates every
+    # ${Resource.Arn} against the template, so a typo or a deleted Lambda is a
+    # template error. DefinitionS3Location + DefinitionSubstitutions has no
+    # equivalent check — an unmatched token is passed through literally and only
+    # surfaces when the state machine runs.
+    # $$.Execution.Id / $$.Map.Item.Value are Step Functions context-object paths;
+    # !Sub passes them through untouched (it only expands ${...}).
+    #
+    # Only three tiers are named literally here; chunk transcode and merge
+    # resolve theirs from the payload at runtime ($.item_data.function_arn and
+    # $.data.function_arn), so their memory tier depends on the input.
+    # 3-cores  : probe.
+    # 6-cores  : chunk transcode timeout/Lambda.Unknown retry.
+    # half-core: usage tracking.
+    ################################################################################
+    MediaProcessingStateMachine:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            StateMachineName: !Sub
+                - ${ResourcePrefix}-${name}
+                - name: !FindInMap [Lambda, Function, Name]
+            RoleArn: !GetAtt MediaProcessingStateMachineRole.Arn
+            LoggingConfiguration:
+                Destinations:
+                    -
+                        CloudWatchLogsLogGroup:
+                            LogGroupArn: !GetAtt MediaProcessingStateMachineLogGroup.Arn
+                IncludeExecutionData: true
+                Level: ALL
+            TracingConfiguration:
+                Enabled: true
+            DefinitionString:
+                !Sub |-
+                    {
+                        "Comment": "Media processing state machine split into chunks, transcode, and stitch them back together",
+                        "StartAt": "Probe media file",
+                        "States": {
+                            "Probe media file": {
+                                "Type": "Task",
+                                "Resource": "arn:aws:states:::lambda:invoke",
+                                "OutputPath": "$.Payload",
+                                "Parameters": {
+                                    "FunctionName": "${MediaProcessingLambda3Cores.Arn}",
+                                    "Payload": {
+                                        "operation": "StateProbeMediaFile",
+                                        "uuid.$": "$.uuid",
+                                        "input.$": "$.input",
+                                        "output.$": "$.output",
+                                        "data.$": "$.data"
+                                    }
+                                },
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [
+                                            "Lambda.ServiceException",
+                                            "Lambda.AWSLambdaException",
+                                            "Lambda.SdkClientException",
+                                            "Lambda.TooManyRequestsException"
+                                        ],
+                                        "IntervalSeconds": 1,
+                                        "MaxAttempts": 2,
+                                        "BackoffRate": 1.2
+                                    }
+                                ],
+                                "Next": "Metadata only?"
+                            },
+                            "Metadata only?": {
+                                "Comment": "Metadata-only requests are fully served by the probe state — skip the Map and merge, but still run usage tracking (the End state the gateway reads the final output from)",
+                                "Type": "Choice",
+                                "Choices": [
+                                    {
+                                        "Variable": "$.data.metadata_only",
+                                        "BooleanEquals": true,
+                                        "Next": "Usage tracking"
+                                    }
+                                ],
+                                "Default": "Map transcode segment chunk iterators"
+                            },
+                            "Map transcode segment chunk iterators": {
+                                "Type": "Map",
+                                "MaxConcurrency": 40,
+                                "ItemsPath": "$.data.iterators",
+                                "ItemSelector": {
+                                    "operation": "StateChunkTranscode",
+                                    "item_data.$": "$$.Map.Item.Value"
+                                },
+                                "ItemProcessor": {
+                                    "ProcessorConfig": {
+                                        "Mode": "INLINE"
+                                    },
+                                    "StartAt": "Transcode segment chunk (X mins)",
+                                    "States": {
+                                        "Transcode segment chunk (X mins)": {
+                                            "Type": "Task",
+                                            "Resource": "arn:aws:states:::lambda:invoke",
+                                            "OutputPath": "$.Payload",
+                                            "Parameters": {
+                                                "FunctionName.$": "$.item_data.function_arn",
+                                                "Payload.$": "$"
+                                            },
+                                            "Catch": [
+                                                {
+                                                    "ErrorEquals": [
+                                                        "Sandbox.Timedout",
+                                                        "Lambda.Unknown"
+                                                    ],
+                                                    "Next": "Transcode segment chunk (Retry larger memory)",
+                                                    "ResultPath": "$.error"
+                                                }
+                                            ],
+                                            "Retry": [
+                                                {
+                                                    "ErrorEquals": [
+                                                        "Sandbox.Timedout",
+                                                        "Lambda.Unknown"
+                                                    ],
+                                                    "MaxAttempts": 0
+                                                },
+                                                {
+                                                    "ErrorEquals": [
+                                                        "ValidationException"
+                                                    ],
+                                                    "IntervalSeconds": 1,
+                                                    "MaxAttempts": 2,
+                                                    "BackoffRate": 1.0
+                                                },
+                                                {
+                                                    "ErrorEquals": [
+                                                        "Lambda.ServiceException",
+                                                        "Lambda.AWSLambdaException",
+                                                        "Lambda.SdkClientException",
+                                                        "Lambda.TooManyRequestsException"
+                                                    ],
+                                                    "IntervalSeconds": 1,
+                                                    "MaxAttempts": 2,
+                                                    "BackoffRate": 1.2
+                                                }
+                                            ],
+                                            "End": true
+                                        },
+                                        "Transcode segment chunk (Retry larger memory)": {
+                                            "Type": "Task",
+                                            "Resource": "arn:aws:states:::lambda:invoke",
+                                            "OutputPath": "$.Payload",
+                                            "Parameters": {
+                                                "FunctionName": "${MediaProcessingLambda6Cores.Arn}",
+                                                "Payload.$": "$"
+                                            },
+                                            "Retry": [
+                                                {
+                                                    "ErrorEquals": [
+                                                        "ValidationException"
+                                                    ],
+                                                    "IntervalSeconds": 1,
+                                                    "MaxAttempts": 2,
+                                                    "BackoffRate": 1.0
+                                                },
+                                                {
+                                                    "ErrorEquals": [
+                                                        "Lambda.ServiceException",
+                                                        "Lambda.AWSLambdaException",
+                                                        "Lambda.SdkClientException",
+                                                        "Lambda.TooManyRequestsException"
+                                                    ],
+                                                    "IntervalSeconds": 1,
+                                                    "MaxAttempts": 2,
+                                                    "BackoffRate": 1.0
+                                                }
+                                            ],
+                                            "End": true
+                                        }
+                                    }
+                                },
+                                "ResultPath": "$.data.iterators",
+                                "Next": "Merge segment chunks"
+                            },
+                            "Merge segment chunks": {
+                                "Type": "Task",
+                                "Resource": "arn:aws:states:::lambda:invoke",
+                                "OutputPath": "$.Payload",
+                                "Parameters": {
+                                    "FunctionName.$": "$.data.function_arn",
+                                    "Payload": {
+                                        "operation": "StateMergeChunks",
+                                        "uuid.$": "$.uuid",
+                                        "input.$": "$.input",
+                                        "output.$": "$.output",
+                                        "data.$": "$.data"
+                                    }
+                                },
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [
+                                            "Lambda.ServiceException",
+                                            "Lambda.AWSLambdaException",
+                                            "Lambda.SdkClientException",
+                                            "Lambda.TooManyRequestsException"
+                                        ],
+                                        "IntervalSeconds": 1,
+                                        "MaxAttempts": 2,
+                                        "BackoffRate": 1.2
+                                    }
+                                ],
+                                "Next": "Usage tracking"
+                            },
+                            "Usage tracking": {
+                                "Type": "Task",
+                                "Resource": "arn:aws:states:::lambda:invoke",
+                                "OutputPath": "$.Payload",
+                                "Parameters": {
+                                    "FunctionName": "${MediaProcessingLambdaHalfCore.Arn}",
+                                    "Payload": {
+                                        "operation": "StateUsageTracking",
+                                        "uuid.$": "$.uuid",
+                                        "input.$": "$.input",
+                                        "output.$": "$.output",
+                                        "data.$": "$.data",
+                                        "execution_arn.$": "$$.Execution.Id"
+                                    }
+                                },
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [
+                                            "Lambda.ServiceException",
+                                            "Lambda.AWSLambdaException",
+                                            "Lambda.SdkClientException",
+                                            "Lambda.TooManyRequestsException"
+                                        ],
+                                        "IntervalSeconds": 1,
+                                        "MaxAttempts": 2,
+                                        "BackoffRate": 1.2
+                                    }
+                                ],
+                                "End": true
+                            }
+                        }
+                    }
+
+    ################################################################################
+    # Gateway Tool Log Group
+    ################################################################################
+    MediaProcessingGatewayToolLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${name}-${tool}
+                - name: !FindInMap [Lambda, Function, Name]
+                  tool: !FindInMap [Lambda, GatewayTool, Name]
+            RetentionInDays: 7
+
+    ################################################################################
+    # Gateway Tool Lambda IAM Role
+    # Separate role: needs only StartExecution + DescribeExecution on this workflow.
+    # Does NOT need S3, ECR, or GetFunctionConfiguration — those are for the
+    # workflow Lambdas, not this thin dispatcher.
+    ################################################################################
+    MediaProcessingGatewayToolRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service: lambda.amazonaws.com
+                        Action: sts:AssumeRole
+            Policies:
+                -
+                    PolicyName: !Sub ${ResourcePrefix}MediaProcessingGatewayToolPolicy
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                            -
+                                Effect: Allow
+                                Action:
+                                    - logs:CreateLogGroup
+                                    - logs:CreateLogStream
+                                    - logs:PutLogEvents
+                                Resource: !GetAtt MediaProcessingGatewayToolLogGroup.Arn
+                            # Start a new media-processing execution
+                            -
+                                Effect: Allow
+                                Action: states:StartExecution
+                                Resource: !GetAtt MediaProcessingStateMachine.Arn
+                            # Poll and inspect any execution of this state machine.
+                            # Both DescribeExecution and GetExecutionHistory operate on
+                            # execution ARNs, not the state machine ARN.
+                            -
+                                Effect: Allow
+                                Action:
+                                    - states:DescribeExecution
+                                    - states:GetExecutionHistory
+                                Resource: !Sub
+                                    - arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${smName}:*
+                                    - smName: !GetAtt MediaProcessingStateMachine.Name
+                            # callback_task_token (2026-09-18, the family
+                            # consumer pattern): register rows at submit,
+                            # complete synchronously on absorbed-finished
+                            # runs. SendTaskSuccess cannot be resource-
+                            # scoped — a task token is an opaque bearer
+                            # credential, not an ARN.
+                            -
+                                Effect: Allow
+                                Action:
+                                    - dynamodb:PutItem
+                                    - dynamodb:DeleteItem
+                                Resource: !GetAtt MediaProcessingCallbackTokensTable.Arn
+                            -
+                                Effect: Allow
+                                Action: states:SendTaskSuccess
+                                # any machine in THIS account+region — the token's machine is the
+                                # caller's (ours or a customer's own), never known at deploy time
+                                Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*
+
+    ################################################################################
+    # Gateway Tool Lambda
+    # Pure Python zip — no Docker image needed. Packaged inline from gateway_tool/.
+    ################################################################################
+    MediaProcessingGatewayToolLambda:
+        Type: AWS::Lambda::Function
+        DependsOn: ProxyBucketValidator
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W89
+                        reason: Not using VPC
+                    -
+                        id: W92
+                        reason: Single-purpose dispatcher; reserved concurrency unnecessary
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${name}-${tool}
+                - name: !FindInMap [Lambda, Function, Name]
+                  tool: !FindInMap [Lambda, GatewayTool, Name]
+            Description: !Sub
+                - (${ResourcePrefix}) ${desc}
+                - desc: !FindInMap [Lambda, GatewayTool, Description]
+            Runtime: python3.13
+            Architectures:
+                - arm64
+            Handler: lambda_function.lambda_handler
+            Role: !GetAtt MediaProcessingGatewayToolRole.Arn
+            MemorySize: !FindInMap [Lambda, GatewayTool, Memory]
+            Timeout: !FindInMap [Lambda, GatewayTool, Timeout]
+            Environment:
+                Variables:
+                    MEDIA_PROCESSING_STATE_MACHINE_ARN: !GetAtt MediaProcessingStateMachine.Arn
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    TOOL_VERSION: "%%VERSION%%"
+                    # Must equal the GatewayTarget Name in media-toolkit-gateway/cfnstack.yaml
+                    TARGET_NAME: "media-processing"
+                    CALLBACK_TABLE: !Ref MediaProcessingCallbackTokensTable
+            Code:
+                S3Bucket: !FindInMap [CodeBuild, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                      pkg: !FindInMap [CodeBuild, Source, GatewayToolPackage]
+            TracingConfig:
+                Mode: Active
+
+    ################################################################################
+    # Lambda Resource-Based Policy
+    # Allows the AgentCore service principal to invoke the gateway tool Lambda.
+    ################################################################################
+    MediaProcessingGatewayToolPermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !GetAtt MediaProcessingGatewayToolLambda.Arn
+            Action: lambda:InvokeFunction
+            Principal: bedrock-agentcore.amazonaws.com
+            SourceAccount: !Ref AWS::AccountId
+
+    ############################################################################
+    # Callback mechanism — the service-side half of
+    # callback_task_token, ported from bedrock-inference (README.md §11):
+    # consumer workflows (speech-diarization, audiostem-separation,
+    # face-recognition) submit process_media through the GATEWAY with a
+    # task token and sleep on ONE waitForTaskToken state; one EventBridge
+    # rule on THIS machine's native status-change events wakes every
+    # registered consumer. Notification is a SERVICE concern, owned here
+    # once — never a table+rule+waker per consumer stack.
+    ############################################################################
+    MediaProcessingCallbackTokensTable:
+        Type: AWS::DynamoDB::Table
+        Metadata:
+            checkov:
+                skip:
+                    - id: CKV_AWS_119
+                      comment: >-
+                        sample posture: table holds rebuildable derived state; default SSE is deliberate (see README.md §11, table posture)
+                    - id: CKV_AWS_28
+                      comment: >-
+                        sample posture: table is rebuildable derived state designed to delete with the stack; PITR protects nothing irreplaceable here
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W74
+                        reason: Ephemeral task-token rows with a TTL on every item — no customer data, nothing worth a CMK's key-management cost
+                    -
+                        id: W78
+                        reason: Point-in-time recovery is pointless — a restored row's task token belongs to a wait state that has already timed out
+        Properties:
+            # named like every sibling's callback table (bi-/fi-/tts-)
+            # so operators can find it by prefix; TableName is createOnly,
+            # so adding it REPLACES the table — safe only while no callback
+            # run is in flight (rows are transient tokens; a row lost
+            # mid-flight sleeps its held state to its timeout)
+            TableName: !Sub ${ResourcePrefix}-mp-callback-tokens
+            BillingMode: PAY_PER_REQUEST
+            AttributeDefinitions:
+                - { AttributeName: execution_arn, AttributeType: S }
+                - { AttributeName: token_hash, AttributeType: S }
+            KeySchema:
+                - { AttributeName: execution_arn, KeyType: HASH }
+                - { AttributeName: token_hash, KeyType: RANGE }
+            TimeToLiveSpecification:
+                AttributeName: ttl
+                Enabled: true
+
+    MediaProcessingCallbackWakerLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub "/aws/lambda/${ResourcePrefix}-media-processing-callback-waker"
+            RetentionInDays: 7
+
+    MediaProcessingCallbackWakerRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W11
+                        reason: states:SendTask* is scoped to this account+region's state machines — the token's machine is the caller's and unknowable at deploy time. This role can only redeem tokens it reads from the callback table, which only the gateway role writes.
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal:
+                            Service: lambda.amazonaws.com
+                        Action: sts:AssumeRole
+            Policies:
+                -
+                    PolicyName: !Sub ${ResourcePrefix}MediaProcessingCallbackWakerPolicy
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                            -
+                                Effect: Allow
+                                Action:
+                                    - logs:CreateLogGroup
+                                    - logs:CreateLogStream
+                                    - logs:PutLogEvents
+                                Resource: !GetAtt MediaProcessingCallbackWakerLogGroup.Arn
+                            -
+                                Effect: Allow
+                                Action:
+                                    - dynamodb:Query
+                                    - dynamodb:DeleteItem
+                                Resource: !GetAtt MediaProcessingCallbackTokensTable.Arn
+                            -
+                                Effect: Allow
+                                Action: states:SendTaskSuccess
+                                # any machine in THIS account+region — the token's machine is the
+                                # caller's (ours or a customer's own), never known at deploy time
+                                Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*
+
+    MediaProcessingCallbackWakerLambda:
+        Type: AWS::Lambda::Function
+        DependsOn: MediaProcessingCallbackWakerLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W89
+                        reason: Not using VPC
+                    -
+                        id: W92
+                        reason: Invoked once per terminal execution event; reserved concurrency unnecessary
+        Properties:
+            FunctionName: !Sub "${ResourcePrefix}-media-processing-callback-waker"
+            Description: !Sub "(${ResourcePrefix}) Completes consumer task tokens on the media-processing machine's terminal EventBridge event"
+            Runtime: python3.13
+            Architectures:
+                - arm64
+            Handler: callback_waker.lambda_handler
+            Role: !GetAtt MediaProcessingCallbackWakerRole.Arn
+            MemorySize: 256
+            Timeout: 60
+            Environment:
+                Variables:
+                    CALLBACK_TABLE: !Ref MediaProcessingCallbackTokensTable
+            Code:
+                S3Bucket: !FindInMap [CodeBuild, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                      pkg: !FindInMap [CodeBuild, Source, GatewayToolPackage]
+
+    MediaProcessingCallbackCompletionRule:
+        Type: AWS::Events::Rule
+        Properties:
+            Name: !Sub ${ResourcePrefix}-media-processing-callback-completion
+            Description: Complete consumer callback task tokens when a media-processing execution reaches a terminal state
+            EventPattern:
+                source: [aws.states]
+                detail-type: ["Step Functions Execution Status Change"]
+                detail:
+                    status: [SUCCEEDED, FAILED, ABORTED, TIMED_OUT]
+                    stateMachineArn:
+                        - !GetAtt MediaProcessingStateMachine.Arn
+            State: ENABLED
+            Targets:
+                -
+                    Id: MediaProcessingCallbackWaker
+                    Arn: !GetAtt MediaProcessingCallbackWakerLambda.Arn
+
+    MediaProcessingCallbackCompletionRulePermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !GetAtt MediaProcessingCallbackWakerLambda.Arn
+            Action: lambda:InvokeFunction
+            Principal: events.amazonaws.com
+            SourceArn: !GetAtt MediaProcessingCallbackCompletionRule.Arn
+
+Outputs:
+
+    IngestBucketReadRoleArns:
+        Description: >
+            Runtime role ARNs that read the Ingest bucket (comma-separated) —
+            input for the ingest bucket owner's bucket policy. Read-only.
+        Value: !GetAtt MediaProcessingRole.Arn
+    ImageUri:
+        Description: ECR URI of the container image
+        Value: !Sub
+            - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repositoryName}:${imageTag}
+            - repositoryName: !FindInMap [ECR, Repository, Name]
+              imageTag: !FindInMap [ECR, Repository, ImageTag]
+    ECRRepositoryArn:
+        Description: ARN of the ECR repository
+        Value: !Sub
+            - arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${repoName}
+            - repoName: !FindInMap [ECR, Repository, Name]
+    StateMachineArn:
+        Description: ARN of the media processing state machine
+        Value: !GetAtt MediaProcessingStateMachine.Arn
+    StateMachineName:
+        Description: Name of the media processing state machine
+        Value: !GetAtt MediaProcessingStateMachine.Name
+    GatewayToolLambdaArn:
+        Description: ARN of the gateway tool Lambda — import as MediaProcessingToolLambdaArn
+        Value: !GetAtt MediaProcessingGatewayToolLambda.Arn

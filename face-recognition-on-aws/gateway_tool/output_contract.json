@@ -1,0 +1,188 @@
+{
+  "contract_version": 1,
+  "target": "face-recognition",
+  "stability": "Every entry in `outputs` is stable API: labels, basenames, and the field names/nesting shown in each example. Removing or renaming any of them is a breaking change and requires a TOOL_VERSION bump plus a changelog note here. Files NOT listed here are internal and may change or vanish without notice — in particular everything under ephemeral/ (face_tracks.json, identity_clusters.json, frame_index, detection_plan, cluster/search checkpoints), the media-processing run prefix the frames live under (MP's own service-derived prefix since 2026-09-18), and the bucket-root _facestore/ derivatives. Integrating against those paths is unsupported: a real consumer built its face overlay on ephemeral/face_tracks.json and ephemeral/identity_clusters.json instead of the face-groups / face-clusters entries below and broke silently when the intermediates changed. `description` is one line by design — it is joined verbatim into each get_job_status outputs[] entry as `desc`.",
+  "outputs": {
+    "face-metadata": {
+      "basename": "facemetadata.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Screen-time/people summary — use for people lists, appearance timelines; montage via thumbnail_key, single reference face via rep_face_key",
+      "example": {
+        "version": 1,
+        "collection_id": "face-recognition-on-aws",
+        "duration_sec": 3670.0,
+        "people": [
+          {
+            "person_id": 0,
+            "name": "Jane Doe",
+            "named": true,
+            "name_source": "celebrity",
+            "confidence": 99.1,
+            "face_id": "a1b2c3d4-5678-90ab-cdef-1234567890ab",
+            "celebrity_id": "1AbC2dE",
+            "celebrity_urls": ["www.imdb.com/name/nm0000000"],
+            "known_gender": "Female",
+            "gender": "Female",
+            "age_range": [29, 41],
+            "total_screen_time_sec": 312.4,
+            "appearances": [
+              { "begin_ms": 1200, "end_ms": 8400, "representative_frame": 3 }
+            ],
+            "thumbnail_key": "<prefix>/debug/people/person_0000.jpg",
+            "rep_face_key": "<prefix>/debug/people/person_0000_face.jpg",
+            "num_tracks": 14
+          }
+        ],
+        "stats": {
+          "frames_analyzed": 5400,
+          "frames_skipped": 1800,
+          "faces_detected": 8123,
+          "num_tracks": 412,
+          "num_people": 23,
+          "cut_detector": "dhash"
+        },
+        "usage": {
+          "detect_faces_api": 512,
+          "recognize_celebrities_api": 91,
+          "index_faces_api": 4,
+          "search_faces_api": 92, "get_celebrity_info_api": 3
+        }
+      },
+      "notes": "people[] is sorted by total_screen_time_sec descending. name falls back to `Person_{person_id}` when named=false; name_source is `celebrity` | `collection` | `indexed` | null; face_id is the persistent-collection id when matched/indexed, else null; celebrity_id is the recognizer's celebrity identity key, gated in trust order: matched collection records carry a register-time celebrity_id, and EQUAL ids keep the key whatever the spelling while DIFFERENT ids (a collection homonym) suppress it; records predating the field fall back to case-insensitive name agreement between the published name and the validated vote's name (a collection witness that confirms the plurality keeps the key; a conflict resolved against the plurality suppresses it); else null; two people[] entries sharing a face_id or a celebrity_id are one person by the recognizer's own assertion — consumers may coalesce on it. celebrity_urls / known_gender (GetCelebrityInfo) accompany a set celebrity_id when the lookup succeeded, and are ABSENT — never null — when it was skipped or failed; known_gender is also absent when the lookup succeeded but Rekognition has no gender on record. get_celebrity_info_api in usage counts the (uncharged) GetCelebrityInfo lookups; it appears ONLY here, never in usage_tracking.json, which reports billed calls. appearances are merged track spans (minimum 800 ms), milliseconds from asset start; representative_frame is a source frame number. thumbnail_key and rep_face_key (like every *_key field) are S3 keys in the SAME bucket as this file, not s3:// uris — they point into the people-images prefix. thumbnail_key is the person's debug MONTAGE (contact sheet); rep_face_key is the single representative face crop (3:4 aspect, native resolution, ≤512 px long edge — the same face gender/age_range were read from). Use rep_face_key, never the montage, as a face-matching reference image. stats.cut_detector records which cut evidence bounded the tracks: `shots+dhash` (shot-segmentation supplement UNIONED with the built-in dHash veto — either detector's break splits a track) or `dhash` (built-in only). A person MAY additionally carry name_conflict: true plus name_conflict_detail {resolution, celebrity_name, celebrity_confidence, first_witness, second_witness} when the collection match disagreed with a validated celebrity plurality; the resolved name is still `name`/`name_source`, and the detail exists so the losing candidate is visible for audit — treat such a person's name as lower-confidence. usage counts Rekognition API calls only; full cost lives in the usage entry."
+    },
+    "face-groups": {
+      "basename": "facegroup.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Full per-face boxes/tracks — use for box overlays, frame-accurate face rendering",
+      "example": {
+        "version": 1,
+        "people": [
+          {
+            "person_id": 0,
+            "name": "Jane Doe",
+            "named": true,
+            "name_source": "celebrity",
+            "confidence": 99.1,
+            "face_id": "a1b2c3d4-5678-90ab-cdef-1234567890ab",
+            "gender": "Female",
+            "age_range": [29, 41],
+            "total_screen_time_sec": 312.4,
+            "appearances": [
+              { "begin_ms": 1200, "end_ms": 8400, "representative_frame": 3 }
+            ],
+            "thumbnail_key": "<prefix>/debug/people/person_0000.jpg",
+            "rep_face_key": "<prefix>/debug/people/person_0000_face.jpg",
+            "num_tracks": 14,
+            "tracks": [
+              {
+                "track_id": 17,
+                "centroid_idx": 3,
+                "faces": [
+                  {
+                    "frame_num": 1208,
+                    "timestamp": 50.3634,
+                    "frame_key": "frame_0001208.jpg",
+                    "box": { "l": 0.412394, "t": 0.187612, "w": 0.091233, "h": 0.162341 },
+                    "source": "detected",
+                    "confidence": 99.98,
+                    "age_range": [29, 41],
+                    "gender": "Female",
+                    "emotion": "CALM",
+                    "pose": { "pitch": -4.2, "roll": 1.1, "yaw": 8.7, "pose_dist": 0.0431 },
+                    "brightness": 71.2,
+                    "sharpness": 12.4,
+                    "eyes_open": true,
+                    "eyeglasses": false,
+                    "sunglasses": false,
+                    "mouth_open": false,
+                    "face_occluded": false
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "triaged_frames": [
+          { "frame_num": 84, "reason": "black" }
+        ],
+        "detection_plan": {
+          "noisy_patches": [7],
+          "skipped_gaps": 118,
+          "dedup_skipped": 240,
+          "dense_frames": 1620
+        }
+      },
+      "notes": "people[] entries repeat the face-metadata person fields and add tracks[]. box is frame-relative and normalized: l/t/w/h are 0-1 fractions of the ANALYZED frame's width/height (left, top, width, height) — multiply by the frame dimensions to get pixels. source is `detected` | `interpolated`: interpolated faces are synthesized for dedup-skipped frames by linear interpolation between the bracketing detections and carry ONLY frame_num/timestamp/box/gender/source (no frame_key, no attribute fields). centroid_idx indexes the track's representative face in faces[]. timestamp = frame_num / exact source fps, seconds from asset start. frame_key names a frame under media-processing's own run prefix — key faces by frame_num; do not integrate against that prefix. triaged_frames reasons: `black` | `mono` | `blur`. detection_plan.noisy_patches are 0-8 patch-grid indices (chronically-churning tickers/scoreboards) excluded from the skip test; skipped_gaps/dedup_skipped/dense_frames are counts."
+    },
+    "face-clusters": {
+      "basename": "face_clusters.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "2D similarity coords per person — use for cluster/scatter visualizations",
+      "example": {
+        "people": [
+          {
+            "person_id": 0,
+            "name": "Jane Doe",
+            "coord": [0.1123, -0.0456],
+            "num_tracks": 14,
+            "thumbnail_key": "<prefix>/debug/people/person_0000.jpg"
+          }
+        ]
+      },
+      "notes": "Classical MDS embedding of the identity-similarity matrix (zero extra API calls). coord axes are unitless — only relative distances between people are meaningful. person_id/name/num_tracks/thumbnail_key join face-metadata's people[]. Written only when clustering produced similarity pairs; the outputs[] entry is omitted otherwise."
+    },
+    "usage": {
+      "basename": "usage_tracking.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Per-state cost, Rekognition API-call counts, media-processing child cost — use for reporting what this run cost",
+      "example": {
+        "pipeline_wall_sec": 812.4,
+        "total_estimated_cost": 0.7113,
+        "lambda_cost": 0.0071,
+        "media_processing_cost": 0.0042,
+        "rekognition_cost": 0.699,
+        "rekognition_api_calls": 699,
+        "detect_faces_api": 512,
+        "recognize_celebrities_api": 91,
+        "index_faces_api": 4,
+        "search_faces_api": 92,
+        "states": {
+          "Map probe detection": {
+            "kind": "lambda",
+            "invocations": 6,
+            "retried": 0,
+            "duration_sec": 213.4,
+            "billed_sec": 208.1,
+            "memory_mb": 5376,
+            "estimated_cost": 0.014557,
+            "incomplete": false,
+            "wall_sec": 54.2
+          }
+        },
+        "media_processing_arn": "arn:aws:states:...",
+        "usage_key": "<prefix>/usage_tracking.json"
+      },
+      "notes": "states is a dict keyed by state name (not a list). kind is `lambda` | `child_execution` | `task_token` | `map` — only lambda attempts are billed, so estimated_cost 0.0 on the other kinds is by design: the media-processing run's cost is reported as media_processing_cost (read from MP's published usage_tracking.json since 2026-09-18), and a task_token span is queue wait (semaphore) or the MP wait (held submit), and a map envelope's iterators are billed under their own names. Costs are us-east-1 arm64 estimates, not billing data."
+    },
+    "people-images": {
+      "basename": "person_{NNNN}.jpg, person_{NNNN}_face.jpg",
+      "kind": "prefix",
+      "mime": "image/jpeg",
+      "description": "Per-person images: montage JPEGs (avatars/UI lanes) and single representative face crops — face-metadata's thumbnail_key/rep_face_key are the per-person pointers",
+      "example": null,
+      "notes": "Two files per person (zero-padded person_id): person_{NNNN}.jpg is the montage — up to 16 headshots evenly sampled across the person's full screen time; person_{NNNN}_face.jpg is the single representative face (3:4 aspect, native resolution, ≤512 px long edge — best track by appearance count, then that track's centroid face by area/frontality/sharpness). facemetadata.json's thumbnail_key and rep_face_key point at exactly these keys — prefer them over listing the prefix."
+    },
+    "debug-grids": {
+      "basename": "*.jpg / *.jpg.json",
+      "kind": "prefix",
+      "mime": null,
+      "description": "Detection/recognition grid JPEGs + raw Rekognition responses — human QC and audit, not a rendering input",
+      "example": null,
+      "notes": "Mixed content: probe/dense detection grids ({item}_{grid}.jpg, with .a/.b recursive-split variants), celebrity grids (celeb_{item}_{batch}.jpg) each with the raw RecognizeCelebrities response beside it as {same}.jpg.json, and search_*.jpg persistent-collection query crops. Debug aid for human QC, not a rendering input."
+    }
+  }
+}

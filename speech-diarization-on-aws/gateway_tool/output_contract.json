@@ -1,0 +1,205 @@
+{
+ "contract_version": 1,
+ "target": "speech-diarization",
+ "stability": "Every entry in `outputs` is stable API: labels, basenames, and the field names/nesting shown in each example. Removing or renaming any of them is a breaking change and requires a TOOL_VERSION bump plus a changelog note here. Files NOT listed here (per-fixed-chunk segments/ VAD turns, dynamic/ speech groups, per-chunk transcripts/transcript_{n}.json and embeddings/embeddings_{n}.json intermediates, workflow_params.json, converted audio under media_processing/, resampled/, clipped/) are internal and may change or vanish without notice. `description` is one line by design — it is joined verbatim into each get_job_status outputs[] entry as `desc`.",
+ "outputs": {
+  "transcript": {
+   "basename": "final_transcript.json",
+   "kind": "file",
+   "mime": "application/json",
+   "description": "Speaker-labelled sentence + word transcript — use for: subtitle/text projections, speaker-tagged quotes, seeking by sentence; words[] joins sentences via word_id_range",
+   "example": {
+    "language": "en",
+    "language_confidence": 0.98,
+    "word_timing_source": "aligned:en",
+    "model_variant": "turbo",
+    "audio_duration_sec": 3670.0,
+    "num_global_speakers": 3,
+    "num_sentences": 412,
+    "num_overlap_spans": 1,
+    "overlap_spans": [
+     [
+      12.4,
+      15.92
+     ]
+    ],
+    "overlap_segments": [
+     {
+      "start": 63.2,
+      "end": 64.1,
+      "speakers": [
+       "SPEAKER_00",
+       "SPEAKER_02"
+      ]
+     }
+    ],
+    "sentences": [
+     {
+      "id": 0,
+      "text": "Welcome back to the programme.",
+      "start": 12.31,
+      "end": 14.02,
+      "confidence": 0.93,
+      "speaker_id": "SPEAKER_00",
+      "word_id_range": [
+       0,
+       4
+      ],
+      "speech_spans": [
+       [
+        12.31,
+        14.02
+       ]
+      ]
+     }
+    ],
+    "words": [
+     {
+      "id": 0,
+      "word": "Welcome",
+      "start": 12.31,
+      "end": 12.58,
+      "probability": 0.99
+     },
+     {
+      "id": 1,
+      "word": "back",
+      "start": 12.6,
+      "end": 12.81,
+      "probability": 0.97,
+      "pad_resolution": "pad_moved"
+     }
+    ]
+   },
+   "notes": "Written at {prefix}/transcripts/final_transcript.json (transcripts/ subdirectory, not the prefix root). Times are seconds from audio start. speaker_id is SPEAKER_NN or null when no speaker could be assigned; confidence and probability may be null. word_id_range is the inclusive [first, last] id span into the flat words[] array; a sentence with no word timestamps has an inverted range. overlap_spans (added 2026-08-26) are cross-talk ranges: VAD speech turns in which >=2 speakers were simultaneously active for at least one frame — turn-granular, not frame-exact; [] when none. Derive per-sentence flags by time-join against sentences[]. word_timing_source (added 2026-09-16) records word-timestamp provenance: 'aligned:<lang>' (forced alignment, precise), 'aligned:en_fallback' (English-model alignment on a language without its own model - degraded), or 'whisper_native' (no alignment; coarse). speech_spans (added 2026-09-16) are word-tight [start,end] spans per sentence, split at intra-sentence pauses >0.5s when alignment ran; with whisper_native timing the sentence span is returned unsplit (coarse boundaries must not cut speech). Prefer speech_spans over sentence start/end for speech-activity uses (silence between spans is real). overlap_segments (2026-09-18): identity-resolved cross-talk spans {start, end, speakers:[two SPEAKER_NN]} — records the second voice sentences[] structurally misses (one speaker per instant). Evidence, not verdict: identity mapping measured 81% precise on the development corpus (zh 56-69%), ~1 in 5 segments may name one wrong speaker — prefer aggregate uses over per-instance claims; [] when none resolved. pad_resolution (added 2026-10-12, optional per word): provenance of a word whose Whisper timestamp fell in a synthetic inter-group concatenation pad — 'pad_moved' (relocated to the owning speech group by the resolution ladder), 'pad_unresolved' (kept, clamped — the evidence could not adjudicate: no aligner, probe abstention, or a support tie within the margin), or 'pad_rehomed' (re-homed next to its sentence-mates after sentence assembly). Absent on words whose timestamps were observed in place; flagged timings are reconstructed, not observed. Hallucinated pad words with no acoustic support are dropped and never appear."
+  },
+  "caption": {
+   "basename": "final_transcript.vtt",
+   "kind": "file",
+   "mime": "text/vtt",
+   "description": "Speaker-tagged WebVTT captions (Netflix-style line/duration limits) — use as <track> subtitles against the proxy",
+   "example": null,
+   "notes": "Written at {prefix}/transcripts/final_transcript.vtt. A WEBVTT header then cues of `HH:MM:SS.mmm --> HH:MM:SS.mmm` followed by `<v SPEAKER_NN>text` — the voice tag carries the transcript's speaker_id (UNKNOWN when unassigned). Netflix Timed Text limits: max 42 chars/line, 2 lines/cue, 7 s max cue duration, >=83 ms gap between cues; long sentences are split into multiple cues at word boundaries, never truncated."
+  },
+  "speaker-manifest": {
+   "basename": "speaker_manifest.json",
+   "kind": "file",
+   "mime": "application/json",
+   "description": "Per-speaker WAV index (durations, segment counts, compact time_map) — use for speaker lanes/turns and for resolving speaker-audio keys",
+   "example": {
+    "channel_mode": "aligned",
+    "source_audio_key": "<prefix>/media_processing/diarization_audio/audio_16k_mono.wav",
+    "sample_rate": 16000,
+    "source_duration_sec": 3670.0,
+    "num_speakers": 3,
+    "merge_gap_sec": 0.5,
+    "fade_ms": 10,
+    "speakers": {
+     "SPEAKER_00": {
+      "wav_key": "<prefix>/speakers/SPEAKER_00.wav",
+      "num_sentences": 42,
+      "num_segments": 17,
+      "total_speech_sec": 128.5
+     }
+    }
+   },
+   "notes": "Written at {prefix}/speakers/speaker_manifest.json. `speakers` is an object keyed by SPEAKER_NN — ids can be non-contiguous (a speaker with no valid audio regions writes no WAV and no entry). channel_mode is `aligned` or `compact`; in compact mode each speaker entry adds duration_sec and time_map ([{original_start, original_end, compact_start, compact_end}], seconds) and the top level adds compact_gap_sec. This file is the index for the speaker-audio prefix."
+  },
+  "global-speakers": {
+   "basename": "global_speakers.json",
+   "kind": "file",
+   "mime": "application/json",
+   "description": "Speaker clustering result (centroid models, sentence→speaker map, diagnostics) — use for cross-run speaker matching or clustering QC; the transcript already carries per-sentence speaker_id",
+   "example": {
+    "num_global_speakers": 3,
+    "clustering_method": "ahc(k_enum  k=3)",
+    "num_sentences_total": 412,
+    "num_sentences_high": 388,
+    "num_sentences_low": 15,
+    "num_sentences_skipped": 9,
+    "total_speech_sec": 3120.4,
+    "elapsed_sec_clustering": 4.2,
+    "sentence_speakers": {
+     "0:0": "SPEAKER_00"
+    },
+    "diarization": [
+     {
+      "start": 12.31,
+      "end": 19.87,
+      "speaker": "SPEAKER_00"
+     }
+    ],
+    "speaker_models": {
+     "SPEAKER_00": {
+      "embedding": [
+       0.0123
+      ],
+      "num_turns": 120,
+      "num_inliers": 108,
+      "num_outliers": 12,
+      "total_speech_sec": 1245.2,
+      "confidence": 0.87,
+      "f0_median_hz": 118.4,
+      "f0_iqr_hz": 21.7,
+      "f0_voiced_ratio": 0.62,
+      "f0_n_sentences": 96
+     }
+    },
+    "clustering_diagnostics": {
+     "k_selected": 3,
+     "selection_reason": "elbow",
+     "single_speaker_detected": false,
+     "n_outliers_removed": 4,
+     "dendrogram_final_height": 0.42,
+     "k_sweep_log": []
+    }
+   },
+   "notes": "Written at {prefix}/embeddings/global_speakers.json. sentence_speakers keys are `{dyn_chunk_idx}:{sentence_idx}` — internal chunk-local ids; join speakers via the transcript's per-sentence speaker_id instead. Values can be UNKNOWN. speaker_models[*].embedding is the 256-dim WeSpeaker centroid (truncated here); diarization segments are merged same-speaker turns. k_sweep_log holds one diagnostic record per candidate K — diagnostics internals, kept shallow here because their shape may deepen. f0_* fields (2026-09-23) are per-cluster voice-pitch STATISTICS (median/IQR of per-sentence F0 medians, voiced-frame ratio) — evidence for downstream voice-to-face compatibility matching, never a gender verdict (thresholds and the abstention band belong to the consumer); absent when nothing voiced or on pre-F0 runs."
+  },
+  "usage": {
+   "basename": "usage_tracking.json",
+   "kind": "file",
+   "mime": "application/json",
+   "description": "Per-state durations and estimated cost, including the media-processing child run — use for reporting what this run cost",
+   "example": {
+    "execution_arn": "arn:aws:states:...",
+    "audio_bucket": "<bucket>",
+    "audio_key": "<prefix>/media_processing/diarization_audio/audio_16k_mono.wav",
+    "output_bucket": "<bucket>",
+    "usage_key": "<prefix>/usage_tracking.json",
+    "pipeline_wall_sec": 412.3,
+    "total_estimated_cost": 0.0212,
+    "states": [
+     {
+      "state_name": "Map transcribe processing",
+      "operation": "StateRunWhisperAlignWtpsplitModels",
+      "lambda_arn": "arn:aws:lambda:...",
+      "architecture": "arm64",
+      "memory_mb": 7168,
+      "invocations": 12,
+      "retried": 0,
+      "wall_sec": 210.5,
+      "total_billed_sec": 1420.7,
+      "incomplete": false,
+      "estimated_cost": 0.0133
+     }
+    ],
+    "media_processing": {
+     "execution_arn": "arn:aws:states:...",
+     "pipeline_wall_sec": 88.2,
+     "estimated_cost": 0.0021,
+     "states": []
+    }
+   },
+   "notes": "Costs are us-east-1 arm64 estimates, not billing data. total_estimated_cost covers parent + child. media_processing is null when the source needed no format conversion; its states[] entries share the parent states[] entry shape. The synthetic `Usage tracking` self-entry estimates its own not-yet-finished invocation and omits retried/incomplete."
+  },
+  "speaker-audio": {
+   "basename": "SPEAKER_{NN}.wav",
+   "kind": "prefix",
+   "mime": "audio/wav",
+   "description": "Per-speaker WAV channels (source-timeline aligned or compact) — use for voice ID, sentiment, or voice-cloning reference audio; resolve exact keys from speaker-manifest",
+   "example": null,
+   "notes": "Files are {prefix}/speakers/SPEAKER_{NN}.wav — mono int16 at the source's native sample rate. They are not individually enumerated in outputs[] (speaker ids can be non-contiguous); speaker_manifest.json in the same prefix is the index. Present only when speaker_channels=true and at least one speaker produced audio. `aligned` mode WAVs share the source timeline (silence elsewhere); `compact` mode holds only the speaker's speech — map times back via the manifest's time_map."
+  }
+ }
+}

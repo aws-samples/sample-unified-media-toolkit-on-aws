@@ -1,0 +1,87 @@
+{
+  "contract_version": 1,
+  "target": "text-to-speech",
+  "stability": "Every entry in `outputs` is stable API: the field names/nesting shown in each example, and the clip WAV objects under `output_s3_prefix`. Removing or renaming any of them is a breaking change and requires a TOOL_VERSION bump plus a changelog note here. This target deliberately does NOT emit the siblings' labeled {uri, mime, label} outputs[] triples — its results are INLINE in get_job_status — so the envelope deviates from the reference instance: keys name result shapes rather than outputs[] labels, entries of kind `inline` carry no basename/mime, `usage` is the one real file and is reached via the top-level `usage_uri` field (there is no label to hang it on), and nothing here is joined into get_job_status as `desc` — describe_tool is this contract's only surface. NOT contract: `ephemeral/` checkpoint objects under the output prefix, and voice conditioning internals under `voices/` (the conditioning npz layout, staging keys), which may change or vanish without notice.",
+  "outputs": {
+    "clips": {
+      "kind": "inline",
+      "description": "Per-transcript synthesis results, inline as get_job_status outputs[] — join each entry to your request via transcript_index; select clips by uri, never by parsing filenames",
+      "example": [
+        {
+          "transcript_index": 0,
+          "uri": "s3://<bucket>/micro-workflow/tts-on-aws/output/<workflow_id>/<clip>.wav",
+          "duration_s": 3.42,
+          "stretched": false,
+          "qc_passed": true,
+          "qc_similarity": 0.97
+        },
+        {
+          "transcript_index": 1,
+          "error": "no output produced"
+        }
+      ],
+      "notes": "Exactly one entry per transcript sent, in request order; transcript_index is the join key back to the caller's transcripts[] array (global across the request, not per-batch). An entry is one of two shapes: success (uri, duration_s, stretched, qc_passed, qc_similarity, plus qc_error only when QC itself could not run — missing/corrupt WAV or ASR crash, in which case qc_passed is null and the clip may still be fine) or failure (transcript_index + error only, no uri). Per-item isolation: a failed entry leaves the rest of the batch unaffected, so always read outputs[], never just status. qc_passed=false is a REVIEW POINTER, not an error — whisper-base ASR is measurably non-deterministic on identical audio, so do not re-synthesize a batch because QC flagged a clip; re-listen or re-render only that entry. WAVs are 24 kHz, written under output_s3_prefix."
+    },
+    "batch_qc_summary": {
+      "kind": "inline",
+      "description": "Batch-level ASR-roundtrip QC rollup, inline in get_job_status — use to decide which clips to review; informational, never a gate",
+      "example": {
+        "all_passed": false,
+        "passed": 3,
+        "failed": 1,
+        "total": 4,
+        "failed_indices": [2]
+      },
+      "notes": "Present only when at least one entry carries a QC verdict. failed_indices holds transcript_index values of entries with qc_passed=false. A SUCCEEDED execution status says nothing about content quality (QC does not fail the workflow), so this is the content-quality signal — surfaced prominently, not enforced, because the QC model itself is non-deterministic."
+    },
+    "voice": {
+      "kind": "inline",
+      "description": "The registered-voice record, inline in get_job_status for a register_voice job — use voice_id for synthesize_speech and presign preview_uri to audition",
+      "example": {
+        "voice_id": "<uuid4>",
+        "name": "narrator-f",
+        "gender": "female",
+        "language": "en",
+        "origin": "user-upload",
+        "license": "IC",
+        "catalog": "default",
+        "comment": "warm read",
+        "ref_transcript": "the exact words spoken in the reference audio",
+        "duration_sec": 8.4,
+        "preview_uri": "s3://<bucket>/micro-workflow/tts-on-aws/voices/<voice_id>/preview.wav",
+        "s3_conditioning_key": "micro-workflow/tts-on-aws/voices/<voice_id>/conditioning.npz",
+        "s3_source_key": "micro-workflow/tts-on-aws/voices/<voice_id>/source.wav"
+      },
+      "notes": "gender, comment and s3_source_key (user-upload origin only, an audit copy) are present only when they exist; language is the NORMALIZED whisper code (\"en\"), never the caller's raw string. s3_conditioning_key and s3_source_key point at voice conditioning internals under voices/ — they appear in the record but their contents are NOT contract; integrate against preview_uri and voice_id only. get_voice / list_voice_collection return a trimmed public view of the same record (no ref_transcript, no conditioning key, plus created_at)."
+    },
+    "usage": {
+      "basename": "usage_tracking.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Per-state durations and estimated cost — use for reporting what this run cost; reached via get_job_status's top-level usage_uri (this target has no usage label)",
+      "example": {
+        "execution_arn": "arn:aws:states:...",
+        "output_bucket": "<bucket>",
+        "usage_key": "micro-workflow/tts-on-aws/output/<workflow_id>/usage_tracking.json",
+        "pipeline_wall_sec": 176.4,
+        "total_estimated_cost": 0.231887,
+        "states": [
+          {
+            "state_name": "Synthesize LLM",
+            "operation": "StateSynthesizeLLM",
+            "lambda_arn": "arn:aws:lambda:...",
+            "architecture": "arm64",
+            "memory_mb": 3584,
+            "invocations": 4,
+            "retried": 1,
+            "wall_sec": 96.2,
+            "total_billed_sec": 311.7,
+            "incomplete": false,
+            "estimated_cost": 0.014601
+          }
+        ]
+      },
+      "notes": "Costs are us-east-1 arm64 estimates, not billing data. retried counts attempts that ended in TaskFailed — non-zero is NORMAL here (checkpoint/resume raises a timeout exception on purpose and the ASL Retry re-invokes), and explains billed time exceeding wall time. incomplete=true means some attempt had no terminal event at all (normally just the usage state's own in-flight record). pipeline_wall_sec is ExecutionStarted → now, measured while the usage state is still running. get_job_status already surfaces pipeline_wall_sec and total_estimated_cost; fetch this file only for the per-state breakdown."
+    }
+  }
+}

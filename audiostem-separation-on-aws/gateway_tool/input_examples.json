@@ -1,0 +1,22 @@
+{
+  "comment": "Per tool: `required` names the fields the gateway refuses without (a prose entry like 'a OR b' states a one-of rule the schema cannot express); `example` is a minimal VALID request including recommended optionals; every other accepted parameter is declared, with type and description, in the tool's InputSchema (delivered via tools/list). The shapes and field names are the contract; every s3 uri, ARN, and id value is an invented placeholder — substitute your deployment's own. Each submit example passes this gateway's full input validation (pinned by a unit test), so an example that drifts from the real contract fails the build.",
+  "tools": {
+    "separate_audio_stems": {
+      "required": ["asset_s3uri"],
+      "example": {
+        "asset_s3uri": "s3://my-ingest-bucket/path/to/source.mp4",
+        "idempotency_token": "my-run-2026-10-07"
+      }
+    },
+    "get_job_status": {
+      "required": ["job_id"],
+      "example": {
+        "job_id": "arn:aws:states:eu-west-1:111111111111:execution:myprefix-audiostem-separation:00000000-0000-5000-8000-000000000001"
+      }
+    },
+    "describe_tool": {
+      "required": [],
+      "example": {}
+    }
+  }
+}

@@ -1,0 +1,12 @@
+# requirements.txt
+# Pinned for reproducibility. All packages are CPU-only builds.
+# boto3/botocore are included in the Lambda base image but pinned here
+# so the version is explicit and not silently upgraded by AWS.
+
+# ── AWS ───────────────────────────────────────────────────────────────────────
+boto3==1.40.4
+botocore==1.40.4
+
+# # ── Image ─────────────────────────────────────────────────────────────────────
+# Pillow==11.1.0
+defusedxml==0.7.1

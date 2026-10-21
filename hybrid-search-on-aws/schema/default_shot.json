@@ -1,0 +1,40 @@
+{
+    "doc_type": "shot",
+    "embedding_model": "cohere.embed-v4:0",
+    "dims": 1024,
+    "vector_store": "s3vectors",
+    "mappings": {
+        "doc_id": {
+            "type": "keyword",
+            "required": true
+        },
+        "asset_id": {
+            "type": "keyword",
+            "required": true
+        },
+        "start_ms": {
+            "type": "long",
+            "required": true
+        },
+        "end_ms": {
+            "type": "long",
+            "required": true
+        },
+        "vector": {
+            "type": "float32_vector",
+            "required": true,
+            "ann": true
+        },
+        "frame_s3_key": {
+            "type": "keyword",
+            "required": true
+        },
+        "scene_parent_id": {
+            "type": "keyword"
+        }
+    },
+    "result_fields": [
+        "frame_s3_key",
+        "scene_parent_id"
+    ]
+}

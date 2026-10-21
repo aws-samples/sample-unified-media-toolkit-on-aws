@@ -1,0 +1,206 @@
+{
+  "Comment": "shot-metadata-enrichment: shots.json -> image-bounded window plan -> Map-rendered image records (checkpointed, OOM-bounded batches) -> ONE waitForTaskToken submit to bedrock-inference (no polling) -> coverage + pairing repair + scene assembly. conversation-analysis's five-state template with the render step widened to a Map + a stage state (user decision 2026-08-19: Map + small thread pool; per-window side-object checkpoints make LambdaResourceTimeoutException retries resume, not restart). Readability copy of the template's inline DefinitionString; edit BOTH, the build fails on drift.",
+  "StartAt": "Validate and plan",
+  "TimeoutSeconds": 108000,
+  "States": {
+    "Validate and plan": {
+      "Type": "Task",
+      "Comment": "Everything that can refuse refuses HERE, before any inference dollar: shots.json fetch+validate, the optional face/transcript joins, get_prompt (binds `default`, checks the 7-token values catalog), IMAGE-capable model-chain validation against bedrock's registry, the image-bounded window plan (10-shot target inside the 20-image budget incl. gallery), Map batches, history scope. Persists _plan/plan.json; states pass URIs, never bodies.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "ValidateAndPlan",
+          "uuid.$": "$.uuid",
+          "input.$": "$.input"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "Render windows"
+    },
+    "Render windows": {
+      "Type": "Map",
+      "Comment": "One iteration per window batch (WINDOWS_PER_BATCH, default 10) — the OOM-bounded unit: each iteration threads RENDER_THREADS (default 3) tarball fetches, renders through the copied prompt_render module, and checkpoints every window as _records/window_NNN.json. LambdaResourceTimeoutException retries RESUME (existing side objects are skipped), they never restart.",
+      "MaxConcurrency": 4,
+      "ItemsPath": "$.batches",
+      "ItemSelector": {
+        "operation": "RenderWindows",
+        "uuid.$": "$.uuid",
+        "plan_s3uri.$": "$.plan_s3uri",
+        "batch_index.$": "$$.Map.Item.Value.batch_index",
+        "window_indices.$": "$$.Map.Item.Value.window_indices"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "Render window batch",
+        "States": {
+          "Render window batch": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+              "FunctionName": "${WorkflowLambdaArn}",
+              "Payload.$": "$"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "LambdaResourceTimeoutException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 10,
+                "BackoffRate": 1.0
+              },
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 3,
+                "MaxAttempts": 4,
+                "BackoffRate": 2.0
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.render_results",
+      "Next": "Stage records"
+    },
+    "Stage records": {
+      "Type": "Task",
+      "Comment": "Concatenate the per-window checkpoints, in window order, into records.jsonl — STREAMED via S3 multipart (an image record is MBs; a long asset's set is never held whole). Refuses on a missing window checkpoint and on an image over-budget (defence in depth beside bedrock's own max_images guard).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "StageRecords",
+          "uuid.$": "$.uuid",
+          "plan_s3uri.$": "$.plan_s3uri"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "Submit and wait"
+    },
+    "Submit and wait": {
+      "Type": "Task",
+      "Comment": "The template's §8 shape verbatim: ONE held state, NO polling. The handler invokes bedrock-inference's gateway Lambda inline (records_s3uri + callback_task_token + idempotency_token = THIS run's uuid) and writes the history pointer from the TRUE submit response. bedrock's waker completes the token with the terminal status as DATA. NO Catch: a timeout FAILS the execution, and a REDRIVE of this state resubmits, absorbs, and is completed synchronously — redrive IS the reconcile. use_batch defaults TRUE here (plan.json carries the explicit bool).",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "SubmitAndWait",
+          "uuid.$": "$.uuid",
+          "plan_s3uri.$": "$.plan_s3uri",
+          "records_s3uri.$": "$.records_s3uri",
+          "record_count.$": "$.record_count",
+          "task_token.$": "$$.Task.Token"
+        }
+      },
+      "ResultPath": "$.wait_result",
+      "TimeoutSeconds": 93600,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "Collect and finalize"
+    },
+    "Collect and finalize": {
+      "Type": "Task",
+      "Comment": "ONE state for both halves: parse the per-window JSONL (fence-tolerant, nothing more), validate coverage per shot_id, apply the §4 pairing repair (`false` wins in BOTH directions, repairs COUNTED — the rate is an interleaved-genre detector), assemble scenes from the repaired flags, write shots + scenes + window-manifest. Unanswered shot_ids land in shots_gap HONESTLY — partial success is success; the rerun is the caller's fresh idempotency_token. A terminally FAILED bedrock run raises and propagates as itself.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "CollectAndFinalize",
+          "uuid.$": "$.uuid",
+          "plan_s3uri.$": "$.plan_s3uri",
+          "wait_result.$": "$.wait_result"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "Usage tracking"
+    },
+    "Usage tracking": {
+      "Type": "Task",
+      "Comment": "Aggregates the run's summary/usage documents into the usage label. Success path only; the handler never raises — as the terminal state, an exception here would fail an execution whose products are already written.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WorkflowLambdaArn}",
+        "Payload": {
+          "operation": "UsageTracking",
+          "uuid.$": "$.uuid",
+          "plan_s3uri.$": "$.plan_s3uri"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    }
+  }
+}

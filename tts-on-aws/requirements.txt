@@ -1,0 +1,48 @@
+# requirements.txt
+# Pinned for reproducibility. All packages are CPU-only builds. No torch,
+# no ffmpeg, no librosa (mel filterbanks precomputed into assets/).
+
+# ── AWS ───────────────────────────────────────────────────────────────────────
+# boto3/botocore are in the Lambda base image but pinned so the version is
+# explicit and not silently upgraded by AWS.
+boto3==1.34.131
+botocore==1.34.131
+
+# ── Numerics ──────────────────────────────────────────────────────────────────
+# numpy 1.x REQUIRED: onnxruntime 1.18.0 wheels are built against numpy 1.x
+# (same constraint the community CosyVoice3-ONNX repos document, and the same
+# one upstream CosyVoice itself pins).
+numpy==1.26.4
+scipy==1.13.1
+
+# ── ONNX Runtime (CPU only) ───────────────────────────────────────────────────
+# PINNED to 1.18.0 — NOT latest. The community FP16 LLM graphs
+# (llm_backbone_*_fp16.onnx) crash newer ORT at session-init
+# (SimplifiedLayerNormFusion bug; reproduced on 1.23.2 during local
+# verification). Every other model in the pipeline was individually
+# verified to load AND run under 1.18.0. Do not bump this without
+# re-running the full onnx_verify checkpoint suite.
+# NOTE python3.12 base image required: 1.18.0 has no cp313 wheels.
+onnxruntime==1.18.0
+
+# ── Audio I/O ─────────────────────────────────────────────────────────────────
+# 0.13.1, NOT 0.12.1: 0.12.1 has no aarch64 manylinux wheel (falls back to a
+# pure-Python wheel that expects a system libsndfile, absent from the Lambda
+# base). 0.13.1 bundles libsndfile in the aarch64 wheel.
+soundfile==0.13.1
+
+# ── Text tokenizer (LLM prompt construction) ─────────────────────────────────
+# transformers is used ONLY for AutoTokenizer (Qwen2 BPE + special tokens) —
+# no torch backend needed for tokenization-only use.
+transformers==4.51.3
+tokenizers==0.21.4
+
+# ── QC gate (ASR roundtrip) ───────────────────────────────────────────────────
+# faster-whisper pulls ctranslate2 — CPU-only manylinux aarch64 wheels on
+# PyPI, no torch anywhere in the dependency chain (verified).
+faster-whisper==1.0.3
+
+# Traditional-to-Simplified Chinese normalization for lib/qc.py's text
+# similarity check — pure-Python wheel (py2.py3-none-any), no compiled
+# extension, no aarch64 concern, bundles its own conversion dictionaries.
+opencc-python-reimplemented==0.1.7

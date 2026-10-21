@@ -1,0 +1,79 @@
+{
+  "contract_version": 1,
+  "target": "prompt-registry",
+  "stability": "Every entry documents an INLINE result shape (this target starts no executions and emits no outputs[] file list — kind inline throughout, the tts/hybrid-search precedent). The field names and nesting shown in each example are stable API; removing or renaming any is a breaking change requiring a TOOL_VERSION bump and a changelog note here. The S3 pair under _promptregistry/{category}/{version}/ (source.md + artifact.json) is readable directly but the TOOLS are the contract surface; anything else under _promptregistry/ is internal and may change without notice.",
+  "outputs": {
+    "prompt-artifact": {
+      "kind": "inline",
+      "description": "get_prompt's result: the full parsed artifact plus source_s3uri — everything prompt_render needs, plus stage so a caller can refuse to bind a dev prompt into a prod pipeline",
+      "example": {
+        "category": "conversation-analysis",
+        "version": "default",
+        "origin": "builtin",
+        "comment": "Builtin instruction for conversation analysis",
+        "system": "You are an expert media content analyst...",
+        "user_template": "Transcript:\n{{transcript}}\n...",
+        "variables": [
+          {"token": "{{transcript}}", "root": "transcript", "leafs": []}
+        ],
+        "source_md5": "9b2f1c0e8d7a6b5c4d3e2f1a0b9c8d7e",
+        "aux": {"supportedvariables": "transcript, ..."},
+        "created_at": 1786500000000,
+        "stage": "prod",
+        "deprecated": false,
+        "promoted_at": null,
+        "deprecated_at": null,
+        "source_s3uri": "s3://<bucket>/_promptregistry/conversation-analysis/default/source.md"
+      },
+      "notes": "version is OPTIONAL on get_prompt and resolves to `default`; a NAMED missing version is PROMPT_NOT_FOUND, never a silent fallback. Content fields (system, user_template, variables, source_md5) are immutable for the life of the version; only stage/deprecated/promoted_at/deprecated_at ever change. `variables` is the pre-declared token list prompt_render substitutes — consumers never parse the {{...}} grammar themselves."
+    },
+    "put-result": {
+      "kind": "inline",
+      "description": "put_prompt's result: the saved identity plus the vocabulary lint — warnings are advisory and NEVER block a save",
+      "example": {
+        "category": "conversation-analysis",
+        "version": "v2-shorter",
+        "stage": "dev",
+        "origin": "user",
+        "source_s3uri": "s3://<bucket>/_promptregistry/conversation-analysis/v2-shorter/source.md",
+        "variables": ["{{transcript}}", "{{total_duration}}"],
+        "warnings": [
+          "'tags': legacy spelling — canonical is 'relevant_tags'"
+        ],
+        "created_at": 1786500000000
+      },
+      "notes": "stage defaults to dev; version `default` is forced to prod (a `message` field says so when it happens). Refusals: VERSION_EXISTS (versions are immutable — an edit is a new version name; dev/test names can be freed with delete_prompt), INVALID_PROMPT (the parse error verbatim), PROMPT_TOO_LARGE (~1 MB paste-accident bound), INVALID_PARAMETER."
+    },
+    "list-entry": {
+      "kind": "inline",
+      "description": "list_prompts' result: categories with per-version lifecycle metadata (no template bodies — get_prompt fetches those)",
+      "example": {
+        "categories": [
+          {
+            "category": "conversation-analysis",
+            "versions": [
+              {"version": "default", "stage": "prod", "origin": "builtin",
+               "deprecated": false,
+               "comment": "Builtin instruction for conversation analysis",
+               "created_at": 1786500000000}
+            ]
+          }
+        ],
+        "total_versions": 1
+      },
+      "notes": "category is optional; absent lists every category. Per-version metadata costs one GET each — acceptable at registry scale and the documented price of keeping lifecycle metadata in the artifact."
+    },
+    "lifecycle-result": {
+      "kind": "inline",
+      "description": "promote_prompt / delete_prompt / deprecate_prompt results — small identity echoes with the state that changed, idempotent where retries must not error",
+      "example": {
+        "category": "conversation-analysis",
+        "version": "v2-shorter",
+        "stage": "prod",
+        "previous_stage": "dev",
+        "promoted_at": 1786500000000
+      },
+      "notes": "promote is a one-way ratchet (dev -> test -> prod); already-at-or-beyond-target returns success with a `message` (covers `default`, born prod, with no special case). delete returns {deleted: true, stage_was, message} and refuses prod (PROD_UNDELETABLE) — deprecate instead. deprecate returns {deprecated: true, deprecated_at}, is idempotent-with-message, and refuses `default` (DEFAULT_PROTECTED). All refusals are {error: true, errorCode, message}."
+    }
+  }
+}

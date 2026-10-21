@@ -1,0 +1,176 @@
+{
+ "vocabulary_version": 1,
+ "note": "The reviewed template-variable vocabulary (settled 2026-08-15). A LINT, not a runtime gate: the per-prompt contract is the artifact's own parsed `variables`, enforced exactly by prompt_render; this file exists so cross-prompt naming stays consistent and a novel name arrives as a deliberate diff to this file, reviewed, instead of a silent coinage. `aliases` are legacy spellings found in the ported v5 builtins — valid to substitute (the token string is the contract), WARNED toward the canonical name by put_prompt, and retired per-prompt as each caller workflow is rebuilt (a rename ships as a NEW prompt version, never an edit). `kind` documents the value the caller is expected to supply: text | number | json (dict/list rendered as compact JSON) | blocks (a list of Converse content blocks, spliced).",
+ "variables": {
+  "overall_content_type": {
+   "kind": "text",
+   "description": "The classified content type (Episodic, Movies/Feature Films, News Program, ...)."
+  },
+  "genres": {
+   "kind": "json",
+   "description": "Genre labels for the asset."
+  },
+  "num_scenes": {
+   "kind": "number",
+   "description": "Scene count in the chunk under analysis."
+  },
+  "total_duration": {
+   "kind": "text",
+   "description": "The asset's total duration, formatted by the caller (v5 passes a formatted string). WORKFLOW-PROVIDED: declare this token to receive the asset's total duration injected programmatically by the calling llm-prompt-workflow (e.g. conversation-analysis); prompt authors never compute or supply this value themselves.",
+   "provided_by": "workflow"
+  },
+  "transcript": {
+   "kind": "text",
+   "description": "The spoken-dialogue transcript — usually a timestamped document (WebVTT text, formatted '[t] SPEAKER: line' text, or a JSON projection of cues), very rarely a single sentence. SINGULAR on purpose (naming rule, round 7): 'transcript' is a container noun like shot_list — one document holding many cues — and the plural would mean multiple transcript DOCUMENTS (tts's `transcripts` parameter means exactly that). CONSOLIDATION (round 3): `dialogue`/`dialogues` are the same concept; canonical went to the dominant spelling and the upstream artifact's name. WORKFLOW-PROVIDED: declare this token to receive the transcript envelope (self-describing WebVTT with cue ids, coverage NOTE) injected programmatically by the calling llm-prompt-workflow (e.g. conversation-analysis); prompt authors never compute or supply this value themselves.",
+   "aliases": [
+    "dialogue",
+    "dialogues"
+   ],
+   "provided_by": "workflow"
+  },
+  "transcript_duration": {
+   "kind": "text",
+   "description": "Coverage duration of the supplied transcript. WORKFLOW-PROVIDED: declare this token to receive transcript coverage duration injected programmatically by the calling llm-prompt-workflow (e.g. conversation-analysis); prompt authors never compute or supply this value themselves.",
+   "provided_by": "workflow"
+  },
+  "chunk_start_time": {
+   "kind": "text",
+   "description": "Start of the chunk under analysis (formatted time or seconds; the prompt's phrasing decides). WORKFLOW-PROVIDED: declare this token to receive chunk coverage start injected programmatically by the calling llm-prompt-workflow (e.g. conversation-analysis); prompt authors never compute or supply this value themselves.",
+   "provided_by": "workflow"
+  },
+  "chunk_end_time": {
+   "kind": "text",
+   "description": "End of the chunk under analysis. WORKFLOW-PROVIDED: declare this token to receive chunk coverage end injected programmatically by the calling llm-prompt-workflow (e.g. conversation-analysis); prompt authors never compute or supply this value themselves.",
+   "provided_by": "workflow"
+  },
+  "chunk_minutes": {
+   "kind": "number",
+   "description": "Chunk sizing parameter: the maximum chunk length in minutes."
+  },
+  "interval_in_minutes": {
+   "kind": "number",
+   "description": "Caller parameter: the timing-window size for interval-based tasks (ad breaks)."
+  },
+  "audio_segment_topics": {
+   "kind": "json",
+   "description": "Topic segmentation of the audio track."
+  },
+  "shot_list": {
+   "kind": "json",
+   "description": "The shot list (shot-segmentation's shots.json content or a projection of it)."
+  },
+  "face_names": {
+   "kind": "json",
+   "description": "Recognized face/celebrity names supplied as context."
+  },
+  "gps_location": {
+   "kind": "text",
+   "description": "Capture location as one 'latitude, longitude' string. CONSOLIDATION: replaces the latitude/longitude pair (2026-08-15 review) — one concept, one token; the caller formats the pair.",
+   "aliases": [
+    "latitude",
+    "longitude"
+   ]
+  },
+  "frame_images": {
+   "kind": "blocks",
+   "description": "A list of SINGLE full-frame images as content blocks (one frame per image). v5's scene/shot frame helpers are explicit that grid tiling is NOT used on these paths — grids downscale small marks (logos, credit text) into illegibility. The scene/shot granularity is the caller's context, not a payload difference.",
+   "aliases": [
+    "scene_frame_images",
+    "shot_frame_images"
+   ]
+  },
+  "face_images": {
+   "kind": "blocks",
+   "description": "Face crops/grid as image content blocks — semantically distinct from frame_images (both appear in one prompt), so NOT consolidated into it."
+  },
+  "image": {
+   "kind": "blocks",
+   "description": "THE single source image (image-caption). Kept distinct from frame_images: one subject image is a different contract than sampled frames. Candidate for a later rename to source_image if a second single-image prompt appears."
+  },
+  "sound_events": {
+   "kind": "text",
+   "description": "Detected sound events for the chunk/scene.",
+   "aliases": [
+    "sound_event"
+   ]
+  },
+  "sentiment": {
+   "kind": "text",
+   "description": "Scene-enrichment leaf: sentiment label(s)."
+  },
+  "camera_shot_type": {
+   "kind": "text",
+   "description": "Scene-enrichment leaf: camera shot type label.",
+   "aliases": [
+    "camera_shot"
+   ]
+  },
+  "named_entities": {
+   "kind": "json",
+   "description": "Scene-enrichment leaf: extracted named entities."
+  },
+  "texts_on_screen": {
+   "kind": "json",
+   "description": "Scene-enrichment leaf: OCR'd on-screen text.",
+   "aliases": [
+    "text_on_screen"
+   ]
+  },
+  "logo": {
+   "kind": "json",
+   "description": "Scene-enrichment leaf: detected logos."
+  },
+  "signals": {
+   "kind": "json",
+   "description": "Scene-enrichment leaf: auxiliary detection signals (program-structure's signals_enriched variant)."
+  },
+  "scene_descriptions": {
+   "kind": "json",
+   "description": "The per-scene enrichment payloads (a LIST — one entry per scene; v5's mapSceneStructure builds exactly this value); composite tokens use this as the ROOT with leafs naming the fields to include. The leaf list is functional: the caller traverses it to decide what to fetch and format.",
+   "aliases": [
+    "scene_description"
+   ]
+  },
+  "segment_descriptions": {
+   "kind": "json",
+   "description": "The per-segment payloads (a LIST; v5's mapSegmentStructure builds exactly this value) — the grouping root for hierarchical tokens ({{segments:scene_descriptions:...}}).",
+   "aliases": [
+    "segments"
+   ]
+  },
+  "grid_images": {
+   "kind": "blocks",
+   "description": "A list of TILED grid images, each compositing multiple frames (scene-metadata's grid preparation). A DIFFERENT contract from frame_images — one image : many frames — kept canonical, not an alias."
+  },
+  "program_names": {
+   "kind": "text",
+   "description": "One or more program names, comma-separated. CONSOLIDATION (2026-08-15 review round 4): `program_name` (a single known title) and `potential_program_names` (candidates while identification is the task) carry the SAME data — names of the program, 1..N — and the epistemic framing belongs to the prompt's prose, not the token. No v5 prompt used both, so the merge collides nowhere.",
+   "aliases": [
+    "program_name",
+    "potential_program_names"
+   ]
+  },
+  "relevant_tags": {
+   "kind": "json",
+   "description": "Scene-enrichment leaf: 3-5 thematic tags per scene. CANONICAL BY THE VALUE-NAME PRECEDENT (round 8): scene-metadata-enrichment's output schema names the field relevant_tags, and v5's value-builder emits {relevant_tags: [...]} into each scene payload — so the JSON the model reads carries this key even where the token leaf was spelled tags/tag. Same rule that chose scene_descriptions/segment_descriptions.",
+   "aliases": [
+    "tags",
+    "tag"
+   ]
+  },
+  "span_context": {
+   "kind": "text",
+   "provided_by": "workflow",
+   "description": "WORKFLOW-PROVIDED. Frame-inspection's span framing: which programme span the frames cover (start/end seconds, shot kinds, which chunk of the selection this record carries). Injected by frame-inspection-on-aws; prompt authors declare it to receive the value, never compute it. SINGULAR: a container noun — one context blob per record."
+  },
+  "question": {
+   "kind": "text",
+   "provided_by": "workflow",
+   "description": "WORKFLOW-PROVIDED. claim-verify's per-span question: the visual claim under test, written by the CALLER (rides the request and its identity — a new question is a new run). Injected by frame-inspection-on-aws. SINGULAR: one question per record by design; a batch of claims is a batch of records, never a list in one prompt."
+  },
+  "body": {
+   "kind": "text",
+   "description": "The fully assembled user-prompt body. Used by the audio-description categories (ad-* , 2026-08-31): their evidence assembly is code-side in the workflow, so the registry carries the JUDGMENT text (the system prompt) and the user template is one slot."
+  }
+ }
+}

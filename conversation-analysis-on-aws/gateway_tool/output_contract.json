@@ -1,0 +1,128 @@
+{
+  "contract_version": 1,
+  "target": "conversation-analysis",
+  "stability": "Three labeled FILE outputs under micro-workflow/conversation-analysis/{workflow_id}/. Labels and basenames are stable API; the field names and nesting shown in each example are stable API — removing or renaming any is a breaking change requiring a TOOL_VERSION bump and a changelog note here. Anything else under the run prefix (_plan/, records.jsonl) is internal and may change without notice. Raw per-chunk model responses live at each bedrock-inference run's own prefix — the chunk-manifest is the pointer, never a copy.",
+  "outputs": {
+    "analysis": {
+      "kind": "file",
+      "basename": "conversation_analysis.json",
+      "mime": "application/json",
+      "description": "THE product: merged, coverage-validated topic segments with authoritative timestamps resolved from the transcript by cue id (timestamps never pass through a model) — use for chapters, topic navigation, editorial summaries, downstream indexing",
+      "example": {
+        "overall_content_type": "Episodic",
+        "top_3_genres": [
+          "Drama",
+          "Mystery",
+          "Supernatural"
+        ],
+        "audio_segments": [
+          {
+            "start_id": 0,
+            "end_id": 60,
+            "start_time": "00:00:26.944",
+            "end_time": "00:03:23.546",
+            "segment_topic": "Investigation briefing",
+            "reasoning": "…",
+            "named_entities": [
+              "El Matador"
+            ],
+            "key_events": [
+              "…"
+            ],
+            "sentiment": "negative, mysterious",
+            "tone": "serious",
+            "conversation_type": "narrative dialogue",
+            "discourse_facts": [
+              {
+                "kind": "threat_of_violence",
+                "cue_id": 41,
+                "quote": "if he talks, he won't make it to the trial"
+              }
+            ]
+          }
+        ],
+        "segments_gap": [],
+        "provenance": {
+          "prompt": {
+            "category": "conversation-analysis",
+            "version": "default",
+            "source_md5": "d197c04a6eac1f56a371f68da8d561ef"
+          },
+          "model_chain": [
+            "anthropic.claude-sonnet-4-6"
+          ],
+          "transcript_s3uri": "s3://<bucket>/micro-workflow/speech-diarization/<id>/transcripts/final_transcript.json",
+          "transcript_format": "diarization-json",
+          "chunk_count": 1,
+          "history_scope": "transcript.<diarization-workflow-id>",
+          "tool_version": "alpha.20260818a"
+        }
+      },
+      "notes": "start_id/end_id reference the transcript's cue ids; start_time/end_time are resolved from the transcript, never model-emitted. discourse_facts may carry `attribution_overlapped_with` (2026-09-18): the cue falls inside a diarization cross-talk span, so the quote could belong to the listed other voice(s) — recorded ambiguity from suggestive upstream evidence (precision 81% en / 56-69% zh, measured on the development corpus), never a re-attribution. `segments_gap` lists cue-id ranges left uncovered — honest partial coverage on a SUCCEEDED run (partial success IS success); the rerun mechanism is a fresh idempotency_token on analyze_conversation, which re-renders identical records under a NEW inference identity. `content_type_candidates` appears ONLY when chunks disagreed with no strict majority: the deduped candidates, coverage-weight-ordered, with overall_content_type still the top-weighted value — reported, never adjudicated by another inference."
+    },
+    "chunk-manifest": {
+      "kind": "file",
+      "basename": "chunk_manifest.json",
+      "mime": "application/json",
+      "description": "Full traceability without copying data: the chunk plan (cut tiers, gaps, budgets) and POINTERS to each bedrock-inference run — use to audit any segment back to the exact rendered request and raw model response",
+      "example": {
+        "workflow_id": "…",
+        "budget_tokens": 15000,
+        "chunks": [
+          {
+            "index": 0,
+            "start_id": 0,
+            "end_id": 87,
+            "cut_tier": "end",
+            "cut_gap_s": 0.0,
+            "est_tokens": 1918.9,
+            "context_start_pos": null,
+            "resolved": true
+          }
+        ],
+        "inference_runs": [
+          {
+            "workflow_id": "…",
+            "job_id": "arn:…",
+            "output_s3_prefix": "s3://…/micro-workflow/bedrock-inference/…",
+            "records_s3uri": "s3://…/records.jsonl",
+            "record_count": 1,
+            "absorbed": false,
+            "history_key": "micro-workflow/histories/…"
+          }
+        ]
+      },
+      "notes": "cut_tier ∈ strong-pause | weak-pause | speaker-change | hard-cut | end. Each inference run's own request.jsonl (exact rendered bytes), response.jsonl and summary.json live at its output_s3_prefix — this manifest is the join."
+    },
+    "usage": {
+      "kind": "file",
+      "basename": "usage_tracking.json",
+      "mime": "application/json",
+      "description": "Aggregated cost and token accounting across every chunk inference run (model fallbacks included) — use for spend attribution; each run's own usage_tracking.json has the per-state breakdown",
+      "example": {
+        "workflow_id": "…",
+        "tool_version": "alpha.20260818a",
+        "written_at_ms": 1787000000000,
+        "inference_runs": [
+          {
+            "workflow_id": "…",
+            "inference_mode": "sync",
+            "mode_reason": "…",
+            "records_succeeded": 1,
+            "records_failed": 0,
+            "models_used": [
+              "…"
+            ],
+            "estimated_cost": 0.0088,
+            "usage_uri": "s3://…/usage_tracking.json"
+          }
+        ],
+        "total_estimated_cost": 0.0088,
+        "cost_is_complete": true,
+        "total_input_tokens": 4636,
+        "total_output_tokens": 834
+      },
+      "notes": "cost_is_complete is false when any run priced incompletely (unpriced model rounds) — check it before quoting the figure, the same discipline as bedrock-inference's own summary."
+    }
+  }
+}

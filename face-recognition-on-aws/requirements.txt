@@ -1,0 +1,19 @@
+# requirements.txt
+# Pinned for reproducibility.
+# boto3/botocore are included in the Lambda base image but pinned here
+# so the version is explicit and not silently upgraded by AWS.
+
+# ── AWS ───────────────────────────────────────────────────────────────────────
+boto3==1.40.4
+botocore==1.40.4
+
+# ── Numerics ──────────────────────────────────────────────────────────────────
+numpy==2.4.2           # cp313 aarch64 manylinux wheel
+
+# ── Imaging ───────────────────────────────────────────────────────────────────
+# pyvips[binary] bundles libvips (like sharp does in Node) — no system install.
+# Unconditional, hard dependency — no fallback anywhere in this codebase.
+# Used for: frame triage decode (thumbnail shrink-on-load, releases the GIL so
+# ThreadPoolExecutor scales across cores), grid compositing (arrayjoin +
+# streaming JPEG write), headshot crops, debug montages.
+pyvips[binary]==3.0.0

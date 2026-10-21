@@ -1,0 +1,345 @@
+{
+ "Comment": "audio-description: sibling run pointers -> understand (name map + watch notes) -> window plan (code) -> chunked writer + critic -> TTS synth/fit with a bounded reask loop -> the SEQUENTIAL repair chain -> coverage oracles + derived ledger + srt/vtt/DAPT/review.html + the render_manifest for media-processing's ad_mix group (the mix is a chained process_media call; this workflow renders no audio). The stage graph was validated by repeated zero-hand-edit runs scored against a corpus of professionally authored AD cues (README.md Design record #8). LOOP SHAPE: every multi-submission stage is ONE waitForTaskToken Task + ONE Choice — a sibling callback re-enters the same state (its payload carries no ad_loop_done), and the Lambda resolves its OWN token with {ad_loop_done: true} when the loop is finished, so no Choice ever depends on a sibling's payload shape. FAN-OUT extension: a loop with N independent tts shards resolves its own token with {tts_shard_tags} instead and the Choice routes through an inline Map — one waitForTaskToken Task per shard, each against ITS OWN token (a single token cannot wait for N callbacks: the first consumes it, the rest are TOKEN_GONE and the state sleeps to its deadman). Shard specs live in the checkpoint; the payload carries only tags. tts is Lambda-driven with no service throttle, so MaxConcurrency is unbounded. S3 checkpoints are the single source of truth; redrive IS the reconcile. Prompts are FIVE registry categories (frame-inspection's credits-read evidence arrives via the cast-resolution run's conditional credits output), iterable pre-GA. Readability copy of the template's inline DefinitionString; edit BOTH, the build fails on drift.",
+ "StartAt": "Validate and plan",
+ "TimeoutSeconds": 172800,
+ "States": {
+  "Validate and plan": {
+   "Type": "Task",
+   "Comment": "Refuse before any spend: all sibling run pointers validated (shot-seg, enrichment incl. the AD fields, diarization transcript, CA, face-rec; OPTIONAL audiostem, reviewer decisions.json, cast-resolution persons.json + conditional credits.json), all five prompt categories bound, voice pinned, sung_vocal_policy validated (narrate|avoid, default narrate — user decision 2026-08-31), supplied sibling ARTIFACTS probed (a typo'd pointer refuses by name, never a NoSuchKey mid-run; decisions.json deliberately unprobed — absence is the designed nothing-accepted state). The mix parameter is refused at the GATEWAY (this workflow renders no audio). Persists _plan/plan.json.",
+   "Resource": "arn:aws:states:::lambda:invoke",
+   "Parameters": {
+    "FunctionName": "${WorkflowLambdaArn}",
+    "Payload": {
+     "operation": "ValidateAndPlan",
+     "uuid.$": "$.uuid",
+     "input.$": "$.input"
+    }
+   },
+   "OutputPath": "$.Payload",
+   "Retry": [
+    {
+     "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+     "IntervalSeconds": 3,
+     "MaxAttempts": 4,
+     "BackoffRate": 2.0
+    }
+   ],
+   "Next": "Build name map and watch notes"
+  },
+  "Build name map and watch notes": {
+   "Type": "Task",
+   "Comment": "LOOP: name map (ad-name-map) then watch-through (ad-watch-notes) — two bedrock submissions in sequence through one re-entrant state. character_map.json + watch_notes.json.",
+   "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+   "Parameters": {
+    "FunctionName": "${WorkflowLambdaArn}",
+    "Payload": {
+     "operation": "Understand",
+     "uuid.$": "$.uuid",
+     "plan_s3uri.$": "$.plan_s3uri",
+     "task_token.$": "$$.Task.Token"
+    }
+   },
+   "ResultPath": "$.callback",
+   "TimeoutSeconds": 93600,
+   "Retry": [
+    {
+     "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+     "IntervalSeconds": 3,
+     "MaxAttempts": 4,
+     "BackoffRate": 2.0
+    }
+   ],
+   "Next": "Name map and watch notes complete?"
+  },
+  "Name map and watch notes complete?": {
+   "Type": "Choice",
+   "Choices": [
+    {
+     "Variable": "$.callback.ad_loop_done",
+     "IsPresent": true,
+     "Next": "Plan narration windows"
+    }
+   ],
+   "Default": "Build name map and watch notes"
+  },
+  "Plan narration windows": {
+   "Type": "Task",
+   "Comment": "Pure code: snap on-screen-text beats to the shots carrying them (the Meridian title-card root cause, fixed upstream), then windows + orientation (entry ladder, montage folds, reveals, honest budgets, sung-vocal policy).",
+   "Resource": "arn:aws:states:::lambda:invoke",
+   "Parameters": {
+    "FunctionName": "${WorkflowLambdaArn}",
+    "Payload": {
+     "operation": "PlanWindows",
+     "uuid.$": "$.uuid",
+     "plan_s3uri.$": "$.plan_s3uri"
+    }
+   },
+   "ResultPath": "$.windows_result",
+   "Retry": [
+    {
+     "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+     "IntervalSeconds": 3,
+     "MaxAttempts": 4,
+     "BackoffRate": 2.0
+    }
+   ],
+   "Next": "Write script"
+  },
+  "Write script": {
+   "Type": "Task",
+   "Comment": "LOOP: the WRITER (one pooled bedrock run, WINDOWS_PER_CHUNK-window records — record rendering is text assembly, seconds, so no Map) then the CRITIC, whose empty-a-duty-window edits are refused by a MECHANICAL veto. cues.json.",
+   "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+   "Parameters": {
+    "FunctionName": "${WorkflowLambdaArn}",
+    "Payload": {
+     "operation": "WriteScript",
+     "uuid.$": "$.uuid",
+     "plan_s3uri.$": "$.plan_s3uri",
+     "task_token.$": "$$.Task.Token"
+    }
+   },
+   "ResultPath": "$.callback",
+   "TimeoutSeconds": 93600,
+   "Retry": [
+    {
+     "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+     "IntervalSeconds": 3,
+     "MaxAttempts": 4,
+     "BackoffRate": 2.0
+    }
+   ],
+   "Next": "Script written and critiqued?"
+  },
+  "Script written and critiqued?": {
+   "Type": "Choice",
+   "Choices": [
+    {
+     "Variable": "$.callback.ad_loop_done",
+     "IsPresent": true,
+     "Next": "Synthesize and fit"
+    }
+   ],
+   "Default": "Write script"
+  },
+  "Synthesize and fit": {
+   "Type": "Task",
+   "Comment": "LOOP: tts main shards fanned out in PARALLEL through 'Synthesize shards in parallel' (shard specs checkpointed, one token per shard) -> fit every take against the true next-word onset (tempo cap) -> bounded reask rounds (bedrock rewrite + fanned tts) for the over-budget -> collide -> placed.json + write-through drops.json. Never a chipmunk, never an overlap.",
+   "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+   "Parameters": {
+    "FunctionName": "${WorkflowLambdaArn}",
+    "Payload": {
+     "operation": "SynthFit",
+     "uuid.$": "$.uuid",
+     "plan_s3uri.$": "$.plan_s3uri",
+     "task_token.$": "$$.Task.Token"
+    }
+   },
+   "ResultPath": "$.callback",
+   "TimeoutSeconds": 93600,
+   "Retry": [
+    {
+     "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+     "IntervalSeconds": 3,
+     "MaxAttempts": 4,
+     "BackoffRate": 2.0
+    }
+   ],
+   "Next": "All takes fitted?"
+  },
+  "All takes fitted?": {
+   "Type": "Choice",
+   "Choices": [
+    {
+     "Variable": "$.callback.ad_loop_done",
+     "IsPresent": true,
+     "Next": "Repair defects one at a time"
+    },
+    {
+     "Variable": "$.callback.tts_shard_tags",
+     "IsPresent": true,
+     "Next": "Synthesize shards in parallel"
+    }
+   ],
+   "Default": "Synthesize and fit"
+  },
+  "Synthesize shards in parallel": {
+   "Type": "Map",
+   "Comment": "One iteration = one tts shard against ITS OWN task token; the loop state checkpointed every shard's spec before resolving its token with the tags. ResultPath is discarded — callbacks are signals, the fit leg reads the submit register from S3.",
+   "ItemsPath": "$.callback.tts_shard_tags",
+   "ItemSelector": {
+    "uuid.$": "$.uuid",
+    "plan_s3uri.$": "$.plan_s3uri",
+    "tag.$": "$$.Map.Item.Value"
+   },
+   "MaxConcurrency": 0,
+   "ItemProcessor": {
+    "ProcessorConfig": {
+     "Mode": "INLINE"
+    },
+    "StartAt": "Submit one synth shard",
+    "States": {
+     "Submit one synth shard": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+       "FunctionName": "${WorkflowLambdaArn}",
+       "Payload": {
+        "operation": "SubmitTtsShard",
+        "loop": "synth",
+        "uuid.$": "$.uuid",
+        "plan_s3uri.$": "$.plan_s3uri",
+        "tag.$": "$.tag",
+        "task_token.$": "$$.Task.Token"
+       }
+      },
+      "TimeoutSeconds": 93600,
+      "Retry": [
+       {
+        "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+        "IntervalSeconds": 3,
+        "MaxAttempts": 4,
+        "BackoffRate": 2.0
+       }
+      ],
+      "End": true
+     }
+    }
+   },
+   "ResultPath": null,
+   "Next": "Synthesize and fit"
+  },
+  "Repair defects one at a time": {
+   "Type": "Task",
+   "Comment": "LOOP: the fixed repair SEQUENCE (revive entries, overlap fixes, entry succession, beat repair, reveal apparatus, role descriptors, on-screen-text claims, name leaks, tail block, redundancy+differentiate) — each step: mechanical trigger -> optional ONE bedrock ask + its re-tts shards fanned in parallel through 'Re-synthesize repaired shards' -> apply under the unified failure policy; deletions only through the coverage-neutrality guard; checkpoint per step. The PASSES stay strictly sequential — each accepted repair changes the placements the next pass collides against.",
+   "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+   "Parameters": {
+    "FunctionName": "${WorkflowLambdaArn}",
+    "Payload": {
+     "operation": "RepairChain",
+     "uuid.$": "$.uuid",
+     "plan_s3uri.$": "$.plan_s3uri",
+     "task_token.$": "$$.Task.Token"
+    }
+   },
+   "ResultPath": "$.callback",
+   "TimeoutSeconds": 93600,
+   "Retry": [
+    {
+     "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+     "IntervalSeconds": 3,
+     "MaxAttempts": 4,
+     "BackoffRate": 2.0
+    }
+   ],
+   "Next": "Repair chain complete?"
+  },
+  "Repair chain complete?": {
+   "Type": "Choice",
+   "Choices": [
+    {
+     "Variable": "$.callback.ad_loop_done",
+     "IsPresent": true,
+     "Next": "Finalize"
+    },
+    {
+     "Variable": "$.callback.tts_shard_tags",
+     "IsPresent": true,
+     "Next": "Re-synthesize repaired shards"
+    }
+   ],
+   "Default": "Repair defects one at a time"
+  },
+  "Re-synthesize repaired shards": {
+   "Type": "Map",
+   "Comment": "Within-pass re-tts shards in parallel — same mechanism as 'Synthesize shards in parallel'; the passes themselves stay sequential (data dependency, not throttling).",
+   "ItemsPath": "$.callback.tts_shard_tags",
+   "ItemSelector": {
+    "uuid.$": "$.uuid",
+    "plan_s3uri.$": "$.plan_s3uri",
+    "tag.$": "$$.Map.Item.Value"
+   },
+   "MaxConcurrency": 0,
+   "ItemProcessor": {
+    "ProcessorConfig": {
+     "Mode": "INLINE"
+    },
+    "StartAt": "Submit one repair shard",
+    "States": {
+     "Submit one repair shard": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+       "FunctionName": "${WorkflowLambdaArn}",
+       "Payload": {
+        "operation": "SubmitTtsShard",
+        "loop": "repair",
+        "uuid.$": "$.uuid",
+        "plan_s3uri.$": "$.plan_s3uri",
+        "tag.$": "$.tag",
+        "task_token.$": "$$.Task.Token"
+       }
+      },
+      "TimeoutSeconds": 93600,
+      "Retry": [
+       {
+        "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+        "IntervalSeconds": 3,
+        "MaxAttempts": 4,
+        "BackoffRate": 2.0
+       }
+      ],
+      "End": true
+     }
+    }
+   },
+   "ResultPath": null,
+   "Next": "Repair defects one at a time"
+  },
+  "Finalize": {
+   "Type": "Task",
+   "Comment": "Coverage oracles (beat, orientation — causes named), reviewer-accepted absences joined, the two-axis ledger DERIVED, srt/vtt/DAPT/review.html + render_manifest.json (per-take wav/at/tempo + af_chain — media-processing's ad_mix group consumes it).",
+   "Resource": "arn:aws:states:::lambda:invoke",
+   "Parameters": {
+    "FunctionName": "${WorkflowLambdaArn}",
+    "Payload": {
+     "operation": "Finalize",
+     "uuid.$": "$.uuid",
+     "plan_s3uri.$": "$.plan_s3uri"
+    }
+   },
+   "ResultPath": "$.finalize_result",
+   "Retry": [
+    {
+     "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+     "IntervalSeconds": 3,
+     "MaxAttempts": 4,
+     "BackoffRate": 2.0
+    }
+   ],
+   "Next": "Usage tracking"
+  },
+  "Usage tracking": {
+   "Type": "Task",
+   "Comment": "SUCCESS PATH ONLY, never raises; sums the write-through submit register's bedrock summaries and PROPAGATES cost_is_complete (a partial float is never reported as complete).",
+   "Resource": "arn:aws:states:::lambda:invoke",
+   "Parameters": {
+    "FunctionName": "${WorkflowLambdaArn}",
+    "Payload": {
+     "operation": "UsageTracking",
+     "uuid.$": "$.uuid",
+     "plan_s3uri.$": "$.plan_s3uri"
+    }
+   },
+   "OutputPath": "$.Payload",
+   "Retry": [
+    {
+     "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+     "IntervalSeconds": 3,
+     "MaxAttempts": 4,
+     "BackoffRate": 2.0
+    }
+   ],
+   "End": true
+  }
+ }
+}

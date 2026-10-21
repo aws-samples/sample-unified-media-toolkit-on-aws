@@ -1,0 +1,20 @@
+// Example SFN input for a direct (non-gateway) execution of the
+// speech-enhancement state machine. Values are invented placeholders.
+{
+  "uuid": "00000000-0000-5000-8000-000000000001",
+  "input": {
+    "s3uri": "s3://my-ingest-bucket/path/to/source.mp4",
+    "input_config": {
+      "model_id": "deepfilternet3",
+      "fixed_chunk_size_secs": 360
+    }
+  },
+  "output": {
+    "s3uri": "s3://my-proxy-bucket/micro-workflow/speech-enhancement/00000000-0000-5000-8000-000000000001",
+    "output_config": {
+      "output_resampl_freq": 16000,
+      "atten_lim_db": null
+    }
+  },
+  "data": {}
+}

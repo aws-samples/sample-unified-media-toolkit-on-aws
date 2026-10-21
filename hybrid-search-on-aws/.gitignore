@@ -1,0 +1,28 @@
+# Ignore research phase files
+research_phase
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+venv*/
+.venv/
+*.egg-info/
+
+# Editors / IDE
+.vscode/
+.idea/
+*.swp
+
+# Claude Code session data
+.claude/
+
+# Build output — build-deploy-s3-dist.sh's staged zips/template, regenerable
+dist/
+
+# Local archives and logs
+*.zip
+*.tar.gz
+*.log

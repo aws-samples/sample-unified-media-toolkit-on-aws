@@ -1,0 +1,32 @@
+# Local working artifacts — run outputs, referee state, review pages,
+# POC evidence, and design records that carry identities the committed
+# tree never names (the no-customer-identifiers rule). ONE folder, one
+# rule: if it must not ship, it lives under do-not-commit/.
+do-not-commit/
+
+# skill-written run artifacts (analyze-video state, visualize-metadata
+# pages) — carry presigned URLs and deployment values, never committed
+outputs/
+
+# build artifacts (each workflow's build-deploy script owns its dist/)
+dist/
+build.log
+__pycache__/
+*.pyc
+
+# GOTCHAS.md stays LOCAL by decision (2026-10-06): the sharp-edges
+# journals carry customer/asset identities; they live beside the code
+# on dev machines and in do-not-commit backups, never in the repo —
+# history was purged of them before the first push.
+GOTCHAS.md
+
+# IDE / agent workspace config — local for now (how to share these
+# across Claude Code and Kiro is an open decision; the skills
+# themselves are committed under media-toolkit-gateway/skills/)
+.claude/
+.kiro/
+.mcp.json
+.gateway-mcp-headers.sh
+gateway_headers.*
+
+.DS_Store

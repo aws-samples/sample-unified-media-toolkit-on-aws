@@ -1,0 +1,234 @@
+{
+  "contract_version": 1,
+  "target": "audio-stem",
+  "stability": "Every entry in `outputs` is stable API: labels, basenames, and the field names/nesting shown in each example. Removing or renaming any of them is a breaking change and requires a TOOL_VERSION bump plus a changelog note here. Files NOT listed here (per-chunk intermediates under segment_chunks/, the resampled/ conversion intermediate) are internal and may change or vanish without notice. `description` is one line by design — it is joined verbatim into each get_job_status outputs[] entry as `desc`.",
+  "outputs": {
+    "speech": {
+      "basename": "audio_speech.wav",
+      "kind": "file",
+      "mime": "audio/wav",
+      "description": "Speech-only stem WAV (Bandit v2; 16 kHz mono default, configurable) — listening/reference product (review lanes, voice ID); not recommended as an ASR/diarization input today (the original mix measured better and is the validated default); absent when speech_stem=false",
+      "example": null,
+      "contents": {
+        "format": "RIFF/WAVE, 16-bit PCM, mono, one data chunk — full source duration, chunks already concatenated",
+        "sample_rate": "16000 Hz default; per-request via speech_resampl_freq (8000/16000/32000/44100/48000/96000)"
+      },
+      "notes": "Bandit v2 separated speech stem (dialogue, voiceover, commentary). The 16 kHz default suits reference-audio consumers and ASR engines alike. Measured on the CURRENT model: the stem deletes low-prominence speech outright and lost to the original mix on word error rate — so the mix is the validated transcription/diarization input and feeding the stem instead is not recommended today; if you do, compare against a mix-based transcript. The model will improve and this will be re-measured. rms_db/duration_sec for QC live in the metrics file's stem_summary.speech."
+    },
+    "music": {
+      "basename": "audio_music.wav",
+      "kind": "file",
+      "mime": "audio/wav",
+      "description": "Music-only stem WAV (Bandit v2; 48 kHz mono default, configurable) — use for music ID, audio timeline lanes, remixing; absent when music_stem=false",
+      "example": null,
+      "contents": {
+        "format": "RIFF/WAVE, 16-bit PCM, mono, one data chunk — full source duration, chunks already concatenated",
+        "sample_rate": "48000 Hz default; per-request via music_resampl_freq (8000/16000/32000/44100/48000/96000)"
+      },
+      "notes": "Bandit v2 separated music stem (score, theme music, jingles). The 48 kHz default preserves full fidelity for remixing and music identification. rms_db/duration_sec for QC live in the metrics file's stem_summary.music."
+    },
+    "sfx": {
+      "basename": "audio_sfx.wav",
+      "kind": "file",
+      "mime": "audio/wav",
+      "description": "SFX/ambience stem WAV (Bandit v2; 32 kHz mono default, configurable) — use for effects lanes, remixing, audio activity detection; absent when sfx_stem=false",
+      "example": null,
+      "contents": {
+        "format": "RIFF/WAVE, 16-bit PCM, mono, one data chunk — full source duration, chunks already concatenated",
+        "sample_rate": "32000 Hz default; per-request via sfx_resampl_freq (8000/16000/32000/44100/48000/96000)"
+      },
+      "notes": "Bandit v2 separated effects stem (sound effects, ambience, foley). rms_db/duration_sec for QC live in the metrics file's stem_summary.sfx."
+    },
+    "speech-safe": {
+      "basename": "audio_speech_safe.wav",
+      "kind": "file",
+      "mime": "audio/wav",
+      "description": "Gated-mix speech WAV (opt-in via speech_safe=true; 48 kHz mono default): the speech stem with attenuated ORIGINAL mix patched into the spans the separator deleted (quiet/background speech), crossfaded — guaranteed never silent where the source had sound. Use it wherever the track is played or mixed: audio-description mixes, review/QC playback, dialogue-forward renders. As an ASR input the original mix measured better pooled and is the validated default, while music-heavy episodes measured ahead on speech_safe — compare per content class",
+      "example": null,
+      "contents": {
+        "format": "RIFF/WAVE, 16-bit PCM, mono, one data chunk — full source duration, chunks already concatenated",
+        "sample_rate": "48000 Hz default; per-request via speech_safe_resampl_freq (8000/16000/32000/44100/48000/96000)"
+      },
+      "notes": "The separation model deletes low-prominence speech outright (whispers, phone voices, background talkers — a property of its training data; no inference knob recovers it). Inside each deleted span this file carries attenuated original mix (speech plus reduced background) instead of silence; everywhere else it is the raw speech stem unchanged. Patched spans are therefore MIX-flavored, not separated — the per-run gap evidence is stem_activity.json's speech_stem_gaps lane, and per-chunk patch spans with the gate parameters live in each segment_chunks/chunk_NNN.json. audio_speech.wav is unaffected and still produced per speech_stem. As an ASR input (measured, 27-ep caption corpus): the original mix is the validated default (11.08% vs speech_safe 12.22% pooled WER); speech_safe measured AHEAD of the mix on music-heavy/uncaptioned-heavy episodes (it suppresses sung-lyric hallucinations) and recovered 3,669 stem-deleted words vs the bare stem — if you feed it to ASR, compare against a mix transcript for your content class first."
+    },
+    "metrics": {
+      "basename": "audiostem_sep.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Aggregate separation metrics (per-stem summary, timings, per-chunk summaries) — use for QC via rms_db/duration_sec and locating stem WAVs via output_keys; keys track the stems actually produced",
+      "example": {
+        "model_id": "bandit_v2",
+        "audio_bucket": "<bucket>",
+        "audio_key": "<media-processing run prefix>/audiostem_sep/audio_48k_mono.wav",
+        "total_chunks": 12,
+        "stems_produced": [
+          "speech",
+          "music",
+          "sfx"
+        ],
+        "output_bucket": "<bucket>",
+        "output_keys": {
+          "speech": "<prefix>/audio_speech.wav"
+        },
+        "stem_summary": {
+          "speech": {
+            "s3_key": "<prefix>/audio_speech.wav",
+            "resampl_freq": 16000,
+            "rms_db": -28.4,
+            "duration_sec": 2112.0,
+            "size_bytes": 67584044
+          }
+        },
+        "timing_ms": {
+          "total_wall": 19822.0,
+          "total_compute": 214511.0,
+          "avg_chunk": 17875.9,
+          "slowest_chunk": "chunk_007"
+        },
+        "chunks": [
+          {
+            "chunk_idx": 0,
+            "chunk_name": "chunk_000",
+            "fetch_start_sec": 0.0,
+            "fetch_end_sec": 176.0,
+            "timing_ms": {
+              "model_load": 950.0,
+              "s3_read": 320.0,
+              "encoder": 11200.0,
+              "speech_decoder": 540.0,
+              "music_decoder": 510.0,
+              "sfx_decoder": 490.0,
+              "resample_write": 85.0,
+              "total": 13145.0
+            },
+            "stems": {
+              "speech": {
+                "rms_db": -28.4,
+                "duration_sec": 176.0
+              }
+            },
+            "metrics_key": "<prefix>/segment_chunks/chunk_000.json",
+            "elapsed_sec": 13.1
+          }
+        ],
+        "elapsed_sec": 21.4
+      },
+      "notes": "output_keys, stem_summary, and each chunks[].stems dict are keyed per ACTIVE stem and carry an entry for every name in stems_produced — the example shows one; speech_safe appears as its own name there when requested. chunks[].timing_ms `{stem}_decoder` keys track the decoders that RAN — speech_safe=true runs the speech decoder even when speech_stem=false, so speech_decoder can appear without a speech entry in stems_produced. audio_key is the 48 kHz mono WAV the model actually consumed: the source itself on the WAV fast path, resampled/audio_48k_mono.wav (internal) or the wav under media-processing's own run prefix when conversion ran. timing_ms.total_wall is the slowest chunk (Map runs in parallel); total_compute is the sum. Each chunks[].metrics_key points at that chunk's own segment_chunks/chunk_NNN.json — an internal file, not contract."
+    },
+    "stem-activity": {
+      "basename": "stem_activity.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Semantic audio timelines: per-lane activity spans (original = non-silence of the mix; each active stem = energy above threshold), the speech_stem_gaps lane (mix active while the speech stem is near-silent — audio the stem does not cover; an upper bound on deleted speech, since music/sfx-only passages qualify too), plus line-up tones measured on the original — use for ad-break/dialogue-gap logic, stem-coverage visibility, and bars-and-tone joins; deliberately carries NO bars_and_tone verdict, that is the fusion layer's call; absent (with stem_waveforms) on pre-alpha.20260826a runs and when the analysis pass degraded — stem WAVs are unaffected",
+      "example": {
+        "params": {
+          "bin_ms": 50,
+          "activity_threshold_dbfs": -45.0,
+          "activity_min_span_ms": 500,
+          "activity_merge_gap_ms": 1000,
+          "speech_stem_gap_threshold_dbfs": -55.0,
+          "speech_stem_gap_min_span_ms": 250,
+          "speech_stem_gap_merge_ms": 500,
+          "tone_frame_ms": 250,
+          "tone_min_purity": 0.85,
+          "tone_freqs_hz": [
+            400,
+            1000,
+            2000
+          ],
+          "tone_tolerance": 0.02,
+          "tone_min_level_dbfs": -45.0,
+          "tone_pop_max_ms": 500,
+          "tone_max_level_std_db": 3.0
+        },
+        "activity": {
+          "original": [
+            [
+              0,
+              5250
+            ]
+          ],
+          "speech": [
+            [
+              1200,
+              4850
+            ]
+          ]
+        },
+        "speech_stem_gaps": [
+          [
+            5100,
+            7450
+          ]
+        ],
+        "tones": [
+          {
+            "start_ms": 0,
+            "end_ms": 30000,
+            "freq_hz": 998.6,
+            "nominal_hz": 1000,
+            "kind": "steady"
+          }
+        ]
+      },
+      "notes": "speech_stem_gaps is present exactly when speech_stem was enabled — it compares the mix envelope against the RAW speech envelope at absolute dBFS (which only exists here; the waveform JSON is peak-normalized), so speech_safe alone cannot produce it: the patched lane would hide the very gaps it exists to show. A gap means the source wasn't silent but the speech stem is — in dialogue regions that is deletion evidence; in music/sfx-only passages it is correct rejection, so the lane is an UPPER BOUND on deleted speech and naming what a gap MEANS is the fusion layer's job (join with the transcript or diarization). The lane and the speech_safe patch gate are DIFFERENT instruments and neither is a subset of the other: the lane reads the DELIVERED (resampled) stem with a 500 ms bridge and 250 ms minimum span, while the patch gate runs pre-resample with a lower mix floor, a 250 ms bridge, and no minimum span. The authoritative record of what audio_speech_safe.wav patched is each chunk's segment_chunks/chunk_NNN.json patch spans (internal)."
+    },
+    "stem-waveforms": {
+      "basename": "stem_waveforms.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Rendering envelopes: peak-normalized per-bin RMS for the original mix and each active stem at params.bin_ms resolution — use to draw timeline waveform lanes without reading the WAVs; absent on pre-alpha.20260826a runs and when the analysis pass degraded",
+      "example": {
+        "params": {
+          "bin_ms": 50
+        },
+        "original": {
+          "rms": [
+            0.12,
+            0.83,
+            0.79
+          ]
+        },
+        "speech": {
+          "rms": [
+            0.0,
+            0.61,
+            0.66
+          ]
+        }
+      }
+    },
+    "usage": {
+      "basename": "usage_tracking.json",
+      "kind": "file",
+      "mime": "application/json",
+      "description": "Per-state durations and estimated cost, media-processing child included when conversion ran — use for reporting what this run cost",
+      "example": {
+        "execution_arn": "arn:aws:states:...",
+        "audio_bucket": "<bucket>",
+        "audio_key": "<media-processing run prefix>/audiostem_sep/audio_48k_mono.wav",
+        "output_bucket": "<bucket>",
+        "usage_key": "<prefix>/usage_tracking.json",
+        "pipeline_wall_sec": 142.3,
+        "total_estimated_cost": 0.00412,
+        "states": [
+          {
+            "state_name": "Map audio stem separation processing",
+            "operation": "StateRunBanditV2Model",
+            "lambda_arn": "arn:aws:lambda:...",
+            "architecture": "arm64",
+            "memory_mb": 10240,
+            "invocations": 12,
+            "retried": 0,
+            "wall_sec": 19.8,
+            "total_billed_sec": 214.5,
+            "incomplete": false,
+            "estimated_cost": 0.0029
+          }
+        ],
+        "media_processing": null
+      },
+      "notes": "Costs are us-east-1 arm64 estimates, not billing data. media_processing is null unless the source needed format conversion; when present it is {execution_arn, pipeline_wall_sec, estimated_cost, states} sourced from media-processing's own published usage_tracking.json (its states entries follow THAT stack's usage shape, not this one's), and its estimated_cost is already summed into total_estimated_cost. The final 'Usage tracking' states entry estimates its own duration (its terminal event has not fired when it writes this file) and omits retried/incomplete. retried counts billed failed attempts; incomplete is true only for an attempt with no terminal event in the history."
+    }
+  }
+}

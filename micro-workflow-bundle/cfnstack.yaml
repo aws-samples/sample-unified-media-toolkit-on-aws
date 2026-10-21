@@ -1,0 +1,891 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+    Unified Media Toolkit micro-workflow bundle — deploys all eight micro-workflow stacks
+    (media-processing, audiostem-separation, speech-diarization,
+    shot-segmentation, face-recognition, hybrid-search, text-to-speech) plus the
+    media-toolkit-gateway AgentCore Gateway that exposes them as MCP tools.
+    Version %%VERSION%%
+
+Metadata:
+    AWS::CloudFormation::Interface:
+        ParameterGroups:
+            -
+                Label:
+                    default: S3 Buckets — IngestBucket required
+                Parameters:
+                    - IngestBucket
+                    - ProxyBucket
+            -
+                Label:
+                    default: Resource Naming
+                Parameters:
+                    - Prefix
+            -
+                Label:
+                    default: AgentCore Gateway Configuration
+                Parameters:
+                    - GatewayName
+                    - Environment
+                    - OAuthScope
+                    - SecretsKmsKeyId
+        ParameterLabels:
+            IngestBucket:
+                default: Ingest Bucket (source media)
+            ProxyBucket:
+                default: Proxy Bucket (workflow outputs, leave blank to create one)
+            Prefix:
+                default: Resource Name Prefix
+            GatewayName:
+                default: Gateway Name
+            Environment:
+                default: Deployment Environment
+            OAuthScope:
+                default: OAuth Scope Identifier
+            SecretsKmsKeyId:
+                default: Credentials Secret KMS Key
+
+Parameters:
+    #
+    # IngestBucket has NO Default and must not gain one. It holds SOURCE MEDIA
+    # this bundle did not produce and cannot recreate, so a typo would deploy
+    # clean and then find nothing to process — a worse failure than being asked
+    # for the name.
+    #
+    IngestBucket:
+        Type: String
+        MinLength: 3
+        Description: >
+            S3 ingest bucket containing source media files. Must already exist.
+            Consumed by media-processing, shot-segmentation,
+            audiostem-separation, and speech-diarization.
+
+    #
+    # ProxyBucket is OPTIONAL, and that is a deliberate reversal. It used to be
+    # mandatory as a guard: six children run a proxy-bucket-validator custom
+    # resource whose handler CREATES the bucket on a 404 (bucket_validator.py
+    # _create), so a typo silently succeeded — it made a stray bucket and wrote
+    # every workflow output somewhere nobody was looking, and forcing the
+    # parameter was the only thing standing in the way.
+    #
+    # Leaving it blank now makes the bundle DECLARE the bucket instead, which
+    # removes the failure mode rather than guarding it: there is nothing to
+    # mistype. The validators still run and still check ownership/region, but
+    # their create path is unreachable in the bundle because the bucket already
+    # exists before any child starts.
+    #
+    # Keeping it settable is also the recovery path for a retained orphan — see
+    # the DeletionPolicy note on BundleProxyBucket.
+    #
+    ProxyBucket:
+        Type: String
+        Default: ""
+        Description: >
+            S3 proxy bucket that all workflows read and write outputs to, under
+            the micro-workflow/ prefix. Consumed by all eight children. LEAVE
+            BLANK to have this stack create and own one named
+            {Prefix}-{stack-id}-{account}-{region}-proxy; supply a name to reuse
+            an existing bucket (including a retained one from a deleted bundle).
+
+    #
+    # Prefix is the USER-SETTABLE part only. ResourcePrefix, handed to the seven
+    # workflow children, is "${Prefix}-${stack-id slice}" — see the Conditions
+    # note below for why the stack-id slice is not optional.
+    #
+    # MaxLength 14 is arithmetic, not taste, and it is a min() over every name
+    # derived from ResourcePrefix (= Prefix + 1 hyphen + 12 stack-id chars, so
+    # ResourcePrefix ≤ 27):
+    #
+    #   hybrid-search  -{account 12}-{region 14}-vectors  = 36 suffix, 63 limit -> 27  <-- binds
+    #   this template  -{account 12}-{region 14}-proxy    = 34 suffix, 63 limit -> 29
+    #   audiostem      -audiostem-separation-bucket-check = 34 suffix, 64 limit -> 30
+    #
+    # Worst-case region is 14 chars (ap-southeast-N); an account id is always
+    # 12. Before the validators were renamed to -bucket-check their 44-char
+    # suffix bound this at 20, i.e. Prefix ≤ 7 — so that rename is a
+    # prerequisite for this MaxLength, not a consistency nicety. README.md §P10
+    # item 10 has the full budget; test_units.py asserts every name still fits
+    # at ResourcePrefix=27.
+    #
+    Prefix:
+        Type: String
+        Default: umt
+        MinLength: 1
+        MaxLength: 14
+        AllowedPattern: "^[a-z0-9][a-z0-9-]*$"
+        Description: >
+            Prefix for resource names in the seven workflow child stacks. A
+            12-character slice of this stack's id is appended automatically, so
+            the effective prefix is {Prefix}-{stack-id}. Lowercase letters,
+            digits and hyphens only — it lands in S3 bucket names. The gateway
+            stack (media-toolkit-gateway) derives its GatewayName the same way when
+            GatewayName is left empty, so two bundles never collide by default.
+
+    # Empty (the default) derives {Prefix}-{stack-id slice} — the same
+    # per-stack derivation the workflow children get as ResourcePrefix — so
+    # every bundle's gateway stack is unique with no knob to remember.
+    # Setting it PINS the gateway's identity instead: the secret path
+    # /{GatewayName}/{Environment}/gateway-credentials is the one anchor
+    # every configured client re-discovers the endpoint through, so a
+    # pinned name survives a stack re-creation (region move, teardown and
+    # rebuild) with zero client reconfiguration, where a derived name
+    # changes with the new stack id. Existing stacks keep their stored
+    # value on update — CloudFormation retains previous parameter values —
+    # so this default change renames nothing that is already deployed.
+    GatewayName:
+        Type: String
+        Default: ""
+        Description: >
+            Name of the AgentCore Gateway (alphanumeric + hyphens, max 100
+            chars). Leave EMPTY to derive {Prefix}-{stack-id slice}
+            automatically (unique per bundle). Set it to pin a stable
+            gateway identity — the secret path and Cognito domain follow it,
+            and a pinned pair (GatewayName + Environment) must be unique per
+            ACCOUNT (the Cognito domain is a global namespace).
+
+    Environment:
+        Type: String
+        Default: dev
+        AllowedValues: [dev, staging, prod]
+        Description: >
+            Deployment environment. Part of the gateway stack's uniqueness key
+            alongside GatewayName.
+
+    OAuthScope:
+        Type: String
+        Default: media-workflows
+        MinLength: 1
+        Description: >
+            Cognito resource server Identifier. The full scope string is
+            constructed as <OAuthScope>/invoke.
+
+    SecretsKmsKeyId:
+        Type: String
+        Default: alias/aws/secretsmanager
+        MinLength: 1
+        Description: >
+            KMS key ID, ARN, or alias used to encrypt the gateway credentials
+            secret. Defaults to the AWS-managed Secrets Manager key.
+
+#
+# Only ONE condition, and it is not a per-region bucket split. There is
+# deliberately no bSingleRegion here — see the S3Bucket mapping note below for
+# why appending "-${AWS::Region}" to the staging bucket would be a second,
+# independent way to name the wrong bucket.
+#
+Conditions:
+    bCreateProxyBucket: !Equals
+        - !Ref ProxyBucket
+        - ""
+
+    bGatewayNameGiven: !Not
+        - !Equals
+            - !Ref GatewayName
+            - ""
+
+Mappings:
+    Solution:
+        Template:
+            #
+            # The RESOLVED staging bucket — the region suffix, if any, is
+            # already baked in by the build script. There is deliberately no
+            # bSingleRegion condition in this template appending
+            # "-${AWS::Region}", even though deployment/media2cloud.yaml does
+            # exactly that.
+            #
+            # Why: every child substitutes %%BUCKET_NAME%% with the bucket
+            # BASENAME while uploading its artifacts to
+            # "${BUCKET_NAME}-${BUCKET_REGION}" when --single-region is absent
+            # (verified in all eight build scripts). So a child staged without
+            # --single-region already carries a CodeBuild Source Bucket mapping
+            # pointing at a bucket that holds none of its artifacts — the
+            # children are only self-consistent under --single-region. Copying
+            # that split here would add a second, independent way for the
+            # composed TemplateURL to name the wrong bucket. Instead the build
+            # script resolves the staging bucket ONCE and writes the final
+            # value, so this mapping and the eight keys below always agree.
+            #
+            S3Bucket: "%%BUCKET_NAME%%"
+        Stack:
+            #
+            # Full "{solution}/{version}/{workflow}/{template}" key per child.
+            # One entry each rather than one shared KeyPrefix because every
+            # child carries its OWN .version (a bundle build with --version
+            # omitted stages eight different version prefixes on purpose, so
+            # that an untouched child keeps its S3 key and CodeBuild skips its
+            # image rebuild). The template basename is baked in for the same
+            # reason.
+            #
+            MediaProcessing:        "%%KEYPREFIX_MEDIA_PROCESSING%%"
+            AudiostemSeparation:    "%%KEYPREFIX_AUDIOSTEM_SEPARATION%%"
+            SpeechDiarization:      "%%KEYPREFIX_SPEECH_DIARIZATION%%"
+            SpeechEnhancement:      "%%KEYPREFIX_SPEECH_ENHANCEMENT%%"
+            ShotSegmentation:       "%%KEYPREFIX_SHOT_SEGMENTATION%%"
+            FaceRecognition:        "%%KEYPREFIX_FACE_RECOGNITION%%"
+            HybridSearch:           "%%KEYPREFIX_HYBRID_SEARCH%%"
+            Tts:                    "%%KEYPREFIX_TTS%%"
+            BedrockInference:       "%%KEYPREFIX_BEDROCK_INFERENCE%%"
+            PromptRegistry:         "%%KEYPREFIX_PROMPT_REGISTRY%%"
+            ConversationAnalysis:   "%%KEYPREFIX_CONVERSATION_ANALYSIS%%"
+            ShotMetadataEnrichment: "%%KEYPREFIX_SHOT_METADATA_ENRICHMENT%%"
+            FrameInspection:        "%%KEYPREFIX_FRAME_INSPECTION%%"
+            ProgramStructureAnalysis: "%%KEYPREFIX_PROGRAM_STRUCTURE_ANALYSIS%%"
+            AudioDescription:       "%%KEYPREFIX_AUDIO_DESCRIPTION%%"
+            CastResolution:          "%%KEYPREFIX_CAST_RESOLUTION%%"
+            ArtworkSelection:       "%%KEYPREFIX_ARTWORK_SELECTION%%"
+            M2cAgentTools:          "%%KEYPREFIX_M2C_AGENT_TOOLS%%"
+
+Resources:
+    #
+    # ORDERING. No explicit DependsOn appears anywhere in this template on
+    # purpose: CloudFormation derives nested-stack ordering from the
+    # !GetAtt references below, so MediaProcessingStack necessarily completes
+    # before its three consumers start, and M2cAgentToolsStack starts only
+    # after all eight ARNs exist. An explicit DependsOn would be redundant.
+    #
+    # ShotSegmentation, HybridSearch, and Tts reference nothing upstream and so
+    # start in parallel with MediaProcessing.
+    #
+    # No TimeoutInMinutes on any child. Seven of the eight build a container
+    # image in CodeBuild at stack-create time (60- and 90-minute CodeBuild
+    # timeouts), and tts additionally seeds six model archives to S3. A
+    # too-short stack timeout would roll back a build that was still healthy.
+    #
+
+    #
+    # Created only when ProxyBucket was left blank. Declaring the bucket is what
+    # makes the validators' create path unreachable here: CFN orders this before
+    # every child, because each child's ProxyBucket value !Refs it.
+    #
+    # RETAINED ON DELETE, and that has a consequence worth stating plainly: the
+    # name embeds a stack-id slice, so deleting and re-creating a bundle strands
+    # this bucket — with every workflow output in it — and the new bundle makes a
+    # different one. Retaining is still clearly right (this is where all the
+    # results live, unlike the rebuildable DDB tables, which deliberately do NOT
+    # retain), but it means TWO orphan classes per bundle lifecycle, this and
+    # hybrid-search's -vectors bucket. Sweep both by hand. To adopt a stranded
+    # bucket, pass its name as ProxyBucket — a non-empty bucket cannot be
+    # reclaimed automatically, which is why that parameter stays settable.
+    #
+    # UpdateReplacePolicy is the one that actually fires on a Prefix change:
+    # BucketName is replacement-forcing, so without it an edit to Prefix would
+    # DELETE the outputs. m2c sets both on its own proxy bucket for the same
+    # reason.
+    #
+    # Security floor only — public-access-block, AES256, DenyInsecureTransport —
+    # matching what the validator's _create() already applies. m2c's proxy bucket
+    # additionally carries access logging, CORS, transfer acceleration,
+    # versioning and an _ephemeraldata/ expiry rule; all four are deliberately
+    # skipped. Access logging would need a second retained -logs bucket, doubling
+    # the orphan problem for no gain; CORS and acceleration exist for m2c's
+    # browser-direct uploads and no micro-workflow serves a browser; no child
+    # writes under _ephemeraldata/ (they write under micro-workflow/); and
+    # versioning on regenerable outputs is cost without a recovery story.
+    #
+    BundleProxyBucket:
+        Condition: bCreateProxyBucket
+        Type: AWS::S3::Bucket
+        DeletionPolicy: Retain
+        UpdateReplacePolicy: Retain
+        Metadata:
+            checkov:
+                skip:
+                    - id: CKV_AWS_18
+                      comment: >-
+                        sample posture: bucket holds derived workflow
+                        outputs; access logging is the deployer's call
+                    - id: CKV_AWS_21
+                      comment: >-
+                        sample posture: outputs are deterministic per
+                        workflow_id; versioning is the deployer's call
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W35
+                        reason: Access logging would require a second retained bucket; workflow outputs are regenerable and the access-log volume is not worth a permanent orphan
+                    -
+                        id: W41
+                        reason: AES256 (SSE-S3) is the security floor here, matching what the child validators apply; a CMK would add per-request KMS cost across every workflow write
+                    -
+                        id: W51
+                        reason: A bucket policy IS attached (BundleProxyBucketPolicy, DenyInsecureTransport)
+        Properties:
+            BucketName: !Sub
+                - ${prefix}-${stackId}-${AWS::AccountId}-${AWS::Region}-proxy
+                -
+                    prefix: !Ref Prefix
+                    stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+            BucketEncryption:
+                ServerSideEncryptionConfiguration:
+                    -
+                        ServerSideEncryptionByDefault:
+                            SSEAlgorithm: AES256
+            PublicAccessBlockConfiguration:
+                BlockPublicAcls: true
+                BlockPublicPolicy: true
+                IgnorePublicAcls: true
+                RestrictPublicBuckets: true
+
+    BundleProxyBucketPolicy:
+        Condition: bCreateProxyBucket
+        Type: AWS::S3::BucketPolicy
+        Properties:
+            Bucket: !Ref BundleProxyBucket
+            PolicyDocument:
+                Statement:
+                    -
+                        Sid: DenyInsecureTransport
+                        Effect: Deny
+                        Principal: "*"
+                        Action: s3:*
+                        Resource:
+                            - !GetAtt BundleProxyBucket.Arn
+                            - !Sub ${BundleProxyBucket.Arn}/*
+                        Condition:
+                            Bool:
+                                aws:SecureTransport: false
+
+    MediaProcessingStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, MediaProcessing]
+            Parameters:
+                ResourcePrefix: !Sub
+                    - ${prefix}-${stackId}
+                    -
+                        prefix: !Ref Prefix
+                        stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                IngestBucket: !Ref IngestBucket
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+
+    AudiostemSeparationStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, AudiostemSeparation]
+            Parameters:
+                ResourcePrefix: !Sub
+                    - ${prefix}-${stackId}
+                    -
+                        prefix: !Ref Prefix
+                        stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                IngestBucket: !Ref IngestBucket
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+                # the family sibling pattern (2026-09-18): conversion goes
+                # through MP's gateway with a callback token, and MP's cost
+                # is read from its published usage_tracking.json — no
+                # machine ARN needed
+                MediaProcessingGatewayLambdaArn: !GetAtt MediaProcessingStack.Outputs.GatewayToolLambdaArn
+
+    SpeechEnhancementStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, SpeechEnhancement]
+            Parameters:
+                ResourcePrefix: !Sub
+                    - ${prefix}-${stackId}
+                    -
+                        prefix: !Ref Prefix
+                        stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                IngestBucket: !Ref IngestBucket
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+                # the family sibling pattern (2026-09-18): conversion goes
+                # through MP's gateway with a callback token, and MP's cost
+                # is read from its published usage_tracking.json — no
+                # machine ARN needed
+                MediaProcessingGatewayLambdaArn: !GetAtt MediaProcessingStack.Outputs.GatewayToolLambdaArn
+
+    SpeechDiarizationStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, SpeechDiarization]
+            Parameters:
+                ResourcePrefix: !Sub
+                    - ${prefix}-${stackId}
+                    -
+                        prefix: !Ref Prefix
+                        stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                IngestBucket: !Ref IngestBucket
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+                # the family sibling pattern (2026-09-18): conversion goes
+                # through MP's gateway with a callback token, and MP's cost
+                # is read from its published usage_tracking.json — no
+                # machine ARN needed
+                MediaProcessingGatewayLambdaArn: !GetAtt MediaProcessingStack.Outputs.GatewayToolLambdaArn
+
+    ShotSegmentationStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, ShotSegmentation]
+            Parameters:
+                ResourcePrefix: !Sub
+                    - ${prefix}-${stackId}
+                    -
+                        prefix: !Ref Prefix
+                        stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                IngestBucket: !Ref IngestBucket
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+
+    FaceRecognitionStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, FaceRecognition]
+            Parameters:
+                ResourcePrefix: !Sub
+                    - ${prefix}-${stackId}
+                    -
+                        prefix: !Ref Prefix
+                        stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+                # the family sibling pattern (2026-09-18): conversion goes
+                # through MP's gateway with a callback token, and MP's cost
+                # is read from its published usage_tracking.json — no
+                # machine ARN needed
+                MediaProcessingGatewayLambdaArn: !GetAtt MediaProcessingStack.Outputs.GatewayToolLambdaArn
+
+    HybridSearchStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, HybridSearch]
+            Parameters:
+                ResourcePrefix: !Sub
+                    - ${prefix}-${stackId}
+                    -
+                        prefix: !Ref Prefix
+                        stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+
+    TtsStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, Tts]
+            Parameters:
+                ResourcePrefix: !Sub
+                    - ${prefix}-${stackId}
+                    -
+                        prefix: !Ref Prefix
+                        stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+
+    BedrockInferenceStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, BedrockInference]
+            Parameters:
+                ResourcePrefix: !Sub
+                    - ${prefix}-${stackId}
+                    -
+                        prefix: !Ref Prefix
+                        stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+
+    PromptRegistryStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, PromptRegistry]
+            Parameters:
+                ResourcePrefix: !Sub
+                    - ${prefix}-${stackId}
+                    -
+                        prefix: !Ref Prefix
+                        stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+                # PromptSeedMode is deliberately NOT passed: the bundle
+                # stays out of that knob entirely (user decision
+                # 2026-08-18). The CHILD's own Default carries the pre-GA
+                # posture (overwrite-builtins — every deploy reseeds
+                # builtins whose shipped source changed), and the GA flip
+                # obligation lives in prompt-registry's own suite as a test
+                # named for it.
+
+    #
+    # The ELEVENTH child, and the first CONSUMER child (conversation-analysis-
+    # on-aws): it takes the two sibling gateway-Lambda ARNs as
+    # parameters — the §C8 pattern (README.md), explicit parameters, never
+    # Fn::ImportValue — so it implicitly deploys after bedrock-inference and
+    # prompt-registry.
+    #
+    ConversationAnalysisStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, ConversationAnalysis]
+            Parameters:
+                ResourcePrefix: !Sub
+                    - ${prefix}-${stackId}
+                    -
+                        prefix: !Ref Prefix
+                        stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+                BedrockInferenceGatewayLambdaArn: !GetAtt BedrockInferenceStack.Outputs.GatewayToolLambdaArn
+                PromptRegistryGatewayLambdaArn: !GetAtt PromptRegistryStack.Outputs.AdminToolLambdaArn
+
+    #
+    # The TWELFTH child, the second consumer (shot-metadata-enrichment-on-aws):
+    # same §C8 shape (README.md) as conversation-analysis — the two sibling
+    # gateway-Lambda ARNs as explicit parameters, so it deploys after
+    # bedrock-inference and prompt-registry. Its workflow Lambda is a container
+    # image (pyvips): the nested stack runs a CodeBuild inside itself, so this
+    # child's first create adds image-build minutes like the seven container
+    # children.
+    #
+    ShotMetadataEnrichmentStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, ShotMetadataEnrichment]
+            Parameters:
+                ResourcePrefix: !Sub
+                    - ${prefix}-${stackId}
+                    -
+                        prefix: !Ref Prefix
+                        stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+                BedrockInferenceGatewayLambdaArn: !GetAtt BedrockInferenceStack.Outputs.GatewayToolLambdaArn
+                PromptRegistryGatewayLambdaArn: !GetAtt PromptRegistryStack.Outputs.AdminToolLambdaArn
+
+    #
+    # Deploys last: it consumes a gateway-tool Lambda ARN from every one of the
+    # eleven workflow stacks above.
+    #
+    # HybridSearchAdminToolLambdaArn is wired UNCONDITIONALLY. The child
+    # supports omitting it (empty string drops the target), and its own note
+    # warns that the target grants destructive powers — configure_search_backend
+    # and delete_collection, which sweeps LanceDB tables, S3 Vectors indexes,
+    # DDB records, and the registry. The bundle makes the posture choice
+    # explicitly rather than by default: a bundle-deployed gateway IS an admin
+    # gateway. The security boundary is the credentials secret at
+    # /{GatewayName}/{Environment}/gateway-credentials, not the target list.
+    # Serving untrusted agents means deploying media-toolkit-gateway standalone with
+    # HybridSearchAdminToolLambdaArn="".
+    #
+    # The THIRTEENTH child (frame-inspection-on-aws, 2026-08-29): the third
+    # consumer, same §8 shape as conversation-analysis. Deliberately NOT an
+    # media-toolkit-gateway target (user decision 2026-08-29): it is internal
+    # plumbing invoked by sibling workflows through its gateway Lambda; its
+    # ARN therefore does NOT flow to M2cAgentToolsStack below.
+    #
+    FrameInspectionStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, FrameInspection]
+            Parameters:
+                ResourcePrefix: !Sub
+                    - ${prefix}-${stackId}
+                    -
+                        prefix: !Ref Prefix
+                        stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+                BedrockInferenceGatewayLambdaArn: !GetAtt BedrockInferenceStack.Outputs.GatewayToolLambdaArn
+                PromptRegistryGatewayLambdaArn: !GetAtt PromptRegistryStack.Outputs.AdminToolLambdaArn
+
+    #
+    # The FOURTEENTH child (program-structure-analysis-on-aws, 2026-08-29):
+    # the first PURE-CODE child — no model calls, no containers, no sibling
+    # gateway parameters at all. IS an media-toolkit-gateway target
+    # (analyze_program_structure).
+    #
+    ProgramStructureAnalysisStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, ProgramStructureAnalysis]
+            Parameters:
+                ResourcePrefix: !Sub
+                    - ${prefix}-${stackId}
+                    -
+                        prefix: !Ref Prefix
+                        stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+
+    #
+    # The FIFTEENTH child (audio-description-on-aws, 2026-08-31): a CONSUMER
+    # child like frame-inspection — three sibling gateway ARNs arrive as
+    # parameters (writer/critic/repair submissions, prompt binding, tts
+    # synthesis with push completion; requires the tts child at
+    # alpha.20260831a+). Registered as an media-toolkit-gateway target
+    # (generate_ad) the same day, after the first live run succeeded —
+    # user decision 2026-08-31 moving registration ahead of the
+    # 28-episode corpus gate.
+    #
+    AudioDescriptionStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, AudioDescription]
+            Parameters:
+                ResourcePrefix: !Sub
+                    - ${prefix}-${stackId}
+                    -
+                        prefix: !Ref Prefix
+                        stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+                BedrockInferenceGatewayLambdaArn: !GetAtt BedrockInferenceStack.Outputs.GatewayToolLambdaArn
+                PromptRegistryGatewayLambdaArn: !GetAtt PromptRegistryStack.Outputs.AdminToolLambdaArn
+                TtsGatewayLambdaArn: !GetAtt TtsStack.Outputs.GatewayToolLambdaArn
+
+    #
+    # The SIXTEENTH child (cast-resolution-on-aws, 2026-09-05): a CONSUMER
+    # child — frame-inspection (witness on-screen reads) and
+    # bedrock-inference (two LLM enrichment rounds via callback tokens)
+    # arrive as gateway ARNs. IS an media-toolkit-gateway target (resolve_cast);
+    # registration moved ahead of GA with the six-state machine measured
+    # on the 36-asset corpus (user decision 2026-09-05).
+    #
+    CastResolutionStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, CastResolution]
+            Parameters:
+                ResourcePrefix: !Sub
+                    - ${prefix}-${stackId}
+                    -
+                        prefix: !Ref Prefix
+                        stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+                FrameInspectionGatewayLambdaArn: !GetAtt FrameInspectionStack.Outputs.GatewayToolLambdaArn
+                BedrockInferenceGatewayLambdaArn: !GetAtt BedrockInferenceStack.Outputs.GatewayToolLambdaArn
+                PromptRegistryGatewayLambdaArn: !GetAtt PromptRegistryStack.Outputs.AdminToolLambdaArn
+
+    #
+    # The SEVENTEENTH child (artwork-selection-on-aws, 2026-09-17): a
+    # CONSUMER child — bedrock-inference (brief translation + vision
+    # rerank via callback tokens) and prompt-registry (two internal
+    # categories) arrive as gateway ARNs. IS an media-toolkit-gateway target
+    # (select_artwork); e2e-verified on the standalone dev stack before
+    # registration (cast-resolution's road).
+    #
+    ArtworkSelectionStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, ArtworkSelection]
+            Parameters:
+                ResourcePrefix: !Sub
+                    - ${prefix}-${stackId}
+                    -
+                        prefix: !Ref Prefix
+                        stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+                BedrockInferenceGatewayLambdaArn: !GetAtt BedrockInferenceStack.Outputs.GatewayToolLambdaArn
+                PromptRegistryGatewayLambdaArn: !GetAtt PromptRegistryStack.Outputs.AdminToolLambdaArn
+
+    #
+    # Every one of this child's optional-target Conditions is permanently
+    # true here, because the bundle always deploys all seventeen children.
+    # That is what lets all SIXTEEN gateway-Lambda references below be plain
+    # !GetAtt with no !If wrapper (sixteen, not eighteen: media-outputs'
+    # Lambda is declared inside media-toolkit-gateway, and frame-inspection is
+    # deliberately NOT a target — user decision 2026-08-29 — so neither ARN
+    # crosses this boundary).
+    #
+    M2cAgentToolsStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub
+                - https://${bucket}.s3.${AWS::Region}.amazonaws.com/${key}
+                -
+                    bucket: !FindInMap [Solution, Template, S3Bucket]
+                    key: !FindInMap [Solution, Stack, M2cAgentTools]
+            Parameters:
+                ProxyBucket: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+                # IngestBucket is required at the bundle root, so the
+                # media-ingest listing target is always on in a bundle deploy
+                IngestBucket: !Ref IngestBucket
+                # Empty GatewayName derives the children's ResourcePrefix
+                # shape, so a bundle is unique with zero knobs; a set value
+                # pins the gateway identity (see the parameter's comment).
+                GatewayName: !If
+                    - bGatewayNameGiven
+                    - !Ref GatewayName
+                    - !Sub
+                        - ${prefix}-${stackId}
+                        -
+                            prefix: !Ref Prefix
+                            stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+                Environment: !Ref Environment
+                OAuthScope: !Ref OAuthScope
+                SecretsKmsKeyId: !Ref SecretsKmsKeyId
+                MediaProcessingToolLambdaArn: !GetAtt MediaProcessingStack.Outputs.GatewayToolLambdaArn
+                AudioStemToolLambdaArn: !GetAtt AudiostemSeparationStack.Outputs.GatewayToolLambdaArn
+                SpeechDiarizationToolLambdaArn: !GetAtt SpeechDiarizationStack.Outputs.GatewayToolLambdaArn
+                ShotSegmentationToolLambdaArn: !GetAtt ShotSegmentationStack.Outputs.GatewayToolLambdaArn
+                FaceRecognitionToolLambdaArn: !GetAtt FaceRecognitionStack.Outputs.GatewayToolLambdaArn
+                HybridSearchToolLambdaArn: !GetAtt HybridSearchStack.Outputs.GatewayToolLambdaArn
+                HybridSearchAdminToolLambdaArn: !GetAtt HybridSearchStack.Outputs.AdminToolLambdaArn
+                TextToSpeechToolLambdaArn: !GetAtt TtsStack.Outputs.GatewayToolLambdaArn
+                BedrockInferenceToolLambdaArn: !GetAtt BedrockInferenceStack.Outputs.GatewayToolLambdaArn
+                PromptRegistryToolLambdaArn: !GetAtt PromptRegistryStack.Outputs.GatewayToolLambdaArn
+                PromptRegistryAdminToolLambdaArn: !GetAtt PromptRegistryStack.Outputs.AdminToolLambdaArn
+                ConversationAnalysisToolLambdaArn: !GetAtt ConversationAnalysisStack.Outputs.GatewayToolLambdaArn
+                ShotMetadataEnrichmentToolLambdaArn: !GetAtt ShotMetadataEnrichmentStack.Outputs.GatewayToolLambdaArn
+                ProgramStructureAnalysisToolLambdaArn: !GetAtt ProgramStructureAnalysisStack.Outputs.GatewayToolLambdaArn
+                AudioDescriptionToolLambdaArn: !GetAtt AudioDescriptionStack.Outputs.GatewayToolLambdaArn
+                CastResolutionToolLambdaArn: !GetAtt CastResolutionStack.Outputs.GatewayToolLambdaArn
+                ArtworkSelectionToolLambdaArn: !GetAtt ArtworkSelectionStack.Outputs.GatewayToolLambdaArn
+                SpeechEnhancementToolLambdaArn: !GetAtt SpeechEnhancementStack.Outputs.GatewayToolLambdaArn
+
+#
+# No Export: on any output. This matches media-toolkit-gateway' own documented
+# reasoning: an exported value can never change, and the producing stack cannot
+# be deleted while any importer exists. Hard-locking the bundle — which owns
+# eight nested stacks — would be the worst possible application of that.
+#
+Outputs:
+    # What an agent operator needs.
+    GatewayUrl:
+        Description: MCP endpoint URL — pass this to agents
+        Value: !GetAtt M2cAgentToolsStack.Outputs.GatewayUrl
+
+    GatewayCredentialsSecretName:
+        Description: >
+            Secrets Manager name holding the credentials bundle (endpointUrl,
+            tokenEndpoint, clientId, clientSecret, scope). Read it with
+            "aws secretsmanager get-secret-value --secret-id <this>".
+        Value: !GetAtt M2cAgentToolsStack.Outputs.GatewayCredentialsSecretName
+
+    GatewayCredentialsSecretArn:
+        Description: >
+            Secrets Manager ARN of the same credentials bundle — the form IAM
+            policies and cross-account grants need (the name output above is
+            for console/CLI lookup).
+        Value: !GetAtt M2cAgentToolsStack.Outputs.GatewayCredentialsSecretArn
+
+    # Input for the INGEST bucket owner's bucket policy. Seven roles, ~650
+    # chars — fits the 1024-char Output limit in one value (the proxy-side
+    # list does not; that one is a separate, chunked story). All read-only
+    # principals. The ARNs carry CFN-generated names: a role REPLACEMENT in
+    # a future update changes an ARN, and a bucket policy pinned to the old
+    # one silently stops matching — re-read this output after bundle updates.
+    IngestBucketReadRoleArns:
+        Description: >
+            Comma-separated runtime IAM role ARNs that read the Ingest bucket
+            (all read-only) — feed these to the ingest bucket owner's bucket
+            policy. Re-read after every bundle update: role replacements
+            change the CFN-generated ARNs.
+        Value: !Join
+            - ","
+            - - !GetAtt MediaProcessingStack.Outputs.IngestBucketReadRoleArns
+              - !GetAtt ShotSegmentationStack.Outputs.IngestBucketReadRoleArns
+              - !GetAtt AudiostemSeparationStack.Outputs.IngestBucketReadRoleArns
+              - !GetAtt SpeechDiarizationStack.Outputs.IngestBucketReadRoleArns
+              - !GetAtt SpeechEnhancementStack.Outputs.IngestBucketReadRoleArns
+              - !GetAtt M2cAgentToolsStack.Outputs.IngestBucketReadRoleArns
+
+    GatewayIdentifier:
+        Description: AgentCore Gateway identifier
+        Value: !GetAtt M2cAgentToolsStack.Outputs.GatewayIdentifier
+
+    # The proxy bucket, whoever owns it. Surfaced unconditionally so the operator
+    # never has to work out which branch fired — and it matters most in the
+    # branch where the stack owns it, because that bucket is RETAINED on delete
+    # and this output is the only record of the name to sweep or to pass back as
+    # ProxyBucket on a re-create.
+    ProxyBucketName:
+        Description: >
+            S3 bucket holding all workflow outputs. Created and RETAINED by this
+            stack when the ProxyBucket parameter was left blank, otherwise the
+            bucket that was supplied.
+        Value: !If [bCreateProxyBucket, !Ref BundleProxyBucket, !Ref ProxyBucket]
+
+    ProxyBucketIsStackOwned:
+        Description: >
+            true when this stack created the proxy bucket (and will retain it on
+            delete); false when an existing bucket was supplied.
+        Value: !If [bCreateProxyBucket, "true", "false"]
+
+    # The effective prefix handed to the seven workflow children. Needed to find
+    # their resources, and to reconstruct the -vectors and -proxy bucket names
+    # after the stack is gone, since both are retained.
+    ResourcePrefix:
+        Description: Effective resource-name prefix ({Prefix}-{stack-id slice})
+        Value: !Sub
+            - ${prefix}-${stackId}
+            -
+                prefix: !Ref Prefix
+                stackId: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+
+    # The stateful resources — worth knowing by name precisely because a stack
+    # delete takes them with it (deliberate: their contents are derived from
+    # media that lives elsewhere and are rebuildable).
+    MediaProcessingStateMachineArn:
+        Description: Shared media-processing state machine (informational — since 2026-09-18 no sibling takes it as a parameter; all three consumers submit through MP's gateway with callback tokens)
+        Value: !GetAtt MediaProcessingStack.Outputs.StateMachineArn
+
+    FaceTableName:
+        Description: DynamoDB face records table (face-recognition)
+        Value: !GetAtt FaceRecognitionStack.Outputs.FaceTableName
+
+    VoiceTableName:
+        Description: DynamoDB voice catalog table (text-to-speech)
+        Value: !GetAtt TtsStack.Outputs.VoiceTableName
+
+    HybridSearchCollectionTableName:
+        Description: DynamoDB collection registry table (hybrid-search)
+        Value: !GetAtt HybridSearchStack.Outputs.CollectionDDBTableName
+
+    HybridSearchVectorBucketName:
+        Description: S3 Vectors bucket backing hybrid-search ANN retrieval
+        Value: !GetAtt HybridSearchStack.Outputs.VectorBucketName

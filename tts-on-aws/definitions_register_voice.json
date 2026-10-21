@@ -1,0 +1,167 @@
+{
+    "Comment": "CosyVoice3 voice registration — validate reference (format + ASR transcript match), extract conditioning in parallel, write registry record.",
+    "StartAt": "Validate reference",
+    "States": {
+        "Validate reference": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${TtsLambda1Core.Arn}",
+                "Payload": {
+                    "operation": "StateValidateReference",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Extract conditioning"
+        },
+        "Extract conditioning": {
+            "Type": "Parallel",
+            "ResultPath": "$.branches",
+            "Branches": [
+                {
+                    "StartAt": "Extract speech tokens",
+                    "States": {
+                        "Extract speech tokens": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                                "FunctionName": "${TtsLambda2Cores.Arn}",
+                                "Payload": {
+                                    "operation": "StateExtractSpeechToken",
+                                    "uuid.$": "$.uuid",
+                                    "input.$": "$.input"
+                                }
+                            },
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "Lambda.ClientExecutionTimeoutException",
+                                        "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException",
+                                        "Lambda.SdkClientException",
+                                        "Lambda.TooManyRequestsException"
+                                    ],
+                                    "IntervalSeconds": 3,
+                                    "MaxAttempts": 3,
+                                    "BackoffRate": 2
+                                }
+                            ],
+                            "End": true
+                        }
+                    }
+                },
+                {
+                    "StartAt": "Extract speaker embedding",
+                    "States": {
+                        "Extract speaker embedding": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                                "FunctionName": "${TtsLambdaHalfCore.Arn}",
+                                "Payload": {
+                                    "operation": "StateExtractSpeakerEmbedding",
+                                    "uuid.$": "$.uuid",
+                                    "input.$": "$.input"
+                                }
+                            },
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException",
+                                        "Lambda.SdkClientException",
+                                        "Lambda.TooManyRequestsException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 3,
+                                    "BackoffRate": 1.5
+                                }
+                            ],
+                            "End": true
+                        }
+                    }
+                },
+                {
+                    "StartAt": "Extract speech features",
+                    "States": {
+                        "Extract speech features": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                                "FunctionName": "${TtsLambdaHalfCore.Arn}",
+                                "Payload": {
+                                    "operation": "StateExtractSpeechFeat",
+                                    "uuid.$": "$.uuid",
+                                    "input.$": "$.input"
+                                }
+                            },
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException",
+                                        "Lambda.SdkClientException",
+                                        "Lambda.TooManyRequestsException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 3,
+                                    "BackoffRate": 1.5
+                                }
+                            ],
+                            "End": true
+                        }
+                    }
+                }
+            ],
+            "Next": "Write voice record"
+        },
+        "Write voice record": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${TtsLambdaHalfCore.Arn}",
+                "Payload": {
+                    "operation": "StateWriteVoiceRecord",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "data.$": "$.data",
+                    "branches.$": "$.branches"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "End": true
+        }
+    }
+}

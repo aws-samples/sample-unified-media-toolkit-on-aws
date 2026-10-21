@@ -1,0 +1,252 @@
+{
+  "Comment": "Speech enhancement - using opensource DeepFilterNet3 model to noise-suppress the dialogue in the audio, in place. Input audio format: wav, 48KHz, mono channel.",
+  "StartAt": "Check and preprocess",
+  "States": {
+    "Check and preprocess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "${SpeechEnhancementLambda2Cores.Arn}",
+        "Payload": {
+          "operation": "StateCheckAndPreprocess",
+          "uuid.$": "$.uuid",
+          "input.$": "$.input",
+          "output.$": "$.output",
+          "data.$": "$.data"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.2
+        }
+      ],
+      "Next": "Needs conversion?"
+    },
+    "Needs conversion?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.data.needs_conversion",
+          "BooleanEquals": true,
+          "Next": "Run media processing"
+        }
+      ],
+      "Default": "Fix chunking for speech enhancement"
+    },
+    "Run media processing": {
+      "Type": "Task",
+      "Comment": "HELD (2026-09-18, the family sibling pattern): submits the conversion request to the media-processing GATEWAY with this state's task token; MP's waker completes it with the submit handle + terminal status AS DATA (never a detonation) \u2014 Extract processed audio enforces SUCCEEDED and derives the wav key from MP's output contract. Idempotent: the token derives from this run's uuid, so a redrive absorbs into the same MP run instead of re-transcoding. Replaces the direct states:startExecution.sync:2 of MP's machine (its internal execution output was our API, no idempotency, extra IAM).",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${SpeechEnhancementLambdaHalfCore.Arn}",
+        "Payload": {
+          "operation": "StateSubmitMediaProcessing",
+          "uuid.$": "$.uuid",
+          "data.$": "$.data",
+          "mp_gateway_arn": "${MediaProcessingGatewayLambdaArn}",
+          "task_token.$": "$$.Task.Token"
+        }
+      },
+      "ResultPath": "$.data.media_processing_output",
+      "TimeoutSeconds": 14400,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "Extract processed audio"
+    },
+    "Extract processed audio": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "${SpeechEnhancementLambdaHalfCore.Arn}",
+        "Payload": {
+          "operation": "StateExtractProcessedAudio",
+          "uuid.$": "$.uuid",
+          "input.$": "$.input",
+          "output.$": "$.output",
+          "data.$": "$.data"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.2
+        }
+      ],
+      "Next": "Fix chunking for speech enhancement"
+    },
+    "Fix chunking for speech enhancement": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "${SpeechEnhancementLambdaHalfCore.Arn}",
+        "Payload": {
+          "operation": "StateFixedChunkingForSpeechEnhancement",
+          "uuid.$": "$.uuid",
+          "input.$": "$.input",
+          "output.$": "$.output",
+          "data.$": "$.data"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.2
+        }
+      ],
+      "Next": "Map speech enhancement processing"
+    },
+    "Map speech enhancement processing": {
+      "Type": "Map",
+      "MaxConcurrency": 40,
+      "ItemsPath": "$.data.iterators",
+      "ItemSelector": {
+        "operation": "StateRunSpeechEnhancementModel",
+        "item_id.$": "$$.Map.Item.Index",
+        "item_data.$": "$$.Map.Item.Value"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "Run speech enhancement model",
+        "States": {
+          "Run speech enhancement model": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+              "FunctionName": "${SpeechEnhancementLambda5Cores.Arn}",
+              "Payload.$": "$"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ClientExecutionTimeoutException",
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException"
+                ],
+                "IntervalSeconds": 6,
+                "MaxAttempts": 4,
+                "BackoffRate": 2
+              },
+              {
+                "ErrorEquals": [
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 1,
+                "MaxAttempts": 6,
+                "BackoffRate": 1.5
+              },
+              {
+                "ErrorEquals": [
+                  "Sandbox.Timedout",
+                  "Lambda.Unknown"
+                ],
+                "MaxAttempts": 0
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.data.iterators",
+      "Next": "Concatenate enhanced audio"
+    },
+    "Concatenate enhanced audio": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "${SpeechEnhancementLambda1Core.Arn}",
+        "Payload": {
+          "operation": "StateConcatenateEnhancedAudio",
+          "uuid.$": "$.uuid",
+          "input.$": "$.input",
+          "output.$": "$.output",
+          "data.$": "$.data"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.2
+        }
+      ],
+      "Next": "Usage tracking"
+    },
+    "Usage tracking": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "${SpeechEnhancementLambdaHalfCore.Arn}",
+        "Payload": {
+          "operation": "StateUsageTracking",
+          "execution_arn.$": "$$.Execution.Id",
+          "uuid.$": "$.uuid",
+          "input.$": "$.input",
+          "output.$": "$.output",
+          "data.$": "$.data"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.2
+        }
+      ],
+      "End": true
+    }
+  }
+}

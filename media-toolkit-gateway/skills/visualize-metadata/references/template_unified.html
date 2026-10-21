@@ -1,0 +1,1620 @@
+<!DOCTYPE html>
+<!--
+  UNIFIED metadata review page. Self-contained: every metadata document
+  rides the embedded DATA block; only media URLs are presigned (expire
+  ~1 h — re-run the skill to refresh). Layout: | video + transport +
+  audio | tabs | over a full-width timeline.
+
+  One chassis, two content modes picked by DATA.mode (PSA
+  manifest.mode): "news" heroes the story rundown; "narrative" heroes
+  SME scenes + CA chapters. Every other module is presence-driven, not
+  mode-driven: PROGRAM STRUCTURE (PSA markers/breaks/sequences) and the
+  Artwork tab render only when their DATA key exists, and a missing
+  input degrades by omission.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>__ASSET__ — metadata</title>
+<style>
+/* Unified metadata review chrome (news + narrative). */
+
+:root {
+  --bg:   #14161a;
+  --bg2:  #1b1e24;
+  --bg3:  #232730;
+  --line: #333844;
+  --fg:   #dde1e8;
+  --dim:  #8d95a5;
+  --accent: #4da3ff;
+  --f-package:  #3f7fd0;
+  --f-live:     #d05a52;
+  --f-aslive:   #d0913f;
+  --f-anchor:   #46b978;
+  --f-interview:#b45fc0;
+  --f-tease:    #8a7ae0;
+  --f-desk:     #4aa8c0;
+  --f-other:    #5a6274;
+  --r-anchor: #46b978; --r-corr: #4da3ff; --r-talent: #4aa8c0; --r-guest: #8d95a5;
+  --w-original: #8d95a5; --w-speech: #3f7fd0; --w-music: #d0913f; --w-sfx: #46b978;
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  overflow: hidden;
+}
+body { display: flex; flex-direction: column; }
+.dim { color: var(--dim); }
+.hide { display: none !important; }
+.spacer { flex: 1; }
+.lbl { font-size: 10.5px; letter-spacing: .8px; color: var(--dim); font-weight: 600; }
+
+/* ------------------------------------------------------------------ header */
+#hdr {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 12px; padding: 6px 12px; background: var(--bg2);
+  border-bottom: 1px solid var(--line); flex: 0 0 auto;
+}
+.hgroup { display: flex; align-items: center; gap: 10px; min-width: 0; }
+#hNote { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#assetPick {
+  background: var(--bg3); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 4px; padding: 3px 6px; font: inherit; font-weight: 600;
+}
+.fact { color: var(--dim); font-variant-numeric: tabular-nums; }
+.fact::before { content: "· "; }
+
+/* --------------------------------------------------------------- main split */
+main { flex: 1 1 auto; display: flex; min-height: 0; }
+
+#left {
+  flex: 1 1 54%; min-width: 380px; display: flex; flex-direction: column;
+  padding: 10px; gap: 7px; min-height: 0;
+}
+#videoWrap {
+  flex: 1 1 auto; min-height: 0; background: #000;
+  border: 1px solid var(--line); border-radius: 5px;
+  display: flex; align-items: center; justify-content: center; overflow: hidden;
+}
+#v { max-width: 100%; max-height: 100%; display: block; background: #000; }
+
+#transport { display: flex; gap: 4px; align-items: center; flex: 0 0 auto; }
+#transport button {
+  background: var(--bg3); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 4px; min-width: 38px; height: 28px; cursor: pointer;
+  font-size: 12px; font-family: inherit;
+}
+#transport button:hover { border-color: var(--accent); }
+#btnPlay { min-width: 48px; }
+#btnBoundL, #btnBoundR { font-family: ui-monospace, Menlo, monospace; font-weight: 700; }
+
+#transport .tc { margin: 0 2px; }
+.tc {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 16px; font-weight: 600; letter-spacing: .5px;
+}
+#frameBox {
+  width: 76px; background: var(--bg3); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 3px; padding: 2px 5px;
+  font: inherit; font-variant-numeric: tabular-nums; text-align: right;
+}
+
+#audioRow { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
+.stemsel { display: flex; gap: 4px; }
+.stemsel button {
+  display: flex; align-items: center; gap: 6px;
+  background: var(--bg3); color: var(--dim); border: 1px solid var(--line);
+  border-radius: 4px; padding: 3px 10px; cursor: pointer; font: inherit; font-size: 12px;
+}
+.stemsel button:hover { color: var(--fg); }
+.stemsel button[aria-pressed="true"] { color: var(--fg); border-color: var(--accent); }
+.swatch { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+
+#ctxInfo {
+  flex: 0 0 auto; min-height: 50px; font-size: 12px; color: var(--dim);
+  background: var(--bg2); border: 1px solid var(--line); border-radius: 4px;
+  padding: 6px 10px; line-height: 1.6;
+}
+#ctxInfo b { color: var(--fg); font-weight: 600; }
+#ctxInfo .sep { color: #4b5260; margin: 0 6px; }
+
+/* ---------------------------------------------------------------- right/tabs */
+#right {
+  flex: 1 1 46%; min-width: 340px; display: flex; flex-direction: column;
+  border-left: 1px solid var(--line); min-height: 0;
+}
+#tabs { display: flex; flex: 0 0 auto; background: var(--bg2); }
+.tab {
+  flex: 1; background: none; border: none; border-bottom: 2px solid transparent;
+  color: var(--dim); padding: 9px 6px; cursor: pointer; font: inherit;
+}
+.tab:hover { color: var(--fg); }
+.tab.on { color: var(--fg); border-bottom-color: var(--accent); background: var(--bg); }
+.tabPane { display: none; flex: 1 1 auto; min-height: 0; flex-direction: column; }
+.tabPane.on { display: flex; }
+.paneTools {
+  flex: 0 0 auto; display: flex; gap: 8px; align-items: center;
+  padding: 6px 8px; border-bottom: 1px solid var(--line);
+}
+.filter {
+  flex: 1; background: var(--bg3); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 3px; padding: 3px 7px; font: inherit;
+}
+.ck { font-size: 11px; color: var(--dim); user-select: none; cursor: pointer; white-space: nowrap; }
+.ck input { vertical-align: -1px; accent-color: var(--accent); }
+.list { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; }
+
+/* rundown rows */
+.row {
+  border-bottom: 1px solid #24282f; padding: 6px 9px; cursor: pointer;
+  display: grid; grid-template-columns: 36px 60px 1fr auto; gap: 8px;
+  align-items: baseline;
+}
+.row:hover { background: var(--bg2); }
+.row.sel { background: #1f2b3d; box-shadow: inset 2px 0 0 var(--accent); }
+.row .pg { color: var(--dim); font-size: 11px; text-align: right;
+  font-variant-numeric: tabular-nums; font-weight: 600; cursor: help; }
+.row .tcv {
+  font-family: ui-monospace, Menlo, monospace; font-size: 11.5px;
+  color: var(--accent); font-variant-numeric: tabular-nums;
+}
+.row .body { min-width: 0; }
+.row .ttl { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .ttl b { font-weight: 650; }
+.row .meta { display: block; color: var(--dim); font-size: 11px; margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .right { text-align: right; }
+.row .dur { color: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; display: block; }
+.chipf {
+  display: inline-block; font-size: 10px; padding: 1px 7px; border-radius: 8px;
+  color: #fff; opacity: .92; font-weight: 600; letter-spacing: .2px;
+}
+.vd { font-size: 10px; padding: 1px 5px; border-radius: 8px; margin-left: 6px; }
+.vd.live   { background: #40201d; color: #e0776f; }
+.vd.aslive { background: #402f1a; color: #e0a95c; }
+.vd.rec    { background: #2a2f3a; color: #9aa4b8; }
+
+/* transcript */
+.turn {
+  border-bottom: 1px solid #21252c; padding: 4px 9px; cursor: pointer;
+  display: grid; grid-template-columns: 60px 110px 1fr; gap: 8px; align-items: baseline;
+}
+.turn:hover { background: var(--bg2); }
+.turn.sel { background: #1f2b3d; box-shadow: inset 2px 0 0 var(--accent); }
+.turn .tcv { font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+  color: var(--accent); font-variant-numeric: tabular-nums; }
+.turn .who { color: var(--dim); font-size: 11.5px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.turn .who.named { color: var(--fg); font-weight: 600; }
+.turn .txt { font-size: 12px; }
+
+/* people tiles */
+#peTiles { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px; align-content: flex-start; }
+.ptile {
+  position: relative; width: 104px; height: 130px; border-radius: 6px;
+  overflow: hidden; cursor: pointer; background: var(--bg3);
+  border: 1px solid var(--line);
+}
+.ptile:hover { border-color: var(--accent); }
+/* tooth-2 (critic_review) suspicion: the machine already doubts this
+   person — reviews start here. Red outline + corner mark; the cited
+   reason rides the hover title. */
+.ptile.flagged { outline: 2px solid #d05a52; outline-offset: -2px; }
+.ptile.flagged::after {
+  content: "\26a0"; position: absolute; top: 2px; right: 6px;
+  color: #d05a52; font-size: 13px; text-shadow: 0 0 3px #000;
+}
+.ptile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.ptile .noface {
+  width: 100%; height: 100%; display: flex; align-items: center;
+  justify-content: center; font-size: 30px; font-weight: 700; color: var(--dim);
+}
+.ptile .nm {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  background: linear-gradient(transparent, #000c 30%);
+  padding: 14px 6px 4px; font-size: 11px; font-weight: 600; line-height: 1.25;
+}
+.ptile .nm .st { display: block; font-weight: 400; font-size: 10px; color: #c8cdd6; }
+.ptile .rb {
+  position: absolute; top: 4px; left: 4px; font-size: 9px; font-weight: 700;
+  padding: 1px 6px; border-radius: 7px; color: #10131a; letter-spacing: .3px;
+}
+
+/* shot inspector ( layered layout) */
+#shotBody { padding: 12px 14px; }
+#shotBody .shdr { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+#shotBody .shdr h3 { margin: 0; font-size: 16px; }
+#shotBody .shdr .tcv { font-family: ui-monospace, Menlo, monospace;
+  font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.pill {
+  display: inline-block; font-size: 10.5px; padding: 1px 8px; border-radius: 9px;
+  background: var(--bg3); border: 1px solid var(--line); color: var(--dim);
+}
+#shotBody .desc { margin: 8px 0 12px; font-size: 13px; }
+.cards { display: flex; flex-wrap: wrap; gap: 6px; }
+.card {
+  min-width: 108px; background: var(--bg2); border: 1px solid var(--line);
+  border-radius: 5px; padding: 6px 10px;
+}
+.card .k { font-size: 9.5px; letter-spacing: .6px; color: var(--dim);
+  text-transform: uppercase; }
+.card .v { font-size: 12.5px; margin-top: 2px; }
+.sect { margin-top: 14px; }
+.sect .sk { font-size: 10px; letter-spacing: .7px; color: var(--dim);
+  text-transform: uppercase; font-weight: 600; margin-bottom: 5px; }
+.pills { display: flex; flex-wrap: wrap; gap: 5px; }
+.pills .pill { color: var(--fg); }
+.storychip { border-color: var(--accent); color: var(--accent); }
+
+/* ----------------------------------------------------------------- timeline */
+#tlWrap {
+  flex: 0 0 auto; max-height: 44%; display: flex; flex-direction: column;
+  background: var(--bg2); border-top: 1px solid var(--line);
+}
+#tlTools {
+  display: flex; align-items: center; gap: 8px; padding: 5px 10px 4px;
+  flex: 0 0 auto;
+}
+#tlTools button {
+  background: var(--bg3); color: var(--dim); border: 1px solid var(--line);
+  border-radius: 3px; min-width: 26px; padding: 1px 8px; cursor: pointer;
+  font: inherit; font-size: 12px;
+}
+#tlTools button:hover { color: var(--fg); border-color: var(--accent); }
+#tlRange { font-size: 11px; font-variant-numeric: tabular-nums; }
+
+#tlScroll { position: relative; overflow-y: auto; overflow-x: hidden; }
+#ruler { position: sticky; top: 0; z-index: 5; background: var(--bg2);
+  border-bottom: 1px solid var(--line); }
+#rulerC { display: block; width: 100%; height: 18px; cursor: crosshair; }
+
+.tgroup {}
+.ghdr {
+  display: flex; align-items: center; gap: 6px; padding: 3px 10px;
+  font-size: 10.5px; letter-spacing: .7px; color: var(--dim); font-weight: 600;
+  cursor: pointer; user-select: none; background: #171a1f;
+  border-bottom: 1px solid #22262d;
+}
+.ghdr:hover { color: var(--fg); }
+.ghdr .tri { width: 10px; display: inline-block; }
+.ghdr .cnt { font-weight: 400; }
+.ghdr .hid { font-weight: 400; font-style: italic; margin-left: 4px; }
+
+.trow { display: flex; align-items: center; border-bottom: 1px solid #1d2127; }
+.trow .rlabel {
+  flex: 0 0 148px; padding: 0 8px 0 20px; font-size: 11px; color: var(--dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  display: flex; align-items: center; gap: 6px;
+}
+.trow .rlabel img { width: 16px; height: 16px; border-radius: 3px; object-fit: cover; }
+.trow .rlabel .rt { font-variant-numeric: tabular-nums; color: #6b7280; }
+.trow canvas { display: block; flex: 1 1 auto; cursor: crosshair; }
+
+#playhead {
+  position: absolute; top: 0; bottom: 0; width: 1px; left: -10px;
+  background: var(--accent); pointer-events: none; z-index: 6;
+}
+
+/* ---------------------------------------------------------------- tooltip */
+#tip {
+  position: fixed; z-index: 90; pointer-events: none; max-width: 380px;
+  background: #0e1014ee; border: 1px solid var(--line); border-radius: 4px;
+  padding: 6px 9px; font-size: 11.5px; line-height: 1.5;
+  box-shadow: 0 6px 20px #000a; white-space: pre-line;
+}
+#tip b { color: var(--accent); }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: #3a4150; border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #4a5260; }
+
+.subsbtn {
+  background: var(--bg3); color: var(--dim); border: 1px solid var(--line);
+  border-radius: 4px; padding: 3px 10px; cursor: pointer; font: inherit; font-size: 12px;
+}
+.subsbtn[aria-pressed="true"] { color: var(--fg); border-color: var(--accent); }
+video::cue { background: #000b; color: #fff; font-size: 15px; }
+
+#summaryBody { padding: 12px 14px; }
+.sumtbl { border-collapse: collapse; font-size: 12px; width: 100%; max-width: 560px; }
+.sumtbl th { text-align: left; color: var(--dim); font-weight: 500; padding: 3px 8px;
+  border-bottom: 1px solid var(--line); }
+.sumtbl td { padding: 3px 8px; border-bottom: 1px solid #22262d; }
+.sumtbl td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.sumtbl tr.tot td { border-top: 1px solid var(--line); font-weight: 600; }
+
+.sumtbl tr.cmp td { color: var(--dim); }
+
+.ratesel { display: flex; gap: 2px; margin-left: 8px; }
+.ratesel button {
+  min-width: 34px !important; height: 24px !important; font-size: 11px !important;
+  color: var(--dim);
+}
+.ratesel button[aria-pressed="true"] { color: var(--fg); border-color: var(--accent); }
+
+/* artwork gallery (optional module) */
+#awBody { padding: 10px 14px; }
+.awRow { display: flex; flex-wrap: wrap; gap: 8px; padding: 4px 0; }
+.awTile { margin: 0; width: 150px; cursor: pointer; }
+.awTile img { width: 100%; border-radius: 5px; border: 1px solid var(--line); display: block; }
+.awTile:hover img { border-color: var(--accent); }
+.awTile figcaption { font-size: 10.5px; color: var(--dim); margin-top: 2px; }
+</style>
+</head>
+<body>
+
+<header id="hdr">
+  <div class="hgroup">
+    <select id="assetPick" title="asset"></select>
+    <span class="fact" id="fDur">–</span>
+    <span class="fact" id="fStories">–</span>
+    <span class="fact" id="fPeople">–</span>
+  </div>
+  <div class="hgroup dim" id="hNote">pages A01/B01… are GENERATED block numbering (blocks split on break gaps), not house rundown data</div>
+</header>
+
+<main>
+  <div id="left">
+    <div id="videoWrap"><video id="v" preload="metadata" muted></video></div>
+
+    <div id="transport">
+      <button id="btnBack1" title="step back 1 frame (←)">◀︎❙</button>
+      <button id="btnPlay" title="play/pause (space)">▶</button>
+      <button id="btnFwd1" title="step forward 1 frame (→)">❙▶︎</button>
+      <div class="ratesel" id="ratesel" title="playback rate"></div>
+      <span class="spacer"></span>
+      <span class="tc" id="clock">00:00:00:00</span>
+      <span class="dim">frame</span>
+      <input id="frameBox" title="frame number — edit and press enter">
+      <span class="dim" id="frameTotal">/ –</span>
+      <span class="spacer"></span>
+      <button id="btnPrevSeg" title="previous story / scene (↑)">⏮</button>
+      <button id="btnNextSeg" title="next story / scene (↓)">⏭</button>
+      <button id="btnBoundL" title="jump to story / scene start ([)">[</button>
+      <button id="btnBoundR" title="jump to story / scene end (])">]</button>
+    </div>
+
+    <div id="audioRow">
+      <span class="lbl">AUDIO</span>
+      <div class="stemsel" id="stemsel"></div>
+      <span class="spacer"></span>
+      <button id="btnSubs" class="subsbtn" aria-pressed="true">subtitles on</button>
+    </div>
+
+    <div id="ctxInfo">–</div>
+  </div>
+
+  <div id="right">
+    <div id="tabs">
+      <button class="tab on" data-pane="rundown" id="tabHero">Rundown</button>
+      <button class="tab" data-pane="transcript">Transcript</button>
+      <button class="tab" data-pane="people">People</button>
+      <button class="tab" data-pane="shot">Shot</button>
+      <button class="tab hide" data-pane="artwork" id="tabArtwork">Artwork</button>
+      <button class="tab" data-pane="summary">Summary</button>
+    </div>
+
+    <div class="tabPane on" id="pane-rundown">
+      <div class="paneTools">
+        <input class="filter" id="ruFilter" placeholder="filter slug / headline / talent">
+        <label class="ck"><input type="checkbox" id="ruFollow" checked> follow</label>
+      </div>
+      <div class="list" id="ruList"></div>
+    </div>
+
+    <div class="tabPane" id="pane-transcript">
+      <div class="paneTools">
+        <input class="filter" id="trFilter" placeholder="filter text / speaker">
+        <label class="ck"><input type="checkbox" id="trFollow" checked> follow</label>
+      </div>
+      <div class="list" id="trList"></div>
+    </div>
+
+    <div class="tabPane" id="pane-people">
+      <div class="paneTools"><span class="dim" id="peCount"></span></div>
+      <div class="list" id="peTiles"></div>
+    </div>
+
+    <div class="tabPane" id="pane-shot">
+      <div class="list" id="shotBody"></div>
+    </div>
+
+    <div class="tabPane" id="pane-artwork">
+      <div class="list" id="awBody"></div>
+    </div>
+
+    <div class="tabPane" id="pane-summary">
+      <div class="list" id="summaryBody"></div>
+    </div>
+  </div>
+</main>
+
+<div id="tlWrap">
+  <div id="tlTools">
+    <span class="lbl">TIMELINE</span>
+    <button id="zOut" title="zoom out (-)">−</button>
+    <button id="zIn" title="zoom in (+)">+</button>
+    <button id="zFit" title="fit (0)">fit</button>
+    <span class="dim" id="tlRange">–</span>
+    <span class="spacer"></span>
+    <span class="dim">ctrl+wheel = zoom · drag = pan · click = seek</span>
+  </div>
+  <div id="tlScroll">
+    <div id="ruler"><canvas id="rulerC"></canvas></div>
+    <div id="groups"></div>
+    <div id="playhead"></div>
+  </div>
+</div>
+
+<div id="tip" class="hide"></div>
+<div id="stemAudio"></div>
+<script type="application/json" id="DATA">/*__DATA__*/</script>
+<script>
+/* Unified metadata review page (news + narrative modes). */
+"use strict";
+
+const $  = (s) => document.querySelector(s);
+const $$ = (s) => Array.from(document.querySelectorAll(s));
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const pad = (x, n = 2) => String(x).padStart(n, "0");
+const hms = (t) => {
+  t = Math.max(0, t | 0);
+  return `${t / 3600 | 0}:${pad(t % 3600 / 60 | 0)}:${pad(t % 60)}`;
+};
+const mmss = (t) => { t = Math.max(0, Math.round(t)); return `${t / 60 | 0}:${pad(t % 60)}`; };
+const parseTs = (ts) => { const [h, m, s] = String(ts).split(":");
+  return (+h) * 3600 + (+m) * 60 + parseFloat(s); };
+
+const DATA = JSON.parse(document.getElementById("DATA").textContent);
+const ASSETS = [DATA.asset];
+const ASSET_LABEL = { [DATA.asset]: DATA.asset_label || DATA.asset };
+/* media URLs are PRE-SIGNED at build time and embedded in DATA.media —
+ * they expire (~1 h): re-run the visualize-metadata skill to refresh. */
+async function presign(asset, kind) {
+  const u = (DATA.media || {})[kind];
+  if (!u) throw new Error(`no embedded media url for ${kind}`);
+  return u;
+}
+const S = { run: null, ca: [], sentences: [], shots: [], docs: {}, env: {},
+            spkName: {}, pages: [], fps: 29.97, frames: 0,
+            mode: "news", units: [], chapters: [], structure: null,
+            artwork: null,
+            curStory: -1, curTurn: -1, curShot: -1,
+            view: { t0: 0, t1: 1 } };
+const v = $("#v");
+
+/* ------------------------------------------------------ frame arithmetic */
+const frameAt = (t) => Math.floor(t * S.fps + 1e-6);
+const timeOf = (n) => (n + 0.5) / S.fps;
+const clampF = (n) => Math.max(0, Math.min(S.frames - 1, n | 0));
+const goToFrame = (n) => { v.currentTime = timeOf(clampF(n)); };
+const tcOf = (t) => {
+  const f = frameAt(t);
+  const s = Math.floor(f / S.fps);
+  return `${pad(s / 3600 | 0)}:${pad(s % 3600 / 60 | 0)}:${pad(s % 60)}:${pad(f - Math.round(s * S.fps))}`;
+};
+
+/* ------------------------------------------------------------ palettes */
+const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const FORM_VAR = {
+  package: "--f-package", live_two_way: "--f-live", live_toss_only: "--f-aslive",
+  anchor_read: "--f-anchor", headlines_block: "--f-anchor",
+  interview: "--f-interview", panel: "--f-interview",
+  weather_hit: "--f-desk", sports_hit: "--f-desk", markets_hit: "--f-desk",
+  tease: "--f-tease", promo: "--f-other",
+  handoff_banter: "--f-other", other: "--f-other",
+};
+const formColor = (f) => cssVar(FORM_VAR[f] || "--f-other");
+const FORM_SHORT = {
+  package: "PKG", live_two_way: "LIVE 2-WAY", live_toss_only: "LIVE/AS-LIVE",
+  anchor_read: "READ", headlines_block: "HEADLINES", interview: "INTV",
+  panel: "PANEL", weather_hit: "WX", sports_hit: "SPORTS",
+  markets_hit: "MARKETS", tease: "TEASE", promo: "PROMO",
+  handoff_banter: "CHAT", other: "—",
+};
+const ROLE_COL = { anchor: "--r-anchor", correspondent: "--r-corr",
+                   talent: "--r-talent", guest_or_subject: "--r-guest" };
+/* narrative tiles badge the CHARACTER NAME or nothing (user,
+   2026-09-23: the person_type badges read as noise) — the type stays
+   in the hover title. News keeps the role badge. */
+const personBadge = (p) => S.mode === "news"
+  ? (p.role
+      ? { txt: p.role.replace("_or_subject", ""),
+          col: cssVar(ROLE_COL[p.role] || "--r-guest") }
+      : null)   // cast-resolution abstained: no badge, never a guess
+  : (p.character_name
+      ? { txt: p.character_name, col: cssVar("--r-corr") }
+      : null);
+const laneColor = (p) => S.mode === "news"
+  ? cssVar(ROLE_COL[p.role] || "--r-guest") : cssVar("--r-corr");
+const SENT_COL = { positive: "#46b978", negative: "#d05a52",
+                   tense: "#d05a52", dramatic: "#b45fc0",
+                   mixed: "#d0913f", neutral: "#5a6274" };
+const sentColor = (s) => { const k = String(s || "").toLowerCase();
+  for (const key in SENT_COL) if (k.includes(key)) return SENT_COL[key];
+  return "#5a6274"; };
+const VERDICT = {
+  live: ["LIVE", "live"], as_live_candidate: ["AS-LIVE?", "aslive"],
+  recorded_disclosed: ["EARLIER", "rec"],
+  live_unbugged: ["LIVE (no on-air LIVE bug)", "live"],
+  produced_or_studio: ["", ""],
+};
+const SETTING_COL = {
+  studio_anchor_desk: "#46b978", studio_video_wall: "#4aa8c0",
+  studio_interview: "#b45fc0", field: "#3f7fd0",
+  remote_box: "#d0913f", graphic_full_screen: "#5a6274",
+};
+const INTER_COL = { two_way: "#d05a52", toss_only: "#d0913f", none: "#5a6274" };
+const SPK_COLS = ["#3f7fd0", "#46b978", "#d05a52", "#b45fc0", "#d0913f",
+                  "#4aa8c0", "#8a7ae0", "#a6a84e", "#7a86a0", "#a97142"];
+
+/* ------------------------------------------------------------------- load */
+async function loadAsset(a) {
+  const base = "";
+  // every metadata document is EMBEDDED in the DATA block at build time
+  // (a file:// page cannot fetch from S3 — CORS); only media is presigned
+  const run = DATA.rundown, ca = DATA.conversation_analysis,
+        tr = DATA.final_transcript, shotsDoc = DATA.shots,
+        jsonl = DATA.shot_metadata_jsonl || "", env = DATA.envelopes,
+        man = DATA.manifest, usage = DATA.usage_summary || [],
+        recurrence = DATA.recurrence || {}, scenes = DATA.scenes || {};
+  Object.assign(S, {
+    base, run, ca: ca.audio_segments || [], caHeader: ca,
+    sentences: tr.sentences || [],
+    shots: shotsDoc.shots, env, fps: man.fps || 29.97,
+    usage, recurrence, scenes, man,
+    curStory: -1, curTurn: -1, curShot: -1,
+  });
+  // content mode: PSA manifest.mode is the authority; a rundown with
+  // stories is the fallback signal for pre-PSA data
+  S.mode = DATA.mode || man.mode || (run.stories ? "news" : "narrative");
+  if (S.mode !== "news") S.mode = "narrative";
+  S.structure = DATA.structure || null;
+  S.artwork = DATA.artwork || null;
+  S.chapters = (ca.audio_segments || []).map((g) => ({
+    t0: parseTs(g.start_time), t1: parseTs(g.end_time), g }));
+  // the transport/follow UNIT: a story (news) or an SME scene (narrative)
+  S.units = S.mode === "news" ? (run.stories || [])
+    : (scenes.scenes || []).map((sc) => ({
+        start_sec: +sc.start_time, end_sec: +sc.end_time, scene: sc }));
+  S.frames = Math.round(run.duration_sec * S.fps);
+  S.docs = {};
+  for (const line of jsonl.split("\n")) {
+    if (!line.trim()) continue;
+    const d = JSON.parse(line);
+    S.docs[d.shot_id] = d;
+  }
+  // Speaker names come from cast-resolution's adjudicated speaker map
+  // (never heuristic solo-shot binding), and each shows its person type
+  // so uncertainty stays visible.
+  S.spkName = {};
+  for (const t of run.speakers) {
+    if (t.name && !S.spkName[t.speaker]) {
+      S.spkName[t.speaker] = { name: t.name, type: t.person_type };
+    }
+  }
+  S.pages = S.mode === "news" ? assignPages(run.stories) : [];
+  S.view = { t0: 0, t1: run.duration_sec };
+
+  S.asset = a;
+  try {
+    v.src = await presign(a, "video");
+  } catch (e) {
+    v.removeAttribute("src");
+    alert(`video unavailable: ${e.message}`);
+  }
+  applyRate();
+  v.innerHTML = "";  // nosemgrep: html.security.audit.insecure-document-method
+  const track = document.createElement("track");
+  track.kind = "subtitles"; track.label = "transcript";
+  track.srclang = "en";
+  if (DATA.vtt) track.src = URL.createObjectURL(
+    new Blob([DATA.vtt], { type: "text/vtt" }));
+  track.default = true;
+  v.appendChild(track);
+  applySubs();
+  buildStems(a, man.stems_s3 || {});
+  $("#fDur").textContent = hms(run.duration_sec);
+  $("#fStories").textContent = S.mode === "news"
+    ? `${run.stories.length} stories`
+    : `${S.units.length} scenes · ${S.chapters.length} chapters`;
+  $("#fPeople").textContent = `${run.people.length} people`;
+  $("#frameTotal").textContent = `/ ${S.frames}`;
+  $("#tabHero").textContent = S.mode === "news" ? "Rundown" : "Scenes";
+  $("#ruFilter").placeholder = S.mode === "news"
+    ? "filter slug / headline / talent" : "filter setting / description";
+  $("#hNote").textContent = S.mode === "news"
+    ? "pages A01/B01… are GENERATED block numbering (blocks split on break gaps), not house rundown data"
+    : "scenes are SME visual units; chapters are CA dialogue segments — their boundaries may legitimately disagree";
+  $("#tabArtwork").classList.toggle("hide", !S.artwork);
+  buildHero();
+  buildTranscript();
+  buildPeople();
+  buildArtwork();
+  buildSummary();
+  buildTimeline();
+}
+
+/* Generated rundown-style pages: blocks split on >=30 s story gaps (breaks). */
+function assignPages(stories) {
+  const pages = [];
+  let block = 0, n = 0;
+  for (let i = 0; i < stories.length; i++) {
+    if (i > 0 && stories[i].start_sec - stories[i - 1].end_sec >= 30) { block++; n = 0; }
+    n++;
+    pages.push(String.fromCharCode(65 + Math.min(block, 25)) + pad(n));
+  }
+  return pages;
+}
+
+/* --------------------------------------------------- stems (synced) */
+let stemAudio = {}, activeStem = "original";
+const STEM_COL = { original: "#8d95a5", speech: "#3f7fd0", music: "#d0913f", sfx: "#46b978" };
+function buildStems(asset, stems) {
+  const host = $("#stemAudio");
+  host.innerHTML = ""; stemAudio = {};  // nosemgrep: html.security.audit.insecure-document-method
+  for (const k of ["speech", "music", "sfx"]) {
+    if (!stems[k]) continue;
+    const a = document.createElement("audio");
+    a.preload = "none";
+    presign(asset, k).then((u) => { a.src = u; }).catch(() => {});
+    // presigned URLs expire after an hour: on any media error while this
+    // stem is live, re-presign and resume in place
+    a.addEventListener("error", async () => {
+      const t = a.currentTime;
+      try { a.src = await presign(asset, k); a.currentTime = t; }
+      catch (e) { /* endpoint down — the selector click retries */ }
+    });
+    host.appendChild(a); stemAudio[k] = a;
+  }
+  activeStem = "original";
+  const sel = $("#stemsel");
+  sel.innerHTML = "";  // nosemgrep: html.security.audit.insecure-document-method
+  for (const k of ["original", ...Object.keys(stemAudio)]) {
+    const b = document.createElement("button");
+    b.setAttribute("aria-pressed", String(k === activeStem));
+    b.innerHTML = `<span class="swatch" style="background:${STEM_COL[k]}"></span>${esc(k === "original" ? "original mix" : k)}`;  // nosemgrep: html.security.audit.insecure-document-method
+    b.onclick = () => {
+      activeStem = k;
+      [...sel.children].forEach((c) => c.setAttribute("aria-pressed", "false"));
+      b.setAttribute("aria-pressed", "true");
+      syncStems(true);
+    };
+    sel.appendChild(b);
+  }
+  syncStems(true);
+}
+function syncStems(force) {
+  for (const k in stemAudio) {
+    const a = stemAudio[k];
+    if (k === activeStem) {
+      if (Math.abs(a.currentTime - v.currentTime) > (force ? 0.05 : 0.30))
+        a.currentTime = v.currentTime;
+      a.playbackRate = v.playbackRate;
+      a.muted = false; a.volume = 1;
+      if (!v.paused && a.paused) a.play().catch(() => {});
+      if (v.paused && !a.paused) a.pause();
+    } else {
+      if (!a.paused) a.pause();
+      a.muted = true;
+    }
+  }
+  v.muted = (activeStem !== "original");
+}
+["play", "pause", "seeked", "ratechange"].forEach((e) =>
+  v.addEventListener(e, () => syncStems(true)));
+v.addEventListener("timeupdate", () => syncStems(false));
+
+// presigned video expires after an hour: re-presign and resume in place
+v.addEventListener("error", async () => {
+  if (!S.asset || !v.error) return;
+  const t = v.currentTime;
+  try { v.src = await presign(S.asset, "video"); v.currentTime = t; }
+  catch (e) { /* proxy not landed yet — the asset picker retries */ }
+});
+
+let subsOn = true;
+// Chrome cue-repaint glitch: after a seek, previously painted cues can
+// stay on screen even though they are no longer active. Toggling the
+// track mode off/on forces the cue layer to recompute and repaint.
+v.addEventListener("seeked", () => {
+  if (!subsOn) return;
+  for (const t of v.textTracks) t.mode = "hidden";
+  requestAnimationFrame(() => applySubs());
+});
+function applySubs() {
+  for (const t of v.textTracks) t.mode = subsOn ? "showing" : "hidden";
+  const b = $("#btnSubs");
+  if (b) { b.setAttribute("aria-pressed", String(subsOn));
+           b.textContent = `subtitles ${subsOn ? "on" : "off"}`; }
+}
+
+/* -------------------------------------------------------------- transport */
+// Seeks NEVER start playback: a click on the timeline / a rundown row /
+// a tile is an INSPECTION — the reviewer lands on a frame and steps from
+// it. Play state is preserved (playing stays playing, paused stays put).
+const seekTo = (t) => { v.currentTime = t; };
+
+/* trick play — playbackRate rides into the active stem via syncStems'
+   ratechange hook. A new source resets the element to defaultPlaybackRate,
+   so both are set and loadAsset re-applies. */
+const RATES = [0.5, 1, 2, 5, 10];
+let rate = 1;
+function applyRate() {
+  v.defaultPlaybackRate = rate;
+  v.playbackRate = rate;
+  $$("#ratesel button").forEach((b) =>
+    b.setAttribute("aria-pressed", String(+b.dataset.r === rate)));
+}
+{
+  const host = $("#ratesel");
+  for (const r of RATES) {
+    const b = document.createElement("button");
+    b.dataset.r = r;
+    b.textContent = `${r}×`;
+    b.onclick = () => { rate = r; applyRate(); };
+    host.appendChild(b);
+  }
+}
+$("#btnPlay").onclick = () => (v.paused ? v.play() : v.pause());
+v.addEventListener("play",  () => { $("#btnPlay").textContent = "❚❚"; });
+v.addEventListener("pause", () => { $("#btnPlay").textContent = "▶"; });
+$("#btnBack1").onclick = () => { v.pause(); goToFrame(frameAt(v.currentTime) - 1); };
+$("#btnFwd1").onclick  = () => { v.pause(); goToFrame(frameAt(v.currentTime) + 1); };
+
+function stepStory(dir) {
+  const t = v.currentTime;
+  const starts = S.units.map((s) => s.start_sec);
+  const next = dir > 0
+    ? starts.find((x) => x > t + 0.05)
+    : [...starts].reverse().find((x) => x < t - 0.5);
+  if (next != null) seekTo(next);
+}
+$("#btnPrevSeg").onclick = () => stepStory(-1);
+$("#btnNextSeg").onclick = () => stepStory(1);
+$("#btnBoundL").onclick = () => {
+  const s = S.units[S.curStory];
+  if (s) v.currentTime = s.start_sec;
+};
+$("#btnBoundR").onclick = () => {
+  const s = S.units[S.curStory];
+  if (s) v.currentTime = Math.max(s.start_sec, s.end_sec - 1 / S.fps);
+};
+$("#frameBox").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { goToFrame(+e.target.value || 0); e.target.blur(); }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT") return;
+  if (e.code === "Space") { e.preventDefault(); $("#btnPlay").click(); }
+  else if (e.code === "ArrowLeft")  { v.pause(); goToFrame(frameAt(v.currentTime) - (e.shiftKey ? 10 : 1)); }
+  else if (e.code === "ArrowRight") { v.pause(); goToFrame(frameAt(v.currentTime) + (e.shiftKey ? 10 : 1)); }
+  else if (e.code === "ArrowUp")    { e.preventDefault(); stepStory(-1); }
+  else if (e.code === "ArrowDown")  { e.preventDefault(); stepStory(1); }
+  else if (e.key === "[") $("#btnBoundL").click();
+  else if (e.key === "]") $("#btnBoundR").click();
+  else if (e.key === "+" || e.key === "=") zoom(1 / 1.4);
+  else if (e.key === "-") zoom(1.4);
+  else if (e.key === "0") { S.view = { t0: 0, t1: S.run.duration_sec }; drawAll(); }
+});
+
+/* ---------------------------------------------------------------- rundown */
+function storyMeta(s) {
+  const bits = [];
+  if (s.correspondent) bits.push(s.correspondent);
+  if (s.locators?.length) bits.push(s.locators[0]);
+  if (s.headline_banners?.length) bits.push(`“${s.headline_banners[0]}”`);
+  return bits.join(" · ");
+}
+function buildRundown() {
+  const q = $("#ruFilter").value.trim().toLowerCase();
+  const host = $("#ruList");
+  host.innerHTML = "";  // nosemgrep: html.security.audit.insecure-document-method
+  S.run.stories.forEach((s, i) => {
+    const hay = `${s.slug} ${s.headline} ${s.correspondent || ""}`.toLowerCase();
+    if (q && !hay.includes(q)) return;
+    const [vLbl, vCls] = VERDICT[s.presentation_verdict] || ["", ""];
+    const row = document.createElement("div");
+    row.className = "row";
+    row.dataset.i = i;
+    // nosemgrep: html.security.audit.insecure-document-method
+    row.innerHTML = `
+      <span class="pg" title="generated page: block ${S.pages[i][0]} (blocks split on break gaps), story ${+S.pages[i].slice(1)}">${S.pages[i]}</span>
+      <span class="tcv">${hms(s.start_sec)}</span>
+      <span class="body">
+        <span class="ttl"><b>${esc(s.slug)}</b> — ${esc(s.headline)}</span>
+        <span class="meta">${esc(storyMeta(s))}</span>
+      </span>
+      <span class="right">
+        <span class="chipf" style="background:${formColor(s.news_form)}" title="story FORM (from the transcript): ${esc(s.news_form)}">${FORM_SHORT[s.news_form] || esc(s.news_form)}</span>${vLbl ? `<span class="vd ${vCls}" title="PRESENTATION verdict (video evidence × transcript interaction): ${esc(s.presentation_verdict)}">${vLbl}</span>` : ""}
+        <span class="dur">${mmss(s.end_sec - s.start_sec)}</span>
+      </span>`;
+    row.onclick = () => seekTo(s.start_sec);
+    host.appendChild(row);
+  });
+}
+
+/* narrative hero: SME scenes (the follow units), then the CA chapters
+   as a second section — two sections, never nested: visual scenes and
+   dialogue chapters legitimately disagree on boundaries */
+function buildScenes() {
+  const q = $("#ruFilter").value.trim().toLowerCase();
+  const host = $("#ruList");
+  host.innerHTML = "";  // nosemgrep: html.security.audit.insecure-document-method
+  S.units.forEach((u, i) => {
+    const sc = u.scene;
+    const desc = (sc.shot_descriptions?.[0]?.description) || "";
+    const setting = sc.setting && sc.setting !== "None" ? sc.setting : "";
+    const hay = `${setting} ${desc} ${sc.boundary_reason || ""}`.toLowerCase();
+    if (q && !hay.includes(q)) return;
+    const row = document.createElement("div");
+    row.className = "row";
+    row.dataset.i = i;
+    // nosemgrep: html.security.audit.insecure-document-method
+    row.innerHTML = `
+      <span class="pg">${esc(sc.scene_id)}</span>
+      <span class="tcv">${hms(u.start_sec)}</span>
+      <span class="body">
+        <span class="ttl"><b>${esc(setting || `scene ${sc.scene_id}`)}</b>${desc ? " — " + esc(desc) : ""}</span>
+        <span class="meta">${esc([sc.boundary_reason, sc.time_of_day]
+          .filter((x) => x && x !== "indeterminate").join(" · "))}</span>
+      </span>
+      <span class="right">
+        ${sc.sentiment ? `<span class="chipf" style="background:${sentColor(sc.sentiment)}" title="scene sentiment">${esc(sc.sentiment)}</span>` : ""}
+        <span class="dur">${mmss(u.end_sec - u.start_sec)} · ${esc(sc.shot_count)} shots</span>
+      </span>`;
+    row.onclick = () => seekTo(u.start_sec);
+    host.appendChild(row);
+  });
+  const h = document.createElement("div");
+  h.className = "sect"; h.style.padding = "8px 9px 2px";
+  h.innerHTML = `<div class="sk">Chapters (dialogue)</div>`;  // nosemgrep: html.security.audit.insecure-document-method
+  host.appendChild(h);
+  S.chapters.forEach((c) => {
+    const g = c.g;
+    if (q && !`${g.segment_topic || ""} ${g.tone || ""}`.toLowerCase().includes(q)) return;
+    const row = document.createElement("div");
+    row.className = "row";
+    // nosemgrep: html.security.audit.insecure-document-method
+    row.innerHTML = `
+      <span class="pg"></span>
+      <span class="tcv">${hms(c.t0)}</span>
+      <span class="body">
+        <span class="ttl">${esc(g.segment_topic || "")}</span>
+        <span class="meta">${esc([g.conversation_type, g.tone].filter(Boolean).join(" · "))}</span>
+      </span>
+      <span class="right">
+        ${g.sentiment ? `<span class="chipf" style="background:${sentColor(g.sentiment)}">${esc(g.sentiment)}</span>` : ""}
+        <span class="dur">${mmss(c.t1 - c.t0)}</span>
+      </span>`;
+    row.onclick = () => seekTo(c.t0);
+    host.appendChild(row);
+  });
+}
+
+function buildHero() { S.mode === "news" ? buildRundown() : buildScenes(); }
+$("#ruFilter").oninput = buildHero;
+
+/* ------------------------------------------------------------- transcript */
+function buildTranscript() {
+  const q = $("#trFilter").value.trim().toLowerCase();
+  const host = $("#trList");
+  host.innerHTML = "";  // nosemgrep: html.security.audit.insecure-document-method
+  const frag = document.createDocumentFragment();
+  S.sentences.forEach((sn, i) => {
+    if (q && !`${sn.text} ${sn.speaker_id} ${S.spkName[sn.speaker_id]?.name || ""}`
+        .toLowerCase().includes(q)) return;
+    const el = document.createElement("div");
+    el.className = "turn";
+    el.dataset.i = i;
+    const nm = S.spkName[sn.speaker_id];
+    // nosemgrep: html.security.audit.insecure-document-method
+    el.innerHTML = `
+      <span class="tcv">${hms(sn.start)}</span>
+      <span class="who" title="${nm ? `cast-resolution: ${esc(nm.type || "")} (diarization ${esc(sn.speaker_id)})` : "unnamed diarization cluster"}">${nm ? esc(nm.name) : esc(sn.speaker_id)}</span>
+      <span class="txt">${esc(sn.text)}</span>`;
+    el.onclick = () => seekTo(sn.start);
+    frag.appendChild(el);
+  });
+  host.appendChild(frag);
+}
+$("#trFilter").oninput = buildTranscript;
+
+/* ------------------------------------------------------------ people tiles */
+function buildPeople() {
+  const host = $("#peTiles");
+  host.innerHTML = "";  // nosemgrep: html.security.audit.insecure-document-method
+  $("#peCount").textContent = S.mode === "news"
+    ? `${S.run.people.length} named — anchors, correspondents, talent, then guests/subjects`
+    : `${S.run.people.length} named cast — character names from the credits (cast-resolution)`;
+  for (const p of S.run.people) {
+    const badge = personBadge(p);
+    const tile = document.createElement("div");
+    tile.className = "ptile" + (p.review_flag ? " flagged" : "");
+    tile.title = (p.review_flag
+      ? `\u26a0 machine-flagged (${p.review_flag.field}): `
+        + `${p.review_flag.reason}\n`
+      : "") + `${p.name}`
+      + (p.character_name ? ` — plays ${p.character_name}` : "")
+      + (S.mode === "news" && p.role ? ` — ${p.role.replace("_or_subject", "/subject")}` : "")
+      + `, ${Math.round(p.screen_time_sec || 0)}s on screen, `
+      + `${Math.round(p.speech_time_sec || 0)}s speaking, `
+      + `${p.appearances.length} appearances`
+      + (p.person_type ? ` — cast-resolution: ${p.person_type}` : "")
+      + (p.name_mechanisms?.length ? ` (named via ${p.name_mechanisms.join(", ")})` : "");
+    const initials = p.name.split(/\s+/).map((w) => w[0] || "").join("").slice(0, 2);
+    // nosemgrep: html.security.audit.insecure-document-method
+    tile.innerHTML = `
+      ${p.face ? `<img src="${esc((DATA.media.faces || {})[p.face] || "")}" loading="lazy" onerror="this.outerHTML='<div class=noface>${esc(esc(initials))}</div>'">`
+               : `<div class="noface">${esc(initials)}</div>`}
+      ${badge ? `<span class="rb" style="background:${badge.col}">${esc(badge.txt)}</span>` : ""}
+      <span class="nm">${esc(p.name)}<span class="st">${Math.round(p.screen_time_sec || 0)}s · ${Math.round(p.speech_time_sec || 0)}s spoken · ${p.appearances.length}×</span></span>`;
+    tile.onclick = () => p.appearances.length && seekTo(p.appearances[0][0]);
+    host.appendChild(tile);
+  }
+}
+
+/* -------------------------------------------------- shot inspector  */
+function card(k, val) {
+  return (val == null || val === "" || val === false)
+    ? "" : `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(String(val))}</div></div>`;
+}
+const chapterAt = (t) => {
+  const c = S.chapters.find((x) => t >= x.t0 && t < x.t1);
+  return c && c.g;
+};
+function renderShot() {
+  const shot = S.shots.find((x) => v.currentTime >= x.start_time && v.currentTime < x.end_time);
+  const d = shot && S.docs[shot.shot_id];
+  if (!d) { $("#shotBody").innerHTML = `<span class="dim">no shot document here</span>`; return; }  // nosemgrep: html.security.audit.insecure-document-method
+  const st = S.mode === "news" && S.curStory >= 0 && S.run.stories[S.curStory];
+  const cg = S.mode === "news"
+    ? (S.curStory >= 0 && S.ca[S.curStory]) : chapterAt(v.currentTime);
+  const sc = S.mode !== "news" && S.curStory >= 0
+    && S.units[S.curStory] && S.units[S.curStory].scene;
+  // nosemgrep: html.security.audit.insecure-document-method
+  $("#shotBody").innerHTML = `
+    <div class="shdr">
+      <h3>Shot ${esc(d.shot_id)}</h3>
+      <span class="tcv">${tcOf(shot.start_time)} → ${tcOf(shot.end_time)}</span>
+      <span class="pill">${(shot.end_time - shot.start_time).toFixed(2)}s</span>
+      <span class="pill">${esc(shot.shot_type || "content")}</span>
+    </div>
+    <div class="desc">${esc(d.description)}</div>
+    <div class="cards">
+      ${card("shot kind", d.shot_kind)}
+      ${card("camera framing", d.camera_shot_type)}
+      ${card("news setting", d.news_setting)}
+      ${card("setting", d.setting)}
+      ${card("time of day", d.time_of_day)}
+      ${card("lighting", (d.lighting || []).join(" · "))}
+      ${card("sentiment", d.sentiment)}
+      ${card("people in frame", d.people_count)}
+      ${card("starts a new scene", d.starts_new_scene ? "Yes" : "No")}
+      ${card("boundary reason", d.boundary_reason)}
+      ${card("live bug", d.live_bug_present ? "PRESENT" : "")}
+      ${card("unreadable text", d.unreadable_text_present ? "Yes" : "")}
+    </div>
+    ${d.supers?.length ? `<div class="sect"><div class="sk">Supers</div><div class="cards">${
+      d.supers.map((x) => card(x.super_type.replace(/_/g, " "), x.text)).join("")}</div></div>` : ""}
+    ${d.people?.length ? `<div class="sect"><div class="sk">Named faces in shot</div>
+      <div class="pills">${d.people.map((n) => `<span class="pill">${esc(n)}</span>`).join("")}</div></div>` : ""}
+    ${st ? `<div class="sect"><div class="sk">Story</div>
+      <div style="margin-bottom:6px"><span class="pill storychip">${S.pages[S.curStory]} ${esc(st.slug)}</span>
+        <span class="tcv"> ${hms(st.start_sec)} → ${hms(st.end_sec)}</span></div>
+      <div class="cards">
+        ${card("form", st.news_form)}
+        ${card("interaction", st.interaction)}
+        ${card("presentation", st.presentation_verdict)}
+        ${card("correspondent", st.correspondent)}
+        ${card("sentiment", st.sentiment)}
+        ${cg ? card("tone", cg.tone) : ""}
+      </div></div>` : ""}
+    ${sc ? `<div class="sect"><div class="sk">Scene</div>
+      <div style="margin-bottom:6px"><span class="pill storychip">scene ${esc(sc.scene_id)}</span>
+        <span class="tcv"> ${hms(+sc.start_time)} → ${hms(+sc.end_time)}</span></div>
+      <div class="cards">
+        ${card("setting", sc.setting !== "None" ? sc.setting : null)}
+        ${card("time of day", sc.time_of_day !== "indeterminate" ? sc.time_of_day : null)}
+        ${card("boundary", sc.boundary_reason)}
+        ${card("sentiment", sc.sentiment)}
+        ${card("shots", sc.shot_count)}
+      </div></div>` : ""}
+    ${!st && cg ? `<div class="sect"><div class="sk">Chapter</div>
+      <div class="cards">
+        ${card("topic", cg.segment_topic)}
+        ${card("type", cg.conversation_type)}
+        ${card("tone", cg.tone)}
+        ${card("sentiment", cg.sentiment)}
+      </div></div>` : ""}
+    ${cg?.key_events?.length ? `<div class="sect"><div class="sk">Key events</div>
+      <div class="pills">${cg.key_events.map((e) => `<span class="pill">${esc(e)}</span>`).join("")}</div></div>` : ""}
+    ${(st?.named_entities?.length ? st.named_entities : cg?.named_entities || []).length ? `<div class="sect"><div class="sk">Named entities</div>
+      <div class="pills">${(st?.named_entities?.length ? st.named_entities : cg.named_entities).map((e) => `<span class="pill">${esc(e)}</span>`).join("")}</div></div>` : ""}`;
+}
+
+/* ---------------------------------------------------------------- summary */
+function buildSummary() {
+  const R = S.run, u = S.usage || [];
+  const pipe = u.filter((x) => !x.comparison);
+  const cmp = u.filter((x) => x.comparison);
+  const sum = (xs, k) => xs.reduce((s, x) => s + (x[k] || 0), 0);
+  const rowOf = (x, cls = "") => `
+    <tr class="${cls}"><td>${esc(x.workflow)}</td>
+        <td class="num">${x.cost != null ? "$" + x.cost.toFixed(2) : "–"}</td>
+        <td class="num">${x.wall_sec != null ? mmss(x.wall_sec) : "–"}</td>
+        <td class="dim">${x.detail?.total_input_tokens
+          ? `${(x.detail.total_input_tokens / 1000).toFixed(0)}k in / ${(x.detail.total_output_tokens / 1000).toFixed(0)}k out tok`
+          : (x.detail?.actual_frame_count ? `${esc(x.detail.actual_frame_count.toLocaleString())} frames` : "")}</td></tr>`;
+  void cmp;   // A/B experiment rows exist in usage_summary.json but are
+              // not displayed (user decision 2026-08-24)
+  const rows = pipe.map((x) => rowOf(x)).join("") +
+    `<tr class="tot"><td>E2E pipeline total</td><td class="num">$${sum(pipe, "cost").toFixed(2)}</td>
+        <td class="num">${mmss(sum(pipe, "wall_sec"))}</td><td class="dim">sequential sum — stages ran in parallel</td></tr>`;
+  const hdr = S.caHeader || {};
+  const stories = R.stories || [];
+  const forms = {};
+  for (const s of stories) forms[s.news_form] = (forms[s.news_form] || 0) + 1;
+  const rec = S.recurrence || {};
+  const scenesN = (S.scenes?.scenes || []).length;
+  const repairs = (S.scenes?.pairing_repairs || []).length;
+  const banners = new Set();
+  for (const s of stories) for (const b of s.headline_banners || []) banners.add(b);
+  const brands = R.program_brands || [];
+  const mkN = Object.values(S.structure?.markers || {})
+    .reduce((n, a) => n + (a || []).length, 0);
+  // nosemgrep: html.security.audit.insecure-document-method
+  $("#summaryBody").innerHTML = `
+    <div class="sect"><div class="sk">Programme</div>
+      <div class="cards">
+        ${card("program (as branded on screen)",
+               brands.length ? brands[0].text : null)}
+        ${card("program (as spoken)", hdr.program_name)}
+        ${card("content type", hdr.overall_content_type)}
+        ${card("genres", (hdr.top_3_genres || []).join(" · "))}
+        ${card("duration", hms(R.duration_sec))}
+        ${card("frames", S.frames.toLocaleString() + " @ " + S.fps.toFixed(2) + " fps")}
+        ${S.mode === "news"
+          ? card("stories", stories.length)
+            + card("blocks", new Set(S.pages.map((p) => p[0])).size)
+          : card("chapters", S.chapters.length)
+            + card("acts (PSA sequences)", (S.structure?.sequences || []).length || null)}
+        ${card("scenes", scenesN)}
+        ${card("boundary repairs", repairs)}
+        ${card("shots", S.shots.length)}
+        ${S.structure ? card("structure markers", mkN)
+            + card("break candidates", (S.structure.break_candidates || []).length) : ""}
+        ${card("recurring groups", rec.total_groups)}
+        ${card("named people (cast-resolution)", R.people.length)}
+        ${card("speaker clusters", new Set(R.speakers.map((t) => t.speaker)).size)}
+        ${card("cast-named turns",
+               `${R.speakers.filter((t) => t.name).length} / ${R.speakers.length}`)}
+        ${card("credit/graphic text blocks", (R.credits || []).length)}
+      </div></div>
+    <div class="sect"><div class="sk">Pipeline cost & processing time</div>
+      <table class="sumtbl">
+        <thead><tr><th>workflow</th><th>est. cost</th><th>wall</th><th></th></tr></thead>
+        <tbody>${rows}
+        </tbody></table></div>
+    ${S.mode !== "news" ? "" : `<div class="sect"><div class="sk">Story forms</div>
+      <div class="pills">${Object.entries(forms).sort((a, b) => b[1] - a[1])
+        .map(([f, n]) => `<span class="pill"><span class="swatch" style="background:${formColor(f)}"></span> ${esc(f)} × ${n}</span>`).join("")}</div></div>
+    <div class="sect"><div class="sk">Headline banners read off screen (${banners.size})</div>
+      <div class="pills">${[...banners].slice(0, 24).map((b) => `<span class="pill">${esc(b)}</span>`).join("")}</div></div>`}`;
+}
+
+/* ------------------------------------------------------------------- tabs */
+$$("#tabs .tab").forEach((b) => b.onclick = () => {
+  $$("#tabs .tab").forEach((x) => x.classList.remove("on"));
+  b.classList.add("on");
+  $$(".tabPane").forEach((p) => p.classList.remove("on"));
+  $(`#pane-${b.dataset.pane}`).classList.add("on");
+  if (b.dataset.pane === "shot") renderShot();
+  if (b.dataset.pane === "transcript") { S.curTurn = -1; }
+});
+
+/* --------------------------------------------------------------- timeline
+ * Rows own their canvases; GROUPS collapse by hiding rows. One shared view
+ * window {t0,t1}; every draw maps through it. */
+const GROUPS = [];        // {name, el, rows:[{canvas, draw, blocksAt}], open}
+const LABEL_W = 148;
+
+function rowEl(labelHTML, h) {
+  const tr = document.createElement("div");
+  tr.className = "trow";
+  tr.innerHTML = `<span class="rlabel">${labelHTML}</span>`;  // nosemgrep: html.security.audit.insecure-document-method
+  const c = document.createElement("canvas");
+  c.style.height = `${h}px`;
+  tr.appendChild(c);
+  return { tr, c };
+}
+function group(name, count, open = true) {
+  const el = document.createElement("div");
+  el.className = "tgroup";
+  const hdr = document.createElement("div");
+  hdr.className = "ghdr";
+  el.appendChild(hdr);
+  $("#groups").appendChild(el);
+  const g = { name, count, el, hdr, rows: [], open };
+  hdr.onclick = () => { g.open = !g.open; applyGroup(g); drawAll(); };
+  GROUPS.push(g);
+  return g;
+}
+function applyGroup(g) {
+  g.hdr.innerHTML = `<span class="tri">${g.open ? "▾" : "▸"}</span>` +  // nosemgrep: html.security.audit.insecure-document-method
+    `${esc(g.name)} <span class="cnt">· ${g.count}</span>` +
+    (g.open ? "" : `<span class="hid">hidden</span>`);
+  for (const r of g.rows) r.tr.style.display = g.open ? "" : "none";
+}
+
+/* block-row helper: draw [{t0,t1,color}] and answer hover queries */
+function blockRow(g, labelHTML, h, blocks, tipOf) {
+  const { tr, c } = rowEl(labelHTML, h);
+  g.el.appendChild(tr);
+  const row = {
+    tr, c,
+    draw() {
+      const ctx = size(c);
+      for (const b of blocks) {
+        if (b.t1 < S.view.t0 || b.t0 > S.view.t1) continue;
+        ctx.fillStyle = b.color;
+        const x0 = tx(b.t0, c), x1 = tx(b.t1, c);
+        ctx.fillRect(x0, 1, Math.max(x1 - x0, 1.5), c.clientHeight - 2);
+      }
+    },
+    hit(t) { return blocks.find((b) => t >= b.t0 && t <= b.t1); },
+    tipOf,
+  };
+  g.rows.push(row);
+  wireRow(row);
+  return row;
+}
+/* waveform masked to intervals — the speaker lanes: the SPEECH stem's
+   energy drawn only inside that speaker's turns, so a diarization span
+   with no real speech under it shows as the silence it is. */
+function maskedWaveRow(g, labelHTML, h, envName, color, turns, tipOf) {
+  const { tr, c } = rowEl(labelHTML, h);
+  g.el.appendChild(tr);
+  const row = {
+    tr, c,
+    draw() {
+      const ctx = size(c);
+      const e = S.env[envName];
+      if (!e) return;
+      const H = c.clientHeight, mid = H / 2, W = c.clientWidth;
+      ctx.fillStyle = color;
+      const secPerPx = (S.view.t1 - S.view.t0) / W;
+      let ti = 0;
+      for (let x = 0; x < W; x++) {
+        const ta = S.view.t0 + x * secPerPx, tb = ta + secPerPx;
+        while (ti < turns.length && turns[ti].end < ta) ti++;
+        let k = ti, covered = false;
+        while (k < turns.length && turns[k].start < tb) {
+          if (turns[k].end > ta) { covered = true; break; }
+          k++;
+        }
+        if (!covered) continue;
+        let peak = 0;
+        for (let i = Math.floor(ta / e.bin_sec);
+             i <= Math.min(Math.floor(tb / e.bin_sec), e.rms.length - 1); i++)
+          peak = Math.max(peak, e.rms[i] || 0);
+        const half = Math.max(peak * (H / 2 - 1), 0.5);
+        ctx.fillRect(x, mid - half, 1, half * 2);
+      }
+    },
+    hit(t) { return turns.find((b) => t >= b.start && t <= b.end); },
+    tipOf,
+  };
+  g.rows.push(row);
+  wireRow(row);
+  return row;
+}
+
+function waveRow(g, labelHTML, h, envName, color) {
+  const { tr, c } = rowEl(labelHTML, h);
+  g.el.appendChild(tr);
+  const row = {
+    tr, c,
+    draw() {
+      const ctx = size(c);
+      const e = S.env[envName];
+      if (!e) return;
+      const H = c.clientHeight, mid = H / 2, W = c.clientWidth;
+      ctx.fillStyle = color;
+      const secPerPx = (S.view.t1 - S.view.t0) / W;
+      for (let x = 0; x < W; x++) {
+        const a = (S.view.t0 + x * secPerPx) / e.bin_sec;
+        const b = (S.view.t0 + (x + 1) * secPerPx) / e.bin_sec;
+        let peak = 0;
+        for (let i = Math.floor(a); i <= Math.min(Math.floor(b), e.rms.length - 1); i++)
+          peak = Math.max(peak, e.rms[i] || 0);
+        const half = Math.max(peak * (H / 2 - 1), 0.5);
+        ctx.fillRect(x, mid - half, 1, half * 2);
+      }
+    },
+    hit() { return null; },
+  };
+  g.rows.push(row);
+  wireRow(row);
+  return row;
+}
+
+const tx = (t, c) => ((t - S.view.t0) / (S.view.t1 - S.view.t0)) * c.clientWidth;
+const xt = (x, c) => S.view.t0 + (x / c.clientWidth) * (S.view.t1 - S.view.t0);
+function size(c) {
+  const dpr = window.devicePixelRatio || 1;
+  if (c.width !== c.clientWidth * dpr || c.height !== c.clientHeight * dpr) {
+    c.width = c.clientWidth * dpr;
+    c.height = c.clientHeight * dpr;
+  }
+  const ctx = c.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, c.clientWidth, c.clientHeight);
+  return ctx;
+}
+
+/* pan / zoom / seek / tooltip wiring, shared by every row + the ruler */
+let dragging = null;
+function wireRow(row) {
+  const c = row.c;
+  c.addEventListener("mousedown", (e) => {
+    dragging = { x: e.clientX, t0: S.view.t0, t1: S.view.t1, moved: false, c };
+  });
+  c.addEventListener("mousemove", (e) => {
+    if (dragging && dragging.c === c) {
+      const dt = (dragging.x - e.clientX) / c.clientWidth * (dragging.t1 - dragging.t0);
+      if (Math.abs(dragging.x - e.clientX) > 3) dragging.moved = true;
+      panTo(dragging.t0 + dt, dragging.t1 + dt);
+      return;
+    }
+    const t = xt(e.offsetX, c);
+    const b = row.hit ? row.hit(t) : null;
+    const tip = $("#tip");
+    if (b && row.tipOf) {
+      tip.innerHTML = row.tipOf(b);  // nosemgrep: html.security.audit.insecure-document-method
+      tip.style.left = `${Math.min(e.clientX + 14, innerWidth - 400)}px`;
+      tip.style.top = `${e.clientY - 12}px`;
+      tip.classList.remove("hide");
+    } else tip.classList.add("hide");
+  });
+  c.addEventListener("mouseleave", () => $("#tip").classList.add("hide"));
+  c.addEventListener("mouseup", (e) => {
+    if (dragging && !dragging.moved) {
+      const t = xt(e.offsetX, c);
+      const b = row.hit ? row.hit(t) : null;
+      seekTo(b && b.seek != null ? b.seek : t);
+    }
+    dragging = null;
+  });
+  c.addEventListener("wheel", (e) => {
+    // Zoom only with CTRL (or pinch, which Chrome reports as ctrl+wheel);
+    // a plain wheel keeps its native meaning — scrolling the lane stack.
+    if (!e.ctrlKey && !e.metaKey) return;
+    e.preventDefault();
+    zoom(e.deltaY > 0 ? 1.25 : 1 / 1.25, xt(e.offsetX, c));
+  }, { passive: false });
+}
+document.addEventListener("mouseup", () => { dragging = null; });
+
+function panTo(t0, t1) {
+  const dur = S.run.duration_sec, span = t1 - t0;
+  t0 = Math.max(0, Math.min(t0, dur - span));
+  S.view = { t0, t1: t0 + span };
+  drawAll();
+}
+function zoom(factor, centre) {
+  const dur = S.run.duration_sec;
+  centre = centre ?? (S.view.t0 + S.view.t1) / 2;
+  let span = Math.min(dur, Math.max(5, (S.view.t1 - S.view.t0) * factor));
+  const frac = (centre - S.view.t0) / (S.view.t1 - S.view.t0);
+  let t0 = centre - frac * span;
+  t0 = Math.max(0, Math.min(t0, dur - span));
+  S.view = { t0, t1: t0 + span };
+  drawAll();
+}
+$("#zIn").onclick = () => zoom(1 / 1.4);
+$("#zOut").onclick = () => zoom(1.4);
+$("#zFit").onclick = () => { S.view = { t0: 0, t1: S.run.duration_sec }; drawAll(); };
+
+function drawRuler() {
+  const c = $("#rulerC");
+  const ctx = size(c);
+  const span = S.view.t1 - S.view.t0;
+  const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800];
+  const step = steps.find((s) => (span / s) * 62 < c.clientWidth) || 3600;
+  ctx.fillStyle = "#8d95a5";
+  ctx.font = "10px -apple-system, sans-serif";
+  ctx.textBaseline = "top";
+  ctx.strokeStyle = "#333844";
+  for (let t = Math.ceil(S.view.t0 / step) * step; t <= S.view.t1; t += step) {
+    const x = tx(t, c);
+    ctx.beginPath(); ctx.moveTo(x, 12); ctx.lineTo(x, 18); ctx.stroke();
+    ctx.fillText(hms(t), x + 3, 2);
+  }
+  $("#tlRange").textContent = `${hms(S.view.t0)} – ${hms(S.view.t1)}`;
+}
+{ /* the ruler pans/zooms/seeks like a row */
+  const c = $("#rulerC");
+  wireRow({ c, hit: () => null });
+}
+
+function drawAll() {
+  drawRuler();
+  for (const g of GROUPS) if (g.open) for (const r of g.rows) r.draw();
+}
+window.addEventListener("resize", () => S.run && drawAll());
+
+function buildTimeline() {
+  GROUPS.length = 0;
+  $("#groups").innerHTML = "";  // nosemgrep: html.security.audit.insecure-document-method
+  const R = S.run;
+
+  if (S.mode === "news") {
+    const gS = group("STORIES", R.stories.length, true);
+    blockRow(gS, `<span></span>`, 20,
+      R.stories.map((s, i) => ({ t0: s.start_sec, t1: s.end_sec,
+        color: formColor(s.news_form), seek: s.start_sec, i })),
+      (b) => { const s = R.stories[b.i];
+        return `<b>${S.pages[b.i]} ${esc(s.slug)}</b>\n${esc(s.headline)}\n${esc(s.news_form)} · ${esc(s.presentation_verdict)}${s.correspondent ? " · " + esc(s.correspondent) : ""}`; });
+
+    const gC = group("CONVERSATION ANALYSIS", S.ca.length, false);
+    blockRow(gC, `<span>interaction</span>`, 14,
+      S.ca.map((g2, i) => {
+        const st = R.stories[i] || {};
+        return { t0: st.start_sec ?? 0, t1: st.end_sec ?? 0,
+                 color: INTER_COL[g2.interaction] || "#5a6274", seek: st.start_sec, i };
+      }),
+      (b) => { const g2 = S.ca[b.i];
+        return `<b>${esc(g2.slug || "")}</b>\n${esc(g2.segment_topic)}\ninteraction ${esc(g2.interaction || "none")} · ${esc(g2.sentiment || "")} · ${esc(g2.tone || "")}${g2.sig_out && g2.sig_out !== "None" ? `\nsig-out: ${esc(g2.sig_out)}` : ""}`; });
+  } else {
+    const gSc = group("SCENES", S.units.length, true);
+    blockRow(gSc, `<span></span>`, 20,
+      S.units.map((u, i) => ({ t0: u.start_sec, t1: u.end_sec,
+        color: i % 2 ? "#28425a" : "#20303f", seek: u.start_sec, i })),
+      (b) => { const sc = S.units[b.i].scene;
+        return `<b>scene ${esc(sc.scene_id)}</b> · ${esc(sc.shot_count)} shots\n${hms(b.t0)}–${hms(b.t1)}${sc.setting && sc.setting !== "None" ? "\n" + esc(sc.setting) : ""}${sc.boundary_reason ? " · " + esc(sc.boundary_reason) : ""}`; });
+
+    const gCh = group("CHAPTERS", S.chapters.length, true);
+    blockRow(gCh, `<span>dialogue</span>`, 14,
+      S.chapters.map((c, i) => ({ t0: c.t0, t1: c.t1,
+        color: sentColor(c.g.sentiment), seek: c.t0, i })),
+      (b) => { const g2 = S.chapters[b.i].g;
+        return `<b>${esc(g2.segment_topic || "")}</b>\n${esc(g2.conversation_type || "")} · ${esc(g2.tone || "")} · ${esc(g2.sentiment || "")}`; });
+  }
+
+  const gSh = group("SHOTS", S.shots.length, true);
+  blockRow(gSh, `<span>${S.mode === "news" ? "news setting" : "shots"}</span>`, 14,
+    S.shots.map((sh, i) => {
+      const d = S.docs[sh.shot_id] || {};
+      return { t0: sh.start_time, t1: sh.end_time,
+               color: S.mode === "news"
+                 ? (SETTING_COL[d.news_setting] || "#2c313a")
+                 : (i % 2 ? "#39404d" : "#2c313a"),
+               seek: sh.start_time, id: sh.shot_id };
+    }),
+    (b) => { const d = S.docs[b.id] || {};
+      return `<b>shot ${esc(b.id)}</b>${d.news_setting ? " · " + esc(d.news_setting) : ""}${d.live_bug_present ? " · LIVE bug" : ""}\n${esc(d.description || "")}`; });
+
+  // PROGRAM STRUCTURE (optional module, both modes): PSA markers,
+  // break candidates, and the acts lane from narrative sequences
+  if (S.structure) {
+    const mk = S.structure.markers || {};
+    const mkRows = Object.entries(mk).filter(([, a]) => (a || []).length);
+    const brk = S.structure.break_candidates || [];
+    const seqs = S.structure.sequences || [];
+    const total = mkRows.reduce((n, [, a]) => n + a.length, 0)
+      + brk.length + seqs.length;
+    if (total) {
+      const gSt = group("PROGRAM STRUCTURE", total, false);
+      if (seqs.length) blockRow(gSt, `<span>acts</span>`, 16,
+        seqs.map((q, i) => ({ t0: +q.start, t1: +q.end,
+          color: i % 2 ? "#3f4a5c" : "#333c4a", seek: +q.start, i })),
+        (b) => { const q = seqs[b.i];
+          return `<b>sequence ${esc(q.sequence_id ?? b.i)}</b>\n${hms(b.t0)}–${hms(b.t1)} · ${(q.scene_ids || []).length} scenes`; });
+      const MK_COL = { opening_title: "#8a7ae0", interior_title_cards: "#8a7ae0",
+        end_credits: "#a371f7", blackframes: "#11151b", slate: "#d0913f",
+        bars_and_tone: "#d05a52", textless_tail: "#4aa8c0" };
+      const mBlocks = [];
+      for (const [k, arr] of mkRows) for (const m of arr)
+        mBlocks.push({ t0: +(m.start ?? m.t0 ?? 0), t1: +(m.end ?? m.t1 ?? 0),
+          color: MK_COL[k] || "#5a6274", seek: +(m.start ?? m.t0 ?? 0), k });
+      if (mBlocks.length) blockRow(gSt, `<span>markers</span>`, 14, mBlocks,
+        (b) => `<b>${esc(b.k)}</b>\n${hms(b.t0)}–${hms(b.t1)}`);
+      if (brk.length) blockRow(gSt, `<span>break candidates</span>`, 12,
+        brk.map((x) => ({ t0: x.at, t1: x.at + 1.5, color: "#d05a52",
+          seek: x.at, x })),
+        (b) => `<b>break candidate</b>\nscore ${esc(b.x.score)}\n${esc(JSON.stringify(b.x.evidence || {}))}`);
+    }
+  }
+  const stems = Object.keys(S.env);
+  const gA = group("AUDIO STEMS", stems.length, true);
+  for (const name of ["original", "speech", "music", "sfx"]) {
+    if (!S.env[name]) continue;
+    waveRow(gA, `<span class="swatch" style="background:${STEM_COL[name]}"></span><span>${esc(name === "original" ? "original mix" : name)}</span>`,
+            26, name, STEM_COL[name]);
+  }
+
+  const talk = {};
+  for (const t of R.speakers) talk[t.speaker] = (talk[t.speaker] || 0) + (t.end - t.start);
+  const spk = Object.keys(talk).sort((a, b) => talk[b] - talk[a]).slice(0, 10);
+  const gSp = group("SPEAKERS", `${spk.length}/${Object.keys(talk).length}`, true);
+  spk.forEach((id, ci) => {
+    const turns = R.speakers.filter((t) => t.speaker === id)
+                            .map((t) => ({ start: t.start, end: t.end, seek: t.start }));
+    const nm = S.spkName[id];
+    maskedWaveRow(gSp,
+      `<span title="${nm ? `cast-resolution: ${esc(nm.type || "")} (${esc(id)})` : esc(id)}">${esc(nm ? nm.name : id)}</span><span class="rt">${mmss(talk[id])}</span>`, 20,
+      "speech", SPK_COLS[ci % SPK_COLS.length], turns,
+      (b) => `<b>${esc(nm ? `${nm.name} — ${id}` : id)}</b>\n${hms(b.start)}–${hms(b.end)}`);
+  });
+
+  const credits = R.credits || [];
+  if (credits.length) {
+    const gCr = group("CREDITS / GRAPHICS", credits.length, false);
+    blockRow(gCr, `<span>text blocks</span>`, 14,
+      credits.map((c, i) => ({ t0: c.start_sec, t1: c.end_sec,
+        color: "#8a7ae0", seek: c.start_sec, i })),
+      (b) => { const c = credits[b.i];
+        return `<b>${esc((c.kinds || []).join(" · ") || "credits")}</b>\n${hms(c.start_sec)}–${hms(c.end_sec)}${c.lines.length ? "\n" + c.lines.slice(0, 6).map(esc).join("\n") : ""}`; });
+  }
+
+  const faces = R.people.slice(0, 20);
+  const gF = group("FACES", `${faces.length}/${R.people.length}`, true);
+  for (const p of faces) {
+    const img = p.face ? `<img src="${esc((DATA.media.faces || {})[p.face] || "")}" loading="lazy">` : "";
+    blockRow(gF,
+      `${img}<span>${esc(p.name)}</span><span class="rt">${Math.round(p.screen_time_sec || 0)}s</span>`,
+      13,
+      p.appearances.map(([a, b2]) => ({ t0: a, t1: b2,
+        color: laneColor(p), seek: a })),
+      (b) => `<b>${esc(p.name)}</b>${S.mode === "news" && p.role ? ` (${esc(p.role.replace("_or_subject", ""))})` : ""}${p.character_name ? " — as " + esc(p.character_name) : ""}\n${hms(b.t0)}–${hms(b.t1)}`);
+  }
+
+  // ARTWORK candidate markers (optional module)
+  if (S.artwork) {
+    const slates = S.artwork.slates || {};
+    const AW_COL = ["#4da3ff", "#d0913f", "#46b978", "#b45fc0"];
+    const aBlocks = [];
+    Object.keys(slates).forEach((k, ki) =>
+      (slates[k].candidates || []).forEach((c2) =>
+        aBlocks.push({ t0: c2.t, t1: c2.t + 1.2, color: AW_COL[ki % 4],
+          seek: c2.t, k, c2 })));
+    if (aBlocks.length) {
+      const gAw = group("ARTWORK", aBlocks.length, false);
+      blockRow(gAw, `<span>candidates</span>`, 14, aBlocks,
+        (b) => `<b>${esc(b.k)}</b> · shot ${esc(b.c2.shot_id)}\n${esc((b.c2.description || "").slice(0, 140))}`);
+    }
+  }
+
+  for (const g of GROUPS) applyGroup(g);
+  drawAll();
+}
+
+/* artwork gallery tab (optional module): slates by archetype, tiles in
+   the vision model's ranked order, click-to-seek to the source shot */
+function buildArtwork() {
+  const host = $("#awBody");
+  if (!S.artwork) { host.innerHTML = ""; return; }  // nosemgrep: html.security.audit.insecure-document-method
+  const slates = S.artwork.slates || {};
+  let h = "";
+  for (const [k, sl] of Object.entries(slates)) {
+    const rank = (sl.vision && sl.vision.ranking) || [];
+    const pos = (c2) => { const i = rank.indexOf((c2.frame || "").split("/").pop());
+      return i < 0 ? 99 : i; };
+    const cands = (sl.candidates || []).slice().sort((a, b) => pos(a) - pos(b));
+    h += `<div class="sect"><div class="sk">${esc(k.replace(/_/g, " "))} · ${cands.length} candidates</div>`
+      + (sl.vision?.top_reason ? `<div class="dim" style="margin-bottom:6px">${esc(sl.vision.top_reason)}</div>` : "")
+      + `<div class="awRow">` + cands.map((c2) => {
+          const key = (c2.frame || "").split("/").pop();
+          const url = (DATA.media.artwork || {})[key] || "";
+          const r = pos(c2);
+          return `<figure class="awTile" data-seek="${esc(c2.t)}" title="${esc(c2.description || "")}">
+            ${url ? `<img src="${esc(url)}" loading="lazy">` : `<div class="noface">?</div>`}
+            <figcaption>${r < 99 ? `<b>#${r + 1}</b> · ` : ""}shot ${esc(c2.shot_id)} · ${hms(c2.t)}</figcaption>
+          </figure>`;
+        }).join("") + `</div></div>`;
+  }
+  host.innerHTML = h || `<span class="dim">no artwork candidates</span>`;  // nosemgrep: html.security.audit.insecure-document-method
+  host.querySelectorAll("[data-seek]").forEach((el) =>
+    el.onclick = () => seekTo(+el.dataset.seek));
+}
+
+/* ---------------------------------------------- per-frame updates + follow */
+function tick() {
+  if (S.run) {
+    const t = v.currentTime;
+    $("#clock").textContent = tcOf(t);
+    if (document.activeElement !== $("#frameBox"))
+      $("#frameBox").value = frameAt(t);
+
+    /* playhead across the whole lanes stack */
+    const wrap = $("#tlScroll");
+    const firstCanvas = $("#groups canvas");
+    if (firstCanvas) {
+      const x = tx(Math.min(Math.max(t, S.view.t0), S.view.t1), firstCanvas);
+      $("#playhead").style.left = `${LABEL_W + x}px`;
+      $("#playhead").style.display =
+        (t < S.view.t0 || t > S.view.t1) ? "none" : "";
+      /* keep the playhead in view while playing at zoom */
+      if (!v.paused && t > S.view.t1 && S.view.t1 < S.run.duration_sec) {
+        const span = S.view.t1 - S.view.t0;
+        panTo(t - span * 0.1, t - span * 0.1 + span);
+      }
+    }
+
+    const si = S.units.findIndex((x) => t >= x.start_sec && t < x.end_sec);
+    if (si !== S.curStory) {
+      S.curStory = si;
+      $$("#ruList .row").forEach((r) => r.classList.toggle("sel", +r.dataset.i === si));
+      const sel = $("#ruList .row.sel");
+      if (sel && $("#ruFollow").checked) sel.scrollIntoView({ block: "nearest" });
+      ctxLine();
+      if ($("#pane-shot").classList.contains("on")) renderShot();
+    }
+    const ti = S.sentences.findIndex((x) => t >= x.start && t < x.end);
+    if (ti !== S.curTurn) {
+      S.curTurn = ti;
+      if ($("#pane-transcript").classList.contains("on")) {
+        $$("#trList .turn").forEach((r) => r.classList.toggle("sel", +r.dataset.i === ti));
+        const sel = $("#trList .turn.sel");
+        if (sel && $("#trFollow").checked) sel.scrollIntoView({ block: "nearest" });
+      }
+    }
+    const shot = S.shots.find((x) => t >= x.start_time && t < x.end_time);
+    const sid = shot ? shot.shot_id : -1;
+    if (sid !== S.curShot) {
+      S.curShot = sid;
+      ctxLine();
+      if ($("#pane-shot").classList.contains("on")) renderShot();
+    }
+  }
+  requestAnimationFrame(tick);
+}
+function ctxLine() {
+  const d = S.curShot >= 0 && S.docs[S.curShot];
+  let html;
+  if (S.mode === "news") {
+    const s = S.curStory >= 0 && S.run.stories[S.curStory];
+    html = s
+      ? `<b>${S.pages[S.curStory]} ${esc(s.slug)}</b> — ${esc(s.headline)}<span class="sep">|</span>` +
+        `${esc(s.news_form)} · ${esc(s.presentation_verdict)}` +
+        (s.correspondent ? ` · ${esc(s.correspondent)}` : "")
+      : `<span class="dim">between stories</span>`;
+  } else {
+    const u = S.curStory >= 0 && S.units[S.curStory];
+    const cg = chapterAt(v.currentTime);
+    html = u
+      ? `<b>scene ${esc(u.scene.scene_id)}</b>` +
+        (u.scene.setting && u.scene.setting !== "None" ? ` — ${esc(u.scene.setting)}` : "") +
+        (cg ? `<span class="sep">|</span>${esc(cg.segment_topic || "")}` : "")
+      : `<span class="dim">between scenes</span>`;
+  }
+  if (d) {
+    const banner = d.supers?.find((x) => x.super_type === "headline_banner");
+    html += `<br><span class="dim">shot ${esc(d.shot_id)}` +
+      (d.news_setting ? ` · ${esc(d.news_setting)}` : "") +
+      (d.live_bug_present ? ` · LIVE bug` : "") +
+      (banner ? ` · “${esc(banner.text)}”` : "") + `</span>`;
+  }
+  $("#ctxInfo").innerHTML = html;  // nosemgrep: html.security.audit.insecure-document-method
+}
+
+$("#btnSubs").onclick = () => { subsOn = !subsOn; applySubs(); };
+
+/* -------------------------------------------------------------------- boot */
+const pick = $("#assetPick");
+for (const a of ASSETS) {
+  const o = document.createElement("option");
+  o.value = a; o.textContent = ASSET_LABEL[a] || a.toUpperCase();
+  pick.appendChild(o);
+}
+pick.onchange = () => loadAsset(pick.value);
+requestAnimationFrame(tick);
+loadAsset(ASSETS[0]);
+
+</script>
+</body>
+</html>

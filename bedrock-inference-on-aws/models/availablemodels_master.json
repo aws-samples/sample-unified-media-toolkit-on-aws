@@ -1,0 +1,874 @@
+{
+  "models": [
+    {
+      "model_name": "Amazon Nova Pro",
+      "model_id": "amazon.nova-pro-v1:0",
+      "model_type": [
+        "vision",
+        "text"
+      ],
+      "geos": [
+        "us",
+        "eu",
+        "apac"
+      ],
+      "inference_region": "geo",
+      "supported_regions": [
+        "ap-east-2",
+        "ap-northeast-1",
+        "ap-northeast-2",
+        "ap-south-1",
+        "ap-southeast-1",
+        "ap-southeast-2",
+        "ap-southeast-3",
+        "ap-southeast-4",
+        "ap-southeast-5",
+        "ap-southeast-7",
+        "apac",
+        "eu",
+        "eu-central-1",
+        "eu-north-1",
+        "eu-south-1",
+        "eu-south-2",
+        "eu-west-1",
+        "eu-west-3",
+        "il-central-1",
+        "me-central-1",
+        "us",
+        "us-east-1",
+        "us-east-2",
+        "us-west-1",
+        "us-west-2"
+      ],
+      "model_pricing": {
+        "input_per_token_cost": 8e-07,
+        "output_per_token_cost": 3.2e-06
+      },
+      "batch_job": {
+        "can_support": true
+      },
+      "capabilities": {
+        "temperature": true,
+        "thinking": "absent",
+        "effort": false,
+        "image": {
+          "limits": {
+            "max_images": 100,
+            "max_image_mb": null,
+            "max_payload_mb": 16
+          },
+          "downscales_above": {
+            "long_side_px": null,
+            "total_px": null
+          },
+          "recommendations": {
+            "min_short_side_px": 336,
+            "min_grid_long_side_px": 896,
+            "aspect_snap": [
+              [
+                1,
+                1
+              ],
+              [
+                1,
+                2
+              ],
+              [
+                1,
+                3
+              ],
+              [
+                2,
+                3
+              ],
+              [
+                3,
+                4
+              ],
+              [
+                9,
+                16
+              ]
+            ],
+            "tile_px": null,
+            "max_grid_images": 10
+          }
+        }
+      },
+      "requires_inference_profile": true
+    },
+    {
+      "model_name": "Amazon Nova 2 Lite",
+      "model_id": "amazon.nova-2-lite-v1:0",
+      "model_type": [
+        "vision",
+        "text"
+      ],
+      "geos": [
+        "us",
+        "eu",
+        "apac"
+      ],
+      "inference_region": "global",
+      "supported_regions": [
+        "global"
+      ],
+      "model_pricing": {
+        "input_per_token_cost": 3e-07,
+        "output_per_token_cost": 2.5e-06
+      },
+      "batch_job": {
+        "can_support": true
+      },
+      "capabilities": {
+        "temperature": true,
+        "thinking": "absent",
+        "effort": false,
+        "image": {
+          "limits": {
+            "max_images": 100,
+            "max_image_mb": null,
+            "max_payload_mb": 16
+          },
+          "downscales_above": {
+            "long_side_px": null,
+            "total_px": null
+          },
+          "recommendations": {
+            "min_short_side_px": 336,
+            "min_grid_long_side_px": 896,
+            "aspect_snap": [
+              [
+                1,
+                1
+              ],
+              [
+                1,
+                2
+              ],
+              [
+                1,
+                3
+              ],
+              [
+                2,
+                3
+              ],
+              [
+                3,
+                4
+              ],
+              [
+                9,
+                16
+              ]
+            ],
+            "tile_px": null,
+            "max_grid_images": 10
+          }
+        }
+      },
+      "requires_inference_profile": true
+    },
+    {
+      "model_name": "Amazon Nova Micro",
+      "model_id": "amazon.nova-micro-v1:0",
+      "model_type": [
+        "text"
+      ],
+      "geos": [
+        "us",
+        "eu",
+        "apac"
+      ],
+      "inference_region": "geo",
+      "supported_regions": [
+        "ap-east-2",
+        "ap-northeast-1",
+        "ap-northeast-2",
+        "ap-south-1",
+        "ap-southeast-1",
+        "ap-southeast-2",
+        "ap-southeast-3",
+        "ap-southeast-5",
+        "ap-southeast-7",
+        "apac",
+        "eu",
+        "eu-central-1",
+        "eu-north-1",
+        "eu-south-1",
+        "eu-south-2",
+        "eu-west-1",
+        "eu-west-3",
+        "il-central-1",
+        "me-central-1",
+        "us",
+        "us-east-1",
+        "us-east-2",
+        "us-west-2"
+      ],
+      "model_pricing": {
+        "input_per_token_cost": 3.5e-08,
+        "output_per_token_cost": 1.4e-07
+      },
+      "batch_job": {
+        "can_support": true
+      },
+      "capabilities": {
+        "temperature": true,
+        "thinking": "absent",
+        "effort": false
+      },
+      "requires_inference_profile": true
+    },
+    {
+      "model_name": "Anthropic Claude Fable 5.1",
+      "model_id": "anthropic.claude-fable-5-1",
+      "model_type": [
+        "vision",
+        "text"
+      ],
+      "geos": [
+        "us",
+        "eu",
+        "apac"
+      ],
+      "inference_region": "global",
+      "supported_regions": [
+        "global"
+      ],
+      "model_pricing": {
+        "input_per_token_cost": 1e-05,
+        "output_per_token_cost": 5e-05
+      },
+      "batch_job": {
+        "can_support": false
+      },
+      "capabilities": {
+        "temperature": false,
+        "thinking": "required",
+        "thinking_default": "adaptive",
+        "emit_max_tokens": 16384,
+        "effort": true,
+        "effort_default": "low",
+        "image": {
+          "limits": {
+            "max_images": 100,
+            "max_image_mb": 3.5,
+            "max_payload_mb": 20
+          },
+          "downscales_above": {
+            "long_side_px": 2576,
+            "total_px": 3750000
+          },
+          "recommendations": {
+            "min_short_side_px": 328,
+            "min_grid_long_side_px": null,
+            "aspect_snap": null,
+            "tile_px": null,
+            "max_grid_images": 12
+          }
+        }
+      },
+      "requires_inference_profile": true
+    },
+    {
+      "model_name": "Anthropic Claude Opus 5",
+      "model_id": "anthropic.claude-opus-5",
+      "model_type": [
+        "vision",
+        "text"
+      ],
+      "geos": [
+        "us",
+        "eu",
+        "apac"
+      ],
+      "inference_region": "global",
+      "supported_regions": [
+        "global"
+      ],
+      "model_pricing": {
+        "input_per_token_cost": 5e-06,
+        "output_per_token_cost": 2.5e-05
+      },
+      "batch_job": {
+        "can_support": true
+      },
+      "capabilities": {
+        "temperature": false,
+        "thinking": "required",
+        "thinking_default": "adaptive",
+        "emit_max_tokens": 16384,
+        "effort": true,
+        "effort_default": "low",
+        "image": {
+          "limits": {
+            "max_images": 100,
+            "max_image_mb": 3.5,
+            "max_payload_mb": 20
+          },
+          "downscales_above": {
+            "long_side_px": 2576,
+            "total_px": 3750000
+          },
+          "recommendations": {
+            "min_short_side_px": 328,
+            "min_grid_long_side_px": null,
+            "aspect_snap": null,
+            "tile_px": null,
+            "max_grid_images": 12
+          }
+        }
+      },
+      "requires_inference_profile": true
+    },
+    {
+      "model_name": "Anthropic Claude Sonnet 5.5",
+      "model_id": "anthropic.claude-sonnet-5-5",
+      "model_type": [
+        "vision",
+        "text"
+      ],
+      "geos": [
+        "us",
+        "eu",
+        "apac"
+      ],
+      "inference_region": "global",
+      "supported_regions": [
+        "global"
+      ],
+      "model_pricing": {
+        "input_per_token_cost": 2e-06,
+        "output_per_token_cost": 1e-05
+      },
+      "batch_job": {
+        "can_support": false
+      },
+      "capabilities": {
+        "temperature": false,
+        "thinking": "required",
+        "thinking_default": "adaptive",
+        "emit_max_tokens": 16384,
+        "effort": true,
+        "effort_default": "low",
+        "image": {
+          "limits": {
+            "max_images": 100,
+            "max_image_mb": 3.5,
+            "max_payload_mb": 20
+          },
+          "downscales_above": {
+            "long_side_px": 2576,
+            "total_px": 3750000
+          },
+          "recommendations": {
+            "min_short_side_px": 328,
+            "min_grid_long_side_px": null,
+            "aspect_snap": null,
+            "tile_px": null,
+            "max_grid_images": 12
+          }
+        }
+      },
+      "requires_inference_profile": true
+    },
+    {
+      "model_name": "Anthropic Claude Sonnet 4.6",
+      "model_id": "anthropic.claude-sonnet-4-6",
+      "model_type": [
+        "vision",
+        "text"
+      ],
+      "geos": [
+        "us",
+        "eu",
+        "apac"
+      ],
+      "inference_region": "global",
+      "supported_regions": [
+        "global"
+      ],
+      "model_pricing": {
+        "input_per_token_cost": 3e-06,
+        "output_per_token_cost": 1.5e-05
+      },
+      "batch_job": {
+        "can_support": true
+      },
+      "capabilities": {
+        "temperature": true,
+        "thinking": "optional",
+        "effort": true,
+        "image": {
+          "limits": {
+            "max_images": 100,
+            "max_image_mb": 3.5,
+            "max_payload_mb": 20
+          },
+          "downscales_above": {
+            "long_side_px": 1568,
+            "total_px": 1150000
+          },
+          "recommendations": {
+            "min_short_side_px": 328,
+            "min_grid_long_side_px": null,
+            "aspect_snap": null,
+            "tile_px": null,
+            "max_grid_images": 12
+          }
+        }
+      },
+      "requires_inference_profile": true
+    },
+    {
+      "model_name": "Anthropic Claude Haiku 4.5",
+      "model_id": "anthropic.claude-haiku-4-5-20251001-v1:0",
+      "model_type": [
+        "vision",
+        "text"
+      ],
+      "geos": [
+        "us",
+        "eu",
+        "apac"
+      ],
+      "inference_region": "global",
+      "supported_regions": [
+        "global"
+      ],
+      "model_pricing": {
+        "input_per_token_cost": 1e-06,
+        "output_per_token_cost": 5e-06
+      },
+      "batch_job": {
+        "can_support": true
+      },
+      "capabilities": {
+        "temperature": true,
+        "thinking": "absent",
+        "effort": false,
+        "image": {
+          "limits": {
+            "max_images": 20,
+            "max_image_mb": 3.5,
+            "max_payload_mb": 20
+          },
+          "downscales_above": {
+            "long_side_px": 1568,
+            "total_px": 1150000
+          },
+          "recommendations": {
+            "min_short_side_px": 328,
+            "min_grid_long_side_px": null,
+            "aspect_snap": null,
+            "tile_px": null,
+            "max_grid_images": 12
+          }
+        }
+      },
+      "requires_inference_profile": true
+    },
+    {
+      "model_name": "Anthropic Claude Haiku 5.5",
+      "model_id": "anthropic.claude-haiku-5-5",
+      "model_type": [
+        "vision",
+        "text"
+      ],
+      "geos": [
+        "us",
+        "eu",
+        "apac"
+      ],
+      "inference_region": "global",
+      "supported_regions": [
+        "global"
+      ],
+      "model_pricing": {
+        "input_per_token_cost": 1e-07,
+        "output_per_token_cost": 5e-07
+      },
+      "batch_job": {
+        "can_support": false
+      },
+      "capabilities": {
+        "temperature": false,
+        "thinking": "required",
+        "thinking_default": "adaptive",
+        "emit_max_tokens": 16384,
+        "effort": true,
+        "effort_default": "low",
+        "image": {
+          "limits": {
+            "max_images": 100,
+            "max_image_mb": 3.5,
+            "max_payload_mb": 20
+          },
+          "downscales_above": {
+            "long_side_px": 2576,
+            "total_px": 3750000
+          },
+          "recommendations": {
+            "min_short_side_px": 328,
+            "min_grid_long_side_px": null,
+            "aspect_snap": null,
+            "tile_px": null,
+            "max_grid_images": 12
+          }
+        }
+      },
+      "requires_inference_profile": true
+    },
+    {
+      "model_name": "Meta Llama 4 Maverick 17B Instruct",
+      "model_id": "meta.llama4-maverick-17b-instruct-v1:0",
+      "model_type": [
+        "vision",
+        "text"
+      ],
+      "geos": [
+        "us"
+      ],
+      "inference_region": "geo",
+      "supported_regions": [
+        "us",
+        "us-east-1",
+        "us-east-2",
+        "us-west-1",
+        "us-west-2"
+      ],
+      "model_pricing": {
+        "input_per_token_cost": 2.4e-07,
+        "output_per_token_cost": 9.7e-07
+      },
+      "batch_job": {
+        "can_support": true
+      },
+      "capabilities": {
+        "temperature": true,
+        "thinking": "absent",
+        "effort": false,
+        "image": {
+          "limits": {
+            "max_images": 3,
+            "max_image_mb": null,
+            "max_payload_mb": 16
+          },
+          "downscales_above": {
+            "long_side_px": null,
+            "total_px": null
+          },
+          "recommendations": {
+            "min_short_side_px": 336,
+            "min_grid_long_side_px": null,
+            "aspect_snap": null,
+            "tile_px": 336,
+            "max_grid_images": 2
+          }
+        }
+      },
+      "requires_inference_profile": true
+    },
+    {
+      "model_name": "Mistral AI Pixtral Large (25.02)",
+      "model_id": "mistral.pixtral-large-2502-v1:0",
+      "model_type": [
+        "vision",
+        "text"
+      ],
+      "geos": [
+        "us",
+        "eu"
+      ],
+      "inference_region": "geo",
+      "supported_regions": [
+        "us",
+        "eu",
+        "us-east-1",
+        "us-east-2",
+        "us-west-2",
+        "eu-central-1",
+        "eu-north-1",
+        "eu-west-1",
+        "eu-west-3"
+      ],
+      "model_pricing": {
+        "input_per_token_cost": 2e-06,
+        "output_per_token_cost": 6e-06
+      },
+      "batch_job": {
+        "can_support": false
+      },
+      "capabilities": {
+        "temperature": true,
+        "thinking": "absent",
+        "effort": false,
+        "image": {
+          "limits": {
+            "max_images": 8,
+            "max_image_mb": null,
+            "max_payload_mb": 16
+          },
+          "downscales_above": {
+            "long_side_px": null,
+            "total_px": null
+          },
+          "recommendations": {
+            "min_short_side_px": 336,
+            "min_grid_long_side_px": null,
+            "aspect_snap": null,
+            "tile_px": null,
+            "max_grid_images": 10
+          }
+        }
+      },
+      "requires_inference_profile": true
+    },
+    {
+      "model_name": "Amazon Nova Multimodal Embeddings",
+      "model_id": "amazon.nova-2-multimodal-embeddings-v1:0",
+      "model_type": [
+        "embedding"
+      ],
+      "geos": [
+        "us",
+        "eu",
+        "apac"
+      ],
+      "inference_region": "us-east-1",
+      "supported_regions": [
+        "us-east-1"
+      ],
+      "embedding_size": 1024,
+      "model_pricing": {
+        "input_per_token_cost": 1.35e-07,
+        "input_per_image_cost": 6e-05,
+        "input_per_video_second_cost": 0.0007,
+        "input_per_audio_second_cost": 0.00014
+      },
+      "batch_job": {
+        "can_support": true,
+        "pricing": {
+          "input_per_video_second_cost": 0.00056,
+          "input_per_audio_second_cost": 0.000112
+        }
+      },
+      "requires_inference_profile": false
+    },
+    {
+      "model_name": "Cohere Embed v4",
+      "model_id": "cohere.embed-v4:0",
+      "model_type": [
+        "embedding"
+      ],
+      "geos": [
+        "us",
+        "eu",
+        "apac"
+      ],
+      "inference_region": "global",
+      "supported_regions": [
+        "global"
+      ],
+      "embedding_size": 1024,
+      "model_pricing": {
+        "input_per_token_cost": 1.2e-07,
+        "output_per_token_cost": 0
+      },
+      "batch_job": {
+        "can_support": false
+      },
+      "requires_inference_profile": true
+    },
+    {
+      "model_name": "TwelveLabs Marengo Embed 3.0",
+      "model_id": "twelvelabs.marengo-embed-3-0-v1:0",
+      "model_type": [
+        "embedding"
+      ],
+      "geos": [
+        "us",
+        "eu"
+      ],
+      "inference_region": "geo",
+      "supported_regions": [
+        "us",
+        "eu",
+        "us-east-1",
+        "eu-west-1"
+      ],
+      "model_pricing": {
+        "input_per_video_second_cost": 0.0007,
+        "input_per_audio_second_cost": 0.00014,
+        "input_image_per_request_cost": 0.0001,
+        "input_text_per_request_cost": 7e-05,
+        "output_per_token_cost": 0
+      },
+      "batch_job": {
+        "can_support": false
+      },
+      "requires_inference_profile": true
+    },
+    {
+      "model_name": "OpenAI GPT-6 Luna",
+      "model_id": "openai.gpt-6-luna",
+      "model_type": [
+        "vision",
+        "text"
+      ],
+      "geos": [
+        "us",
+        "eu",
+        "apac"
+      ],
+      "inference_region": "global",
+      "supported_regions": [
+        "global"
+      ],
+      "model_pricing": {
+        "input_per_token_cost": 1e-07,
+        "output_per_token_cost": 5e-07,
+        "cache_write_per_token_cost": 1.25e-07,
+        "cache_read_per_token_cost": 1e-08
+      },
+      "batch_job": {
+        "can_support": false
+      },
+      "capabilities": {
+        "temperature": false,
+        "thinking": "absent",
+        "effort": true,
+        "effort_default": "none",
+        "effort_wire": "reasoning",
+        "prompt_cache_mode": "explicit",
+        "image": {
+          "limits": {
+            "max_images": 100,
+            "max_image_mb": null,
+            "max_payload_mb": 20
+          },
+          "downscales_above": {
+            "long_side_px": null,
+            "total_px": 1024000
+          },
+          "recommendations": {
+            "min_short_side_px": null,
+            "min_grid_long_side_px": null,
+            "aspect_snap": null,
+            "tile_px": 32,
+            "max_grid_images": null
+          }
+        }
+      },
+      "requires_inference_profile": true
+    },
+    {
+      "model_name": "OpenAI GPT-6.1 Sol",
+      "model_id": "openai.gpt-6.1-sol",
+      "model_type": [
+        "vision",
+        "text"
+      ],
+      "geos": [
+        "us",
+        "eu",
+        "apac"
+      ],
+      "inference_region": "global",
+      "supported_regions": [
+        "global"
+      ],
+      "model_pricing": {
+        "input_per_token_cost": 2e-06,
+        "output_per_token_cost": 1e-05,
+        "cache_write_per_token_cost": 2.5e-06,
+        "cache_read_per_token_cost": 1e-07
+      },
+      "batch_job": {
+        "can_support": false
+      },
+      "capabilities": {
+        "temperature": false,
+        "thinking": "absent",
+        "effort": true,
+        "effort_default": "low",
+        "effort_wire": "reasoning",
+        "prompt_cache_mode": "explicit",
+        "image": {
+          "limits": {
+            "max_images": 100,
+            "max_image_mb": null,
+            "max_payload_mb": 20
+          },
+          "downscales_above": {
+            "long_side_px": null,
+            "total_px": 1024000
+          },
+          "recommendations": {
+            "min_short_side_px": null,
+            "min_grid_long_side_px": null,
+            "aspect_snap": null,
+            "tile_px": 32,
+            "max_grid_images": null
+          }
+        }
+      },
+      "requires_inference_profile": true
+    },
+    {
+      "model_name": "OpenAI GPT-6 Astra",
+      "model_id": "openai.gpt-6-astra",
+      "model_type": [
+        "vision",
+        "text"
+      ],
+      "geos": [
+        "us",
+        "eu",
+        "apac"
+      ],
+      "inference_region": "global",
+      "supported_regions": [
+        "global"
+      ],
+      "model_pricing": {
+        "input_per_token_cost": 1e-05,
+        "output_per_token_cost": 5e-05,
+        "cache_write_per_token_cost": 1.25e-05,
+        "cache_read_per_token_cost": 1e-06
+      },
+      "batch_job": {
+        "can_support": false
+      },
+      "capabilities": {
+        "temperature": false,
+        "thinking": "absent",
+        "effort": true,
+        "effort_default": "low",
+        "effort_wire": "reasoning",
+        "prompt_cache_mode": "explicit",
+        "image": {
+          "limits": {
+            "max_images": 100,
+            "max_image_mb": null,
+            "max_payload_mb": 20
+          },
+          "downscales_above": {
+            "long_side_px": null,
+            "total_px": 1024000
+          },
+          "recommendations": {
+            "min_short_side_px": null,
+            "min_grid_long_side_px": null,
+            "aspect_snap": null,
+            "tile_px": 32,
+            "max_grid_images": null
+          }
+        }
+      },
+      "requires_inference_profile": true
+    }
+  ]
+}

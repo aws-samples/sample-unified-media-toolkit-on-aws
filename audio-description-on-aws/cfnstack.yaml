@@ -1,0 +1,668 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# ============================================================================
+# audio-description-on-aws — sibling runs in (shot-seg, enrichment,
+# diarization, conversation-analysis, face-rec; optional audiostem,
+# reviewer decisions, cast-resolution bindings+credits), a narrated AD script out:
+# srt/vtt/DAPT/review.html + render_manifest.json (the mix is
+# media-processing's ad_mix group, chained by the caller — this workflow
+# renders NO audio and its only third-party dependency is boto3).
+#
+# TWO Lambdas out of ONE flat zip (the gateway dispatcher and the
+# operation-routed workflow handler) and ONE state machine whose
+# multi-submission stages are LOOP states: one waitForTaskToken Task + one
+# Choice each; sibling callbacks (bedrock-inference, text-to-speech) re-enter
+# the state and the Lambda self-completes its token when the loop finishes.
+#
+# A CONSUMER child: the three sibling gateway-Lambda ARNs arrive as
+# parameters — explicit parameters, never Fn::ImportValue.
+# ============================================================================
+Description: >
+    audio-description micro-workflow: sibling run artifacts in, a narrated
+    AD script out — windows with duties, name-map discipline, TTS-fitted
+    takes (pure arithmetic; no audio rendered), a mechanical repair chain,
+    coverage oracles, a two-axis reviewer ledger, and the render manifest
+    media-processing's ad_mix group consumes.
+
+Metadata:
+    AWS::CloudFormation::Interface:
+        ParameterGroups:
+            -
+                Label:
+                    default: Resource Naming
+                Parameters:
+                    - ResourcePrefix
+            -
+                Label:
+                    default: S3 Bucket
+                Parameters:
+                    - ProxyBucket
+            -
+                Label:
+                    default: Sibling Gateways (consumer wiring)
+                Parameters:
+                    - BedrockInferenceGatewayLambdaArn
+                    - PromptRegistryGatewayLambdaArn
+                    - TtsGatewayLambdaArn
+
+Parameters:
+    ResourcePrefix:
+        Type: String
+        Description: Prefix applied to all resource names.
+        AllowedPattern: "[a-z0-9][a-z0-9-]*"
+    ProxyBucket:
+        Type: String
+        Description: S3 proxy bucket — sibling run artifacts are read from micro-workflow/* and outputs land under micro-workflow/audio-description/. No default on purpose.
+    BedrockInferenceGatewayLambdaArn:
+        Type: String
+        Description: bedrock-inference stack's GatewayToolLambdaArn output — the writer/critic/repair submissions (push completion via callback_task_token).
+    PromptRegistryGatewayLambdaArn:
+        Type: String
+        Description: prompt-registry stack's AdminToolLambdaArn output (2026-09-08 — the ad-* categories are INTERNAL and only the admin surface serves them) — the five ad-* judgment categories bind at ValidateAndPlan.
+    TtsGatewayLambdaArn:
+        Type: String
+        Description: tts-on-aws stack's GatewayToolLambdaArn output — synthesis submissions (push completion via callback_task_token; requires tts alpha.20260831a+).
+
+Mappings:
+    Solution:
+        Package:
+            GatewayTool: "%%PKG_GATEWAY_TOOL%%"
+            Workflow: "%%PKG_WORKFLOW%%"
+        Source:
+            Bucket: "%%BUCKET_NAME%%"
+            KeyPrefix: "%%KEY_PREFIX%%"
+    Lambda:
+        GatewayTool:
+            Name: gateway-tool
+            Memory: 512
+            Timeout: 60
+        Workflow:
+            Name: workflow
+            Memory: 2048
+            Timeout: 600
+
+Resources:
+    ############################################################################
+    # Gateway tool — generate_ad / get_job_status / describe_tool
+    ############################################################################
+    GatewayToolLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            # -log suffix + LoggingConfig, never /aws/lambda/{name}: the
+            # canonical group may exist as an orphan from an earlier deploy,
+            # and CFN cannot adopt a group (micro-workflow-bundle/README.md §C8).
+            LogGroupName: !Sub
+                - ${ResourcePrefix}-audio-description-${tool}-log
+                - tool: !FindInMap [Lambda, GatewayTool, Name]
+            RetentionInDays: 30
+
+    GatewayToolRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}AudioDescriptionGatewayToolPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt GatewayToolLogGroup.Arn
+                          - Effect: Allow
+                            Action: states:StartExecution
+                            Resource: !Ref AudioDescriptionStateMachine
+                          - Effect: Allow
+                            Action:
+                                - states:DescribeExecution
+                                - states:GetExecutionHistory
+                            Resource: !Sub
+                                - arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${smName}:*
+                                - smName: !GetAtt AudioDescriptionStateMachine.Name
+                          - Effect: Allow
+                            Action: s3:GetObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/audio-description/*
+                          # Without ListBucket, GetObject on a MISSING key
+                          # answers 403 AccessDenied instead of 404 NoSuchKey.
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            Condition:
+                                StringLike:
+                                    s3:prefix: micro-workflow/*
+
+    GatewayToolLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Single-purpose dispatcher; reserved concurrency unnecessary
+        Properties:
+            # Unnamed on purpose: reached through LoggingConfig, renames stay
+            # one-update operations.
+            Description: !Sub ${ResourcePrefix}-audio-description gateway tool (generate_ad / get_job_status / describe_tool)
+            Runtime: python3.13
+            Architectures:
+                - arm64
+            Handler: lambda_function.lambda_handler
+            Role: !GetAtt GatewayToolRole.Arn
+            Code:
+                S3Bucket: !FindInMap [Solution, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [Solution, Source, KeyPrefix]
+                      pkg: !FindInMap [Solution, Package, GatewayTool]
+            MemorySize: !FindInMap [Lambda, GatewayTool, Memory]
+            Timeout: !FindInMap [Lambda, GatewayTool, Timeout]
+            LoggingConfig:
+                LogGroup: !Ref GatewayToolLogGroup
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    STATE_MACHINE_ARN: !Ref AudioDescriptionStateMachine
+                    TOOL_VERSION: "%%VERSION%%"
+                    # Must equal the GatewayTarget Name in media-toolkit-gateway.
+                    TARGET_NAME: audio-description
+
+    ############################################################################
+    # Workflow Lambda — one zip, operation-routed (states/router.py)
+    ############################################################################
+    WorkflowLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub
+                - ${ResourcePrefix}-audio-description-${tool}-log
+                - tool: !FindInMap [Lambda, Workflow, Name]
+            RetentionInDays: 30
+
+    WorkflowRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}AudioDescriptionWorkflowPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt WorkflowLogGroup.Arn
+                          # Reads sibling run artifacts + the bedrock/tts run
+                          # outputs it checkpointed pointers to. HeadObject
+                          # (refuse-before-spend probes) rides s3:GetObject.
+                          - Effect: Allow
+                            Action: s3:GetObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/*
+                          # Writes ONLY its own run prefix and the caller-side
+                          # inference history pointers.
+                          - Effect: Allow
+                            Action: s3:PutObject
+                            Resource:
+                                - !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/audio-description/*
+                                - !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/histories/*
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            Condition:
+                                StringLike:
+                                    s3:prefix: micro-workflow/*
+                          # Sibling gateway Lambdas invoked directly (the
+                          # submit brain stays the sibling's) — never their
+                          # state machines.
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource:
+                                - !Ref BedrockInferenceGatewayLambdaArn
+                                - !Ref PromptRegistryGatewayLambdaArn
+                                - !Ref TtsGatewayLambdaArn
+                          # The loop states resolve their OWN task tokens
+                          # ({ad_loop_done: true}) when a loop finishes —
+                          # SendTaskSuccess takes no resource scoping.
+                          - Effect: Allow
+                            Action: states:SendTaskSuccess
+                            # any machine in THIS account+region — the token's machine is the
+                            # caller's (ours or a customer's own), never known at deploy time
+                            Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*
+
+    WorkflowLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Serial workflow states; reserved concurrency unnecessary
+        Properties:
+            Description: !Sub ${ResourcePrefix}-audio-description workflow states (operation-routed)
+            Runtime: python3.13
+            Architectures:
+                - arm64
+            Handler: lambda_function.lambda_handler
+            Role: !GetAtt WorkflowRole.Arn
+            Code:
+                S3Bucket: !FindInMap [Solution, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [Solution, Source, KeyPrefix]
+                      pkg: !FindInMap [Solution, Package, Workflow]
+            MemorySize: !FindInMap [Lambda, Workflow, Memory]
+            Timeout: !FindInMap [Lambda, Workflow, Timeout]
+            LoggingConfig:
+                LogGroup: !Ref WorkflowLogGroup
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    TARGET_NAME: audio-description
+                    TOOL_VERSION: "%%VERSION%%"
+                    BEDROCK_GATEWAY_ARN: !Ref BedrockInferenceGatewayLambdaArn
+                    PROMPT_REGISTRY_ARN: !Ref PromptRegistryGatewayLambdaArn
+                    TTS_GATEWAY_ARN: !Ref TtsGatewayLambdaArn
+
+    ############################################################################
+    # State machine
+    ############################################################################
+    StateMachineRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: states.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}AudioDescriptionStateMachinePolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource: !GetAtt WorkflowLambda.Arn
+
+    AudioDescriptionStateMachine:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            # Named like every machine-bearing sibling (micro-workflow-bundle/README.md §C8's
+            # unnamed rule covers LAMBDAS, not machines).
+            StateMachineName: !Sub ${ResourcePrefix}-audio-description
+            RoleArn: !GetAtt StateMachineRole.Arn
+            DefinitionSubstitutions:
+                WorkflowLambdaArn: !GetAtt WorkflowLambda.Arn
+            # Inline is the single source of truth for what deploys;
+            # definitions.json is the readability copy — edit BOTH, the
+            # build script fails on drift.
+            DefinitionString: |-
+                {
+                 "Comment": "audio-description: sibling run pointers -> understand (name map + watch notes) -> window plan (code) -> chunked writer + critic -> TTS synth/fit with a bounded reask loop -> the SEQUENTIAL repair chain -> coverage oracles + derived ledger + srt/vtt/DAPT/review.html + the render_manifest for media-processing's ad_mix group (the mix is a chained process_media call; this workflow renders no audio). The stage graph was validated by repeated zero-hand-edit runs scored against a corpus of professionally authored AD cues (README.md Design record #8). LOOP SHAPE: every multi-submission stage is ONE waitForTaskToken Task + ONE Choice — a sibling callback re-enters the same state (its payload carries no ad_loop_done), and the Lambda resolves its OWN token with {ad_loop_done: true} when the loop is finished, so no Choice ever depends on a sibling's payload shape. FAN-OUT extension: a loop with N independent tts shards resolves its own token with {tts_shard_tags} instead and the Choice routes through an inline Map — one waitForTaskToken Task per shard, each against ITS OWN token (a single token cannot wait for N callbacks: the first consumes it, the rest are TOKEN_GONE and the state sleeps to its deadman). Shard specs live in the checkpoint; the payload carries only tags. tts is Lambda-driven with no service throttle, so MaxConcurrency is unbounded. S3 checkpoints are the single source of truth; redrive IS the reconcile. Prompts are FIVE registry categories (frame-inspection's credits-read evidence arrives via the cast-resolution run's conditional credits output), iterable pre-GA. Readability copy of the template's inline DefinitionString; edit BOTH, the build fails on drift.",
+                 "StartAt": "Validate and plan",
+                 "TimeoutSeconds": 172800,
+                 "States": {
+                  "Validate and plan": {
+                   "Type": "Task",
+                   "Comment": "Refuse before any spend: all sibling run pointers validated (shot-seg, enrichment incl. the AD fields, diarization transcript, CA, face-rec; OPTIONAL audiostem, reviewer decisions.json, cast-resolution persons.json + conditional credits.json), all five prompt categories bound, voice pinned, sung_vocal_policy validated (narrate|avoid, default narrate — user decision 2026-08-31), supplied sibling ARTIFACTS probed (a typo'd pointer refuses by name, never a NoSuchKey mid-run; decisions.json deliberately unprobed — absence is the designed nothing-accepted state). The mix parameter is refused at the GATEWAY (this workflow renders no audio). Persists _plan/plan.json.",
+                   "Resource": "arn:aws:states:::lambda:invoke",
+                   "Parameters": {
+                    "FunctionName": "${WorkflowLambdaArn}",
+                    "Payload": {
+                     "operation": "ValidateAndPlan",
+                     "uuid.$": "$.uuid",
+                     "input.$": "$.input"
+                    }
+                   },
+                   "OutputPath": "$.Payload",
+                   "Retry": [
+                    {
+                     "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                     "IntervalSeconds": 3,
+                     "MaxAttempts": 4,
+                     "BackoffRate": 2.0
+                    }
+                   ],
+                   "Next": "Build name map and watch notes"
+                  },
+                  "Build name map and watch notes": {
+                   "Type": "Task",
+                   "Comment": "LOOP: name map (ad-name-map) then watch-through (ad-watch-notes) — two bedrock submissions in sequence through one re-entrant state. character_map.json + watch_notes.json.",
+                   "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                   "Parameters": {
+                    "FunctionName": "${WorkflowLambdaArn}",
+                    "Payload": {
+                     "operation": "Understand",
+                     "uuid.$": "$.uuid",
+                     "plan_s3uri.$": "$.plan_s3uri",
+                     "task_token.$": "$$.Task.Token"
+                    }
+                   },
+                   "ResultPath": "$.callback",
+                   "TimeoutSeconds": 93600,
+                   "Retry": [
+                    {
+                     "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                     "IntervalSeconds": 3,
+                     "MaxAttempts": 4,
+                     "BackoffRate": 2.0
+                    }
+                   ],
+                   "Next": "Name map and watch notes complete?"
+                  },
+                  "Name map and watch notes complete?": {
+                   "Type": "Choice",
+                   "Choices": [
+                    {
+                     "Variable": "$.callback.ad_loop_done",
+                     "IsPresent": true,
+                     "Next": "Plan narration windows"
+                    }
+                   ],
+                   "Default": "Build name map and watch notes"
+                  },
+                  "Plan narration windows": {
+                   "Type": "Task",
+                   "Comment": "Pure code: snap on-screen-text beats to the shots carrying them (the Meridian title-card root cause, fixed upstream), then windows + orientation (entry ladder, montage folds, reveals, honest budgets, sung-vocal policy).",
+                   "Resource": "arn:aws:states:::lambda:invoke",
+                   "Parameters": {
+                    "FunctionName": "${WorkflowLambdaArn}",
+                    "Payload": {
+                     "operation": "PlanWindows",
+                     "uuid.$": "$.uuid",
+                     "plan_s3uri.$": "$.plan_s3uri"
+                    }
+                   },
+                   "ResultPath": "$.windows_result",
+                   "Retry": [
+                    {
+                     "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                     "IntervalSeconds": 3,
+                     "MaxAttempts": 4,
+                     "BackoffRate": 2.0
+                    }
+                   ],
+                   "Next": "Write script"
+                  },
+                  "Write script": {
+                   "Type": "Task",
+                   "Comment": "LOOP: the WRITER (one pooled bedrock run, WINDOWS_PER_CHUNK-window records — record rendering is text assembly, seconds, so no Map) then the CRITIC, whose empty-a-duty-window edits are refused by a MECHANICAL veto. cues.json.",
+                   "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                   "Parameters": {
+                    "FunctionName": "${WorkflowLambdaArn}",
+                    "Payload": {
+                     "operation": "WriteScript",
+                     "uuid.$": "$.uuid",
+                     "plan_s3uri.$": "$.plan_s3uri",
+                     "task_token.$": "$$.Task.Token"
+                    }
+                   },
+                   "ResultPath": "$.callback",
+                   "TimeoutSeconds": 93600,
+                   "Retry": [
+                    {
+                     "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                     "IntervalSeconds": 3,
+                     "MaxAttempts": 4,
+                     "BackoffRate": 2.0
+                    }
+                   ],
+                   "Next": "Script written and critiqued?"
+                  },
+                  "Script written and critiqued?": {
+                   "Type": "Choice",
+                   "Choices": [
+                    {
+                     "Variable": "$.callback.ad_loop_done",
+                     "IsPresent": true,
+                     "Next": "Synthesize and fit"
+                    }
+                   ],
+                   "Default": "Write script"
+                  },
+                  "Synthesize and fit": {
+                   "Type": "Task",
+                   "Comment": "LOOP: tts main shards fanned out in PARALLEL through 'Synthesize shards in parallel' (shard specs checkpointed, one token per shard) -> fit every take against the true next-word onset (tempo cap) -> bounded reask rounds (bedrock rewrite + fanned tts) for the over-budget -> collide -> placed.json + write-through drops.json. Never a chipmunk, never an overlap.",
+                   "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                   "Parameters": {
+                    "FunctionName": "${WorkflowLambdaArn}",
+                    "Payload": {
+                     "operation": "SynthFit",
+                     "uuid.$": "$.uuid",
+                     "plan_s3uri.$": "$.plan_s3uri",
+                     "task_token.$": "$$.Task.Token"
+                    }
+                   },
+                   "ResultPath": "$.callback",
+                   "TimeoutSeconds": 93600,
+                   "Retry": [
+                    {
+                     "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                     "IntervalSeconds": 3,
+                     "MaxAttempts": 4,
+                     "BackoffRate": 2.0
+                    }
+                   ],
+                   "Next": "All takes fitted?"
+                  },
+                  "All takes fitted?": {
+                   "Type": "Choice",
+                   "Choices": [
+                    {
+                     "Variable": "$.callback.ad_loop_done",
+                     "IsPresent": true,
+                     "Next": "Repair defects one at a time"
+                    },
+                    {
+                     "Variable": "$.callback.tts_shard_tags",
+                     "IsPresent": true,
+                     "Next": "Synthesize shards in parallel"
+                    }
+                   ],
+                   "Default": "Synthesize and fit"
+                  },
+                  "Synthesize shards in parallel": {
+                   "Type": "Map",
+                   "Comment": "One iteration = one tts shard against ITS OWN task token; the loop state checkpointed every shard's spec before resolving its token with the tags. ResultPath is discarded — callbacks are signals, the fit leg reads the submit register from S3.",
+                   "ItemsPath": "$.callback.tts_shard_tags",
+                   "ItemSelector": {
+                    "uuid.$": "$.uuid",
+                    "plan_s3uri.$": "$.plan_s3uri",
+                    "tag.$": "$$.Map.Item.Value"
+                   },
+                   "MaxConcurrency": 0,
+                   "ItemProcessor": {
+                    "ProcessorConfig": {
+                     "Mode": "INLINE"
+                    },
+                    "StartAt": "Submit one synth shard",
+                    "States": {
+                     "Submit one synth shard": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                      "Parameters": {
+                       "FunctionName": "${WorkflowLambdaArn}",
+                       "Payload": {
+                        "operation": "SubmitTtsShard",
+                        "loop": "synth",
+                        "uuid.$": "$.uuid",
+                        "plan_s3uri.$": "$.plan_s3uri",
+                        "tag.$": "$.tag",
+                        "task_token.$": "$$.Task.Token"
+                       }
+                      },
+                      "TimeoutSeconds": 93600,
+                      "Retry": [
+                       {
+                        "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                        "IntervalSeconds": 3,
+                        "MaxAttempts": 4,
+                        "BackoffRate": 2.0
+                       }
+                      ],
+                      "End": true
+                     }
+                    }
+                   },
+                   "ResultPath": null,
+                   "Next": "Synthesize and fit"
+                  },
+                  "Repair defects one at a time": {
+                   "Type": "Task",
+                   "Comment": "LOOP: the fixed repair SEQUENCE (revive entries, overlap fixes, entry succession, beat repair, reveal apparatus, role descriptors, on-screen-text claims, name leaks, tail block, redundancy+differentiate) — each step: mechanical trigger -> optional ONE bedrock ask + its re-tts shards fanned in parallel through 'Re-synthesize repaired shards' -> apply under the unified failure policy; deletions only through the coverage-neutrality guard; checkpoint per step. The PASSES stay strictly sequential — each accepted repair changes the placements the next pass collides against.",
+                   "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                   "Parameters": {
+                    "FunctionName": "${WorkflowLambdaArn}",
+                    "Payload": {
+                     "operation": "RepairChain",
+                     "uuid.$": "$.uuid",
+                     "plan_s3uri.$": "$.plan_s3uri",
+                     "task_token.$": "$$.Task.Token"
+                    }
+                   },
+                   "ResultPath": "$.callback",
+                   "TimeoutSeconds": 93600,
+                   "Retry": [
+                    {
+                     "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                     "IntervalSeconds": 3,
+                     "MaxAttempts": 4,
+                     "BackoffRate": 2.0
+                    }
+                   ],
+                   "Next": "Repair chain complete?"
+                  },
+                  "Repair chain complete?": {
+                   "Type": "Choice",
+                   "Choices": [
+                    {
+                     "Variable": "$.callback.ad_loop_done",
+                     "IsPresent": true,
+                     "Next": "Finalize"
+                    },
+                    {
+                     "Variable": "$.callback.tts_shard_tags",
+                     "IsPresent": true,
+                     "Next": "Re-synthesize repaired shards"
+                    }
+                   ],
+                   "Default": "Repair defects one at a time"
+                  },
+                  "Re-synthesize repaired shards": {
+                   "Type": "Map",
+                   "Comment": "Within-pass re-tts shards in parallel — same mechanism as 'Synthesize shards in parallel'; the passes themselves stay sequential (data dependency, not throttling).",
+                   "ItemsPath": "$.callback.tts_shard_tags",
+                   "ItemSelector": {
+                    "uuid.$": "$.uuid",
+                    "plan_s3uri.$": "$.plan_s3uri",
+                    "tag.$": "$$.Map.Item.Value"
+                   },
+                   "MaxConcurrency": 0,
+                   "ItemProcessor": {
+                    "ProcessorConfig": {
+                     "Mode": "INLINE"
+                    },
+                    "StartAt": "Submit one repair shard",
+                    "States": {
+                     "Submit one repair shard": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                      "Parameters": {
+                       "FunctionName": "${WorkflowLambdaArn}",
+                       "Payload": {
+                        "operation": "SubmitTtsShard",
+                        "loop": "repair",
+                        "uuid.$": "$.uuid",
+                        "plan_s3uri.$": "$.plan_s3uri",
+                        "tag.$": "$.tag",
+                        "task_token.$": "$$.Task.Token"
+                       }
+                      },
+                      "TimeoutSeconds": 93600,
+                      "Retry": [
+                       {
+                        "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                        "IntervalSeconds": 3,
+                        "MaxAttempts": 4,
+                        "BackoffRate": 2.0
+                       }
+                      ],
+                      "End": true
+                     }
+                    }
+                   },
+                   "ResultPath": null,
+                   "Next": "Repair defects one at a time"
+                  },
+                  "Finalize": {
+                   "Type": "Task",
+                   "Comment": "Coverage oracles (beat, orientation — causes named), reviewer-accepted absences joined, the two-axis ledger DERIVED, srt/vtt/DAPT/review.html + render_manifest.json (per-take wav/at/tempo + af_chain — media-processing's ad_mix group consumes it).",
+                   "Resource": "arn:aws:states:::lambda:invoke",
+                   "Parameters": {
+                    "FunctionName": "${WorkflowLambdaArn}",
+                    "Payload": {
+                     "operation": "Finalize",
+                     "uuid.$": "$.uuid",
+                     "plan_s3uri.$": "$.plan_s3uri"
+                    }
+                   },
+                   "ResultPath": "$.finalize_result",
+                   "Retry": [
+                    {
+                     "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                     "IntervalSeconds": 3,
+                     "MaxAttempts": 4,
+                     "BackoffRate": 2.0
+                    }
+                   ],
+                   "Next": "Usage tracking"
+                  },
+                  "Usage tracking": {
+                   "Type": "Task",
+                   "Comment": "SUCCESS PATH ONLY, never raises; sums the write-through submit register's bedrock summaries and PROPAGATES cost_is_complete (a partial float is never reported as complete).",
+                   "Resource": "arn:aws:states:::lambda:invoke",
+                   "Parameters": {
+                    "FunctionName": "${WorkflowLambdaArn}",
+                    "Payload": {
+                     "operation": "UsageTracking",
+                     "uuid.$": "$.uuid",
+                     "plan_s3uri.$": "$.plan_s3uri"
+                    }
+                   },
+                   "OutputPath": "$.Payload",
+                   "Retry": [
+                    {
+                     "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                     "IntervalSeconds": 3,
+                     "MaxAttempts": 4,
+                     "BackoffRate": 2.0
+                    }
+                   ],
+                   "End": true
+                  }
+                 }
+                }
+Outputs:
+    GatewayToolLambdaArn:
+        Description: >
+            ARN of the AgentCore Gateway tool Lambda. Pass this as
+            AudioDescriptionToolLambdaArn when deploying
+            media-toolkit-gateway/cfnstack.yaml.
+        Value: !GetAtt GatewayToolLambda.Arn
+    StateMachineArn:
+        Description: The audio-description state machine.
+        Value: !Ref AudioDescriptionStateMachine

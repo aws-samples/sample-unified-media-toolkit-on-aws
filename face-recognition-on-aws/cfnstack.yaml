@@ -1,0 +1,1045 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Build and deploy face-recognition-on-aws container to ECR. Version %%VERSION%%
+
+Mappings:
+    CodeBuild:
+        Source:
+            Package: "%%PKG_FACE_RECOGNITION%%"
+            GatewayToolPackage: "%%PKG_GATEWAY_TOOL%%"
+            Bucket: "%%BUCKET_NAME%%"
+            KeyPrefix: "%%KEY_PREFIX%%"
+        Project:
+            Type: ARM_CONTAINER
+            ComputeType: BUILD_GENERAL1_LARGE
+            Image: aws/codebuild/amazonlinux2-aarch64-standard:3.0
+    ECR:
+        Repository:
+            Name: face-recognition-on-aws
+            ImageTag: "%%VERSION%%"
+    Lambda:
+        Function:
+            Name: face-recognition
+            Description: Face Recognition (Amazon Rekognition, probe-then-fill grids)
+        GatewayTool:
+            Name: gateway-tool
+            Description: AgentCore Gateway dispatcher — recognize_faces + get_job_status
+            Memory: 256
+            Timeout: 30
+        OneCore:
+            Memory: 1792
+            Name: 1-core
+        ThreeCores:
+            Memory: 5376
+            Name: 3-cores
+    DynamoDB:
+        Table:
+            Suffix: face-recognition
+    Collection:
+        Defaults:
+            Id: face-recognition-on-aws
+
+Parameters:
+    ResourcePrefix:
+        Type: String
+        Description: Prefix for resource names
+    ProxyBucket:
+        Type: String
+        Description: S3 proxy bucket that Lambda functions read/write frames and outputs to
+    MediaProcessingGatewayLambdaArn:
+        Type: String
+        Description: The media-processing stack's GatewayToolLambdaArn output — the Run media processing held state submits process_media through it with a callback token (the family sibling pattern)
+
+Resources:
+
+    # =========================================================================
+    # Proxy bucket validator — verifies the ProxyBucket exists and is owned by
+    # this account (creates it if absent).  Runs on Create/Update; no-op on
+    # Delete.  Workflow Lambdas DependsOn the custom resource so nothing
+    # touches the bucket before it is validated.
+    # Handler code lives in gateway_tool/bucket_validator.py, shipped in the
+    # same zip as the gateway tool Lambda.
+    # =========================================================================
+    ProxyBucketValidatorRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: ProxyBucketValidation
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # Scoped to the declared group, and deliberately NOT
+                          # AWSLambdaBasicExecutionRole: that managed policy
+                          # grants logs:CreateLogGroup on every group, which
+                          # lets a function that cannot reach its declared
+                          # group silently create an unmanaged one instead of
+                          # failing visibly.
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt ProxyBucketValidatorLogGroup.Arn
+                          - Effect: Allow
+                            Action:
+                                - s3:ListBucket
+                                - s3:CreateBucket
+                                - s3:PutBucketPublicAccessBlock
+                            Resource: !Sub "arn:aws:s3:::${ProxyBucket}"
+
+    # Declared so retention is bounded and the group dies with the stack.
+    # Otherwise Lambda auto-creates /aws/lambda/<fn> on first invocation with
+    # never-expire retention and no stack ownership: the logs are billed
+    # forever and the orphan outlives the stack, which then blocks the next
+    # create-stack at this name with "already exists".
+    #
+    # Safe to declare the canonical /aws/lambda/{FunctionName} here ONLY
+    # because the function was renamed to -bucket-check in the same change, so
+    # this name has never existed. Declaring a name that a previous deploy
+    # already auto-created fails the update at pre-flight validation, with no
+    # per-resource event naming the culprit. Do not "restore" the old
+    # -proxy-bucket-validator name without also suffixing this group.
+    ProxyBucketValidatorLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub "/aws/lambda/${ResourcePrefix}-face-recognition-bucket-check"
+            RetentionInDays: 7
+
+    ProxyBucketValidatorFunction:
+        Type: AWS::Lambda::Function
+        DependsOn: ProxyBucketValidatorLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Custom resource Lambda runs once at deploy time; VPC placement adds no security value for a one-shot S3 control-plane call.
+                    - id: W92
+                      reason: Custom resource Lambda is invoked exclusively by CloudFormation during stack operations; reserved concurrency is unnecessary.
+        Properties:
+            FunctionName: !Sub "${ResourcePrefix}-face-recognition-bucket-check"
+            Description: "Custom resource: verifies the proxy bucket exists and is owned by this account; creates it if absent"
+            Runtime: python3.13
+            Architectures: [arm64]
+            Handler: bucket_validator.handler
+            Role: !GetAtt ProxyBucketValidatorRole.Arn
+            Timeout: 60
+            MemorySize: 128
+            Code:
+                S3Bucket: !FindInMap [CodeBuild, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                      pkg: !FindInMap [CodeBuild, Source, GatewayToolPackage]
+
+    ProxyBucketValidator:
+        Type: Custom::ProxyBucketValidator
+        Properties:
+            ServiceToken: !GetAtt ProxyBucketValidatorFunction.Arn
+            BucketName: !Ref ProxyBucket
+            AccountId: !Ref AWS::AccountId
+            Region: !Ref AWS::Region
+
+    ################################################################################
+    # DynamoDB table — face records + semaphore + pending queue + stream dedup
+    # (single-table, hybrid-search precedent).  Items:
+    #   pk="face#{face_id}"  sk="record"            persistent face records
+    #   pk="deleted#{id}"    sk="record"            delete tombstones (TTL 30d)
+    #   pk="semaphore"       sk="counter"           holders / max_holders
+    #   pk="semaphore"       sk="holder#{arn}"      per-holder items (TTL)
+    #   pk="pending"         sk=sha256(token)       queued waiters (TTL 24h)
+    #   pk="stream-dedup"    sk={eventID}           exactly-once markers (TTL 1h)
+    # GSIs: celeb-index (name lookups), collection-index (list_faces
+    # pagination — sk celeb_created "{celeb}#{epoch}", unnamed sort last).
+    ################################################################################
+    FaceTable:
+        Type: AWS::DynamoDB::Table
+        Metadata:
+            checkov:
+                skip:
+                    - id: CKV_AWS_119
+                      comment: >-
+                        sample posture: table holds rebuildable derived state; default SSE is deliberate (see README.md DeletionPolicy decision)
+        Properties:
+            TableName: !Sub
+                - ${ResourcePrefix}-${suffix}
+                - suffix: !FindInMap [DynamoDB, Table, Suffix]
+            BillingMode: PAY_PER_REQUEST
+            AttributeDefinitions:
+                - { AttributeName: pk, AttributeType: S }
+                - { AttributeName: sk, AttributeType: S }
+                - { AttributeName: celeb, AttributeType: S }
+                - { AttributeName: created_at, AttributeType: N }
+                - { AttributeName: collection_id, AttributeType: S }
+                - { AttributeName: celeb_created, AttributeType: S }
+            KeySchema:
+                - { AttributeName: pk, KeyType: HASH }
+                - { AttributeName: sk, KeyType: RANGE }
+            GlobalSecondaryIndexes:
+                - IndexName: celeb-index
+                  KeySchema:
+                      - { AttributeName: celeb, KeyType: HASH }
+                      - { AttributeName: created_at, KeyType: RANGE }
+                  Projection:
+                      ProjectionType: ALL
+                - IndexName: collection-index
+                  KeySchema:
+                      - { AttributeName: collection_id, KeyType: HASH }
+                      - { AttributeName: celeb_created, KeyType: RANGE }
+                  Projection:
+                      ProjectionType: ALL
+            TimeToLiveSpecification:
+                AttributeName: ttl
+                Enabled: true
+            StreamSpecification:
+                StreamViewType: KEYS_ONLY
+            PointInTimeRecoverySpecification:
+                PointInTimeRecoveryEnabled: true
+
+    ################################################################################
+    # CodeBuild IAM Role
+    ################################################################################
+    CodeBuildRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W11
+                      reason: GetAuthorizationToken requires a wildcard resource (no ARN exists for it)
+        Properties:
+            Path: /
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: codebuild.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}FaceRecognitionCodeBuildRolePolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild:*
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub
+                                - arn:aws:s3:::${bucket}
+                                - bucket: !FindInMap [CodeBuild, Source, Bucket]
+                          # Scoped to the staging BUCKET, not the versioned key: a
+                          # key-pinned grant is rewritten on every version bump and the
+                          # build that reads the new key starts seconds later, racing IAM
+                          # propagation (a lost race denies an object that exists and is
+                          # readable). Bucket-wide is already the ListBucket scope above.
+                          - Effect: Allow
+                            Action: s3:GetObject
+                            Resource: !Sub
+                                - arn:aws:s3:::${bucket}/*
+                                - bucket: !FindInMap [CodeBuild, Source, Bucket]
+                          # GetAuthorizationToken, DescribeImages, and CreateRepository require Resource: "*"
+                          - Effect: Allow
+                            Action:
+                                # GetAuthorizationToken is the ONLY ECR action
+                                # that requires "*" (CSR scan 2026-10-08)
+                                - ecr:GetAuthorizationToken
+                            Resource: "*"
+                          - Effect: Allow
+                            Action:
+                                - ecr:CreateRepository
+                                - ecr:DescribeImages
+                                - ecr:BatchCheckLayerAvailability
+                                - ecr:CompleteLayerUpload
+                                - ecr:InitiateLayerUpload
+                                - ecr:PutImage
+                                - ecr:UploadLayerPart
+                            Resource: !Sub
+                                - arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${repoName}
+                                - repoName: !FindInMap [ECR, Repository, Name]
+
+    ################################################################################
+    # CodeBuild Project — ARM_CONTAINER native linux/arm64 build.
+    # pre_build: skip when IMAGE_REPO_NAME:IMAGE_TAG exists in ECR.
+    # post_build: always signals CloudFormation via $CFN_ResponseURL.
+    # No model seeding — all ML is Amazon Rekognition APIs.
+    ################################################################################
+    CodeBuildProject:
+        Type: AWS::CodeBuild::Project
+        Properties:
+            Name: !Sub
+                - ${ResourcePrefix}-${repositoryName}
+                - repositoryName: !FindInMap [ECR, Repository, Name]
+            Description: !Sub
+                - Build and publish ${desc} docker image to ECR
+                - desc: !FindInMap [Lambda, Function, Description]
+            ServiceRole: !GetAtt CodeBuildRole.Arn
+            Source:
+                Type: S3
+                Location: !Sub
+                    - ${bucket}/${keyPrefix}/${package}
+                    - bucket: !FindInMap [CodeBuild, Source, Bucket]
+                      keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                      package: !FindInMap [CodeBuild, Source, Package]
+                BuildSpec: |
+                    version: 0.2
+                    phases:
+                        pre_build:
+                            commands:
+                                - echo "== Logging in to Amazon ECR =="
+                                - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+                                - |
+                                    echo "== Creating ECR repository if it does not exist =="
+                                    aws ecr create-repository --region $AWS_REGION --repository-name $IMAGE_REPO_NAME --image-scanning-configuration scanOnPush=true --encryption-configuration encryptionType=AES256; EXITCODE=$?
+                                    if [ $EXITCODE -ne 0 ] && [ $EXITCODE -ne 254 ]; then
+                                        echo "ECR create-repository failed with exit code $EXITCODE"
+                                        exit $EXITCODE
+                                    fi
+                                - |
+                                    echo "== Checking if $IMAGE_REPO_NAME:$IMAGE_TAG already exists =="
+                                    if aws ecr describe-images --region $AWS_REGION --repository-name $IMAGE_REPO_NAME --image-ids imageTag=$IMAGE_TAG 2>/dev/null; then
+                                        echo "Image $IMAGE_REPO_NAME:$IMAGE_TAG already exists — skipping build"
+                                        touch /tmp/skip_build
+                                    else
+                                        echo "Image not found — proceeding with build"
+                                    fi
+                        build:
+                            commands:
+                                - |
+                                    if [ -f /tmp/skip_build ]; then
+                                        echo "== Skipping docker build — image already exists =="
+                                    else
+                                        echo "== Building $IMAGE_REPO_NAME:$IMAGE_TAG [$(date)] =="
+                                        docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+                                        docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                                        echo "== Pushing $IMAGE_REPO_NAME:$IMAGE_TAG [$(date)] =="
+                                        docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                                        echo "== Push complete [$(date)] =="
+                                    fi
+                        post_build:
+                            commands:
+                                - |
+                                    echo "=== post_build CODEBUILD_BUILD_SUCCEEDING=$CODEBUILD_BUILD_SUCCEEDING ==="
+                                    if [ -n "$CFN_ResponseURL" ]; then
+                                        if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then
+                                            echo "== Sending SUCCESS to CloudFormation =="
+                                            curl -s -X PUT -H "Content-Type:" \
+                                                --data-binary "{\"Status\":\"SUCCESS\",\"Reason\":\"Docker image ready\",\"PhysicalResourceId\":\"$CFN_PhysicalResourceId\",\"StackId\":\"$CFN_StackId\",\"RequestId\":\"$CFN_RequestId\",\"LogicalResourceId\":\"$CFN_LogicalResourceId\",\"Data\":{\"ImageUri\":\"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG\"}}" \
+                                                "$CFN_ResponseURL"
+                                        else
+                                            echo "== Sending FAILED to CloudFormation =="
+                                            curl -s -X PUT -H "Content-Type:" \
+                                                --data-binary "{\"Status\":\"FAILED\",\"Reason\":\"Build failed — see CodeBuild logs\",\"PhysicalResourceId\":\"$CFN_PhysicalResourceId\",\"StackId\":\"$CFN_StackId\",\"RequestId\":\"$CFN_RequestId\",\"LogicalResourceId\":\"$CFN_LogicalResourceId\",\"Data\":{}}" \
+                                                "$CFN_ResponseURL"
+                                        fi
+                                    fi
+            Environment:
+                Type: !FindInMap [CodeBuild, Project, Type]
+                ComputeType: !FindInMap [CodeBuild, Project, ComputeType]
+                Image: !FindInMap [CodeBuild, Project, Image]
+                PrivilegedMode: true
+                EnvironmentVariables:
+                    - Name: AWS_REGION
+                      Value: !Ref AWS::Region
+                    - Name: AWS_ACCOUNT_ID
+                      Value: !Ref AWS::AccountId
+                    - Name: IMAGE_REPO_NAME
+                      Value: !FindInMap [ECR, Repository, Name]
+                    - Name: IMAGE_TAG
+                      Value: !FindInMap [ECR, Repository, ImageTag]
+            Artifacts:
+                Type: NO_ARTIFACTS
+            EncryptionKey: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3
+            TimeoutInMinutes: 60
+            QueuedTimeoutInMinutes: 60
+            LogsConfig:
+                CloudWatchLogs:
+                    GroupName: /aws/codebuild
+                    StreamName: !Sub
+                        - ${ResourcePrefix}-${repositoryName}
+                        - repositoryName: !FindInMap [ECR, Repository, Name]
+                    Status: ENABLED
+
+    ################################################################################
+    # StartBuild Lambda (StartBuildDelayResponse pattern)
+    ################################################################################
+    StartBuildLambdaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: /
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}FaceRecognitionStartBuildPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # Scoped to the declared group, and NO
+                          # logs:CreateLogGroup: the group is a stack resource,
+                          # so this function must never create one. Withholding
+                          # the permission is what makes "it silently logged
+                          # somewhere else" impossible.
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt StartBuildLambdaLogGroup.Arn
+                          - Effect: Allow
+                            Action: codebuild:StartBuild
+                            Resource: !GetAtt CodeBuildProject.Arn
+
+    # StartBuildLambda is UNNAMED — CFN generates its physical name, so
+    # /aws/lambda/{FunctionName} is unknowable at author time. LoggingConfig
+    # below decouples the group from the function name, which is the only way
+    # an unnamed function can write to a declared, stack-owned group. Without
+    # one, Lambda auto-creates a group with retentionInDays=None (billed
+    # forever) that survives stack deletion.
+    StartBuildLambdaLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W84
+                        reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub /aws/lambda/${ResourcePrefix}-face-recognition-start-build
+            RetentionInDays: 7
+
+    StartBuildLambda:
+        Type: AWS::Lambda::Function
+        DependsOn: StartBuildLambdaLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Single-execution custom resource; reserved concurrency unnecessary
+        Properties:
+            Description: !Sub
+                - (${ResourcePrefix} ${repositoryName}) Start CodeBuild; CodeBuild signals CloudFormation on completion
+                - repositoryName: !FindInMap [ECR, Repository, Name]
+            Runtime: python3.13
+            MemorySize: 128
+            Timeout: 60
+            Handler: index.handler
+            Role: !GetAtt StartBuildLambdaRole.Arn
+            LoggingConfig:
+                LogGroup: !Ref StartBuildLambdaLogGroup
+            Code:
+                ZipFile: |
+                    import json
+                    import urllib.request
+                    import boto3
+
+                    def send_cfn_response(event, status, data, reason=''):
+                        body = json.dumps({
+                            'Status': status,
+                            'Reason': reason or 'See CloudWatch Logs',
+                            'PhysicalResourceId': event.get('PhysicalResourceId') or event['LogicalResourceId'],
+                            'StackId': event['StackId'],
+                            'RequestId': event['RequestId'],
+                            'LogicalResourceId': event['LogicalResourceId'],
+                            'Data': data,
+                        }).encode()
+                        req = urllib.request.Request(
+                            event['ResponseURL'], data=body, method='PUT',
+                            headers={'Content-Type': ''})
+                        urllib.request.urlopen(req)
+
+                    def handler(event, context):
+                        print('Event keys:', sorted(event))
+                        try:
+                            if event['RequestType'] == 'Delete':
+                                send_cfn_response(event, 'SUCCESS', {'Status': 'SKIPPED'})
+                                return
+
+                            env_overrides = [
+                                {'name': 'CFN_ResponseURL',        'value': event['ResponseURL'],                                        'type': 'PLAINTEXT'},
+                                {'name': 'CFN_PhysicalResourceId', 'value': event.get('PhysicalResourceId') or context.log_stream_name,  'type': 'PLAINTEXT'},
+                                {'name': 'CFN_StackId',            'value': event['StackId'],                                            'type': 'PLAINTEXT'},
+                                {'name': 'CFN_RequestId',          'value': event['RequestId'],                                          'type': 'PLAINTEXT'},
+                                {'name': 'CFN_LogicalResourceId',  'value': event['LogicalResourceId'],                                  'type': 'PLAINTEXT'},
+                            ]
+
+                            boto3.client('codebuild').start_build(
+                                projectName=event['ResourceProperties']['ProjectName'],
+                                environmentVariablesOverride=env_overrides,
+                            )
+                            # Intentionally do NOT call send_cfn_response here.
+                            # CodeBuild signals CloudFormation from post_build via curl.
+                        except Exception as exc:
+                            print(f'ERROR: {exc}')
+                            send_cfn_response(event, 'FAILED', {}, str(exc))
+
+    StartBuild:
+        Type: Custom::StartBuildDelayResponse
+        Properties:
+            ServiceToken: !GetAtt StartBuildLambda.Arn
+            ProjectName: !Ref CodeBuildProject
+            ImageTag: !FindInMap [ECR, Repository, ImageTag]
+            ProxyBucket: !Ref ProxyBucket
+
+    ################################################################################
+    # Workflow Lambda role (shared by both variants)
+    ################################################################################
+    FaceRecognitionRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W11
+                      reason: DetectFaces and RecognizeCelebrities are non-resource APIs; sandbox collections are created/deleted at runtime with a name prefix
+        Properties:
+            Path: /
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}FaceRecognitionLambdaPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-face-recognition-*
+                          # DetectFaces / RecognizeCelebrities /
+                          # GetCelebrityInfo are non-resource APIs
+                          - Effect: Allow
+                            Action:
+                                - rekognition:DetectFaces
+                                - rekognition:RecognizeCelebrities
+                                - rekognition:GetCelebrityInfo
+                            Resource: "*"
+                          # Collection APIs: any collection NAME (Phase 2
+                          # face-indexing lets callers create/delete their own
+                          # named collections, so a name list buys nothing) —
+                          # but scoped to THIS account+region's collections,
+                          # never the bare "*" that would also reach another
+                          # region's (CSR scan 2026-10-08).
+                          - Effect: Allow
+                            Action:
+                                - rekognition:CreateCollection
+                                - rekognition:DeleteCollection
+                                - rekognition:DescribeCollection
+                                - rekognition:IndexFaces
+                                - rekognition:SearchFaces
+                                - rekognition:SearchFacesByImage
+                                - rekognition:DeleteFaces
+                            Resource: !Sub arn:aws:rekognition:${AWS::Region}:${AWS::AccountId}:collection/*
+                          - Effect: Allow
+                            Action:
+                                - s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                          - Effect: Allow
+                            Action:
+                                - s3:GetObject
+                                - s3:PutObject
+                                # DeleteObject: batch_delete/delete_collection
+                                # sweep removes _facestore derivatives (§19)
+                                - s3:DeleteObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/*
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:GetItem
+                                - dynamodb:PutItem
+                                - dynamodb:UpdateItem
+                                - dynamodb:DeleteItem
+                                - dynamodb:Query
+                                - dynamodb:BatchGetItem
+                                - dynamodb:BatchWriteItem
+                            Resource:
+                                - !GetAtt FaceTable.Arn
+                                - !Sub ${FaceTable.Arn}/index/celeb-index
+                                - !Sub ${FaceTable.Arn}/index/collection-index
+                          # DDB stream consumption (SemaphoreStreamMapping)
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:GetRecords
+                                - dynamodb:GetShardIterator
+                                - dynamodb:DescribeStream
+                                - dynamodb:ListStreams
+                            Resource: !GetAtt FaceTable.StreamArn
+                          # Semaphore stream/drain + acquire task-token callbacks
+                          - Effect: Allow
+                            Action:
+                                - states:SendTaskSuccess
+                                - states:SendTaskFailure
+                            # any machine in THIS account+region — the token's machine is the
+                            # caller's (ours or a customer's own), never known at deploy time
+                            Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*
+                          # Usage tracking: own execution history only — MP's
+                          # cost is read from its published usage_tracking.json
+                          - Effect: Allow
+                            Action:
+                                - states:DescribeExecution
+                                - states:GetExecutionHistory
+                            Resource:
+                                - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${ResourcePrefix}-face-recognition:*
+                          - Effect: Allow
+                            Action: lambda:GetFunctionConfiguration
+                            Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ResourcePrefix}-face-recognition-*
+                          # StateSubmitMediaProcessing invokes the
+                          # media-processing GATEWAY (the family
+                          # sibling-invoke pattern, never its machine)
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource: !Ref MediaProcessingGatewayLambdaArn
+
+    ################################################################################
+    # Workflow Lambdas — 2 variants (API-bound workload; README.md §7).
+    # 3-cores threads CPU-bound pyvips decode/compose work (libvips releases
+    # the GIL); CPU-bound Lambda work is ~cost-neutral across sizes.
+    ################################################################################
+    FaceRecognitionLambda1CoreLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-face-recognition-${variant}
+                - variant: !FindInMap [Lambda, OneCore, Name]
+            RetentionInDays: 7
+
+    FaceRecognitionLambda1Core:
+        Type: AWS::Lambda::Function
+        DependsOn: [ProxyBucketValidator, StartBuild]
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Concurrency is bounded by the DynamoDB semaphore; reserved concurrency would fight the Map states
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-face-recognition-${variant}
+                - variant: !FindInMap [Lambda, OneCore, Name]
+            Description: Face recognition control states + semaphore handlers
+            PackageType: Image
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            Architectures: [arm64]
+            MemorySize: !FindInMap [Lambda, OneCore, Memory]
+            Timeout: 900
+            Role: !GetAtt FaceRecognitionRole.Arn
+            Environment:
+                Variables:
+                    FACE_TABLE_NAME: !Ref FaceTable
+                    DEFAULT_COLLECTION_ID: !FindInMap [Collection, Defaults, Id]
+            TracingConfig:
+                Mode: Active
+
+    FaceRecognitionLambda3CoresLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-face-recognition-${variant}
+                - variant: !FindInMap [Lambda, ThreeCores, Name]
+            RetentionInDays: 7
+
+    FaceRecognitionLambda3Cores:
+        Type: AWS::Lambda::Function
+        DependsOn: [ProxyBucketValidator, StartBuild]
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Concurrency is bounded by the DynamoDB semaphore; reserved concurrency would fight the Map states
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-face-recognition-${variant}
+                - variant: !FindInMap [Lambda, ThreeCores, Name]
+            Description: Face recognition workers — triage, grid detection, recognition, clustering, search/index, debug images
+            PackageType: Image
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            Architectures: [arm64]
+            MemorySize: !FindInMap [Lambda, ThreeCores, Memory]
+            Timeout: 900
+            EphemeralStorage:
+                Size: 2048
+            Role: !GetAtt FaceRecognitionRole.Arn
+            Environment:
+                Variables:
+                    FACE_TABLE_NAME: !Ref FaceTable
+                    DEFAULT_COLLECTION_ID: !FindInMap [Collection, Defaults, Id]
+            TracingConfig:
+                Mode: Active
+
+    ################################################################################
+    # DynamoDB Stream → semaphore release handler
+    # Fires ONLY on REMOVE of holder items; all three deletion paths (normal
+    # release, EventBridge terminal cleanup, TTL expiry) converge here.
+    ################################################################################
+    SemaphoreStreamMapping:
+        Type: AWS::Lambda::EventSourceMapping
+        Properties:
+            EventSourceArn: !GetAtt FaceTable.StreamArn
+            FunctionName: !GetAtt FaceRecognitionLambda1Core.Arn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+            BisectBatchOnFunctionError: true
+            MaximumRetryAttempts: 3
+            FilterCriteria:
+                Filters:
+                    - Pattern: '{"eventName": ["REMOVE"], "dynamodb": {"Keys": {"pk": {"S": ["semaphore"]}, "sk": {"S": [{"prefix": "holder#"}]}}}}'
+
+    ################################################################################
+    # Step Functions state machine
+    ################################################################################
+    FaceRecognitionSFNLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub /aws/states/${ResourcePrefix}-face-recognition
+            RetentionInDays: 7
+
+    FaceRecognitionStateMachineRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W11
+                      reason: CloudWatch log delivery and X-Ray require wildcard resources
+        Properties:
+            Path: /
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: states.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}FaceRecognitionStateMachinePolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource:
+                                - !GetAtt FaceRecognitionLambda1Core.Arn
+                                - !GetAtt FaceRecognitionLambda3Cores.Arn
+                          # Run media processing (2026-09-18): the held state
+                          # invokes OUR OWN 1Core Lambda (covered above), which
+                          # submits through MP's gateway — no direct
+                          # Start/Stop/Describe on MP's machine and no
+                          # EventBridge managed-rule grants anymore
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogDelivery
+                                - logs:GetLogDelivery
+                                - logs:UpdateLogDelivery
+                                - logs:DeleteLogDelivery
+                                - logs:ListLogDeliveries
+                                - logs:PutResourcePolicy
+                                - logs:DescribeResourcePolicies
+                                - logs:DescribeLogGroups
+                            Resource: "*"
+                          - Effect: Allow
+                            Action:
+                                - xray:PutTraceSegments
+                                - xray:PutTelemetryRecords
+                                - xray:GetSamplingRules
+                                - xray:GetSamplingTargets
+                            Resource: "*"
+
+    FaceRecognitionStateMachine:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            StateMachineName: !Sub ${ResourcePrefix}-face-recognition
+            RoleArn: !GetAtt FaceRecognitionStateMachineRole.Arn
+            LoggingConfiguration:
+                Level: ERROR
+                IncludeExecutionData: false
+                Destinations:
+                    - CloudWatchLogsLogGroup:
+                          LogGroupArn: !GetAtt FaceRecognitionSFNLogGroup.Arn
+            TracingConfiguration:
+                Enabled: true
+            # The build script injects definitions.json here (single source of
+            # truth — no hand-maintained duplicate). ${...} placeholders in the
+            # JSON resolve via !Sub.
+            DefinitionString:
+                !Sub |-
+                    %%STATE_MACHINE_DEFINITION%%
+
+    ################################################################################
+    # Face index management state machine (README.md §19) — batch_index /
+    # batch_delete / delete_collection.  Same Lambda container, same role,
+    # same semaphore (batch IndexFaces shares the Rekognition TPS pool).
+    ################################################################################
+    FaceIndexSFNLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub /aws/states/${ResourcePrefix}-face-index
+            RetentionInDays: 7
+
+    FaceIndexStateMachine:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            StateMachineName: !Sub ${ResourcePrefix}-face-index
+            RoleArn: !GetAtt FaceRecognitionStateMachineRole.Arn
+            LoggingConfiguration:
+                Level: ERROR
+                IncludeExecutionData: false
+                Destinations:
+                    - CloudWatchLogsLogGroup:
+                          LogGroupArn: !GetAtt FaceIndexSFNLogGroup.Arn
+            TracingConfiguration:
+                Enabled: true
+            # The build script injects definitions_index.json here.
+            DefinitionString:
+                !Sub |-
+                    %%INDEX_STATE_MACHINE_DEFINITION%%
+
+    ################################################################################
+    # EventBridge — terminal-state handler (ALL terminal states, incl. SUCCEEDED)
+    # One uniform cleanup path: semaphore holder delete + sandbox collection
+    # delete (fire + ignore ResourceNotFound).  Covers BOTH state machines —
+    # index-management executions hold semaphore slots too, and the sandbox
+    # delete is a harmless no-op for them (no sandbox-{name} ever exists).
+    ################################################################################
+    ExecutionTerminalRule:
+        Type: AWS::Events::Rule
+        Properties:
+            Name: !Sub ${ResourcePrefix}-face-recognition-terminal
+            Description: Release the semaphore slot and delete the sandbox collection on every terminal state
+            EventPattern:
+                source:
+                    - aws.states
+                detail-type:
+                    - Step Functions Execution Status Change
+                detail:
+                    status:
+                        - SUCCEEDED
+                        - FAILED
+                        - ABORTED
+                        - TIMED_OUT
+                    stateMachineArn:
+                        - !GetAtt FaceRecognitionStateMachine.Arn
+                        - !GetAtt FaceIndexStateMachine.Arn
+            State: ENABLED
+            Targets:
+                - Id: FaceRecognitionTerminalHandler
+                  Arn: !GetAtt FaceRecognitionLambda1Core.Arn
+
+    ExecutionTerminalRulePermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !GetAtt FaceRecognitionLambda1Core.Arn
+            Action: lambda:InvokeFunction
+            Principal: events.amazonaws.com
+            SourceArn: !GetAtt ExecutionTerminalRule.Arn
+
+    ################################################################################
+    # AgentCore Gateway tool Lambda (flat zip — no container)
+    ################################################################################
+    GatewayToolLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-face-recognition-${name}
+                - name: !FindInMap [Lambda, GatewayTool, Name]
+            RetentionInDays: 7
+
+    GatewayToolRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: /
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}FaceRecognitionGatewayToolPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !Sub
+                                - arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-face-recognition-${name}:*
+                                - name: !FindInMap [Lambda, GatewayTool, Name]
+                          - Effect: Allow
+                            Action: states:StartExecution
+                            Resource:
+                                - !GetAtt FaceRecognitionStateMachine.Arn
+                                - !GetAtt FaceIndexStateMachine.Arn
+                          - Effect: Allow
+                            Action:
+                                - states:DescribeExecution
+                                - states:GetExecutionHistory
+                            Resource:
+                                - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${ResourcePrefix}-face-recognition:*
+                                - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${ResourcePrefix}-face-index:*
+                          # Phase 2 gateway-side ops (README.md §19): synchronous
+                          # reads + renames + collection create/list live in
+                          # the gateway Lambda, not the state machine.
+                          # ListCollections is account-level (no collection ARN
+                          # to scope to); the collection-scoped actions carry
+                          # the same account+region bound as the workflow role
+                          # (CSR scan 2026-10-08)
+                          - Effect: Allow
+                            Action:
+                                - rekognition:ListCollections
+                            Resource: "*"
+                          - Effect: Allow
+                            Action:
+                                - rekognition:CreateCollection
+                                - rekognition:DescribeCollection
+                            Resource: !Sub arn:aws:rekognition:${AWS::Region}:${AWS::AccountId}:collection/*
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:GetItem
+                                - dynamodb:UpdateItem
+                                - dynamodb:Query
+                                - dynamodb:BatchGetItem
+                            Resource:
+                                - !GetAtt FaceTable.Arn
+                                - !Sub ${FaceTable.Arn}/index/celeb-index
+                                - !Sub ${FaceTable.Arn}/index/collection-index
+                          # Prefix-mode batch_index: list + head the caller's
+                          # images and write the generated manifest.
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                          - Effect: Allow
+                            Action:
+                                - s3:GetObject
+                                - s3:PutObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/*
+
+    GatewayToolLambda:
+        Type: AWS::Lambda::Function
+        DependsOn: ProxyBucketValidator
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Invoked by the AgentCore gateway; reserved concurrency unnecessary
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-face-recognition-${name}
+                - name: !FindInMap [Lambda, GatewayTool, Name]
+            Description: !FindInMap [Lambda, GatewayTool, Description]
+            Runtime: python3.13
+            Architectures: [arm64]
+            Handler: lambda_function.lambda_handler
+            MemorySize: !FindInMap [Lambda, GatewayTool, Memory]
+            Timeout: !FindInMap [Lambda, GatewayTool, Timeout]
+            Role: !GetAtt GatewayToolRole.Arn
+            Code:
+                S3Bucket: !FindInMap [CodeBuild, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                      pkg: !FindInMap [CodeBuild, Source, GatewayToolPackage]
+            Environment:
+                Variables:
+                    STATE_MACHINE_ARN: !GetAtt FaceRecognitionStateMachine.Arn
+                    INDEX_STATE_MACHINE_ARN: !GetAtt FaceIndexStateMachine.Arn
+                    FACE_TABLE_NAME: !Ref FaceTable
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    TOOL_VERSION: "%%VERSION%%"
+                    # Must equal the GatewayTarget Name in media-toolkit-gateway/cfnstack.yaml
+                    TARGET_NAME: "face-recognition"
+                    DEFAULT_COLLECTION_ID: !FindInMap [Collection, Defaults, Id]
+            TracingConfig:
+                Mode: Active
+
+    GatewayToolPermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !GetAtt GatewayToolLambda.Arn
+            Action: lambda:InvokeFunction
+            Principal: bedrock-agentcore.amazonaws.com
+            SourceAccount: !Ref AWS::AccountId
+
+Outputs:
+    ImageUri:
+        Description: ECR image URI
+        Value: !Sub
+            - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+            - repo: !FindInMap [ECR, Repository, Name]
+              tag: !FindInMap [ECR, Repository, ImageTag]
+    StateMachineArn:
+        Description: Face recognition state machine ARN
+        Value: !GetAtt FaceRecognitionStateMachine.Arn
+    StateMachineName:
+        Description: Face recognition state machine name
+        Value: !Sub ${ResourcePrefix}-face-recognition
+    IndexStateMachineArn:
+        Description: Face index management state machine ARN (README.md §19)
+        Value: !GetAtt FaceIndexStateMachine.Arn
+    FaceTableName:
+        Description: DynamoDB table (face records + semaphore)
+        Value: !Ref FaceTable
+    GatewayToolLambdaArn:
+        Description: Pass this as FaceRecognitionToolLambdaArn when deploying media-toolkit-gateway
+        Value: !GetAtt GatewayToolLambda.Arn

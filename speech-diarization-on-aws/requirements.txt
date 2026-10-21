@@ -1,0 +1,34 @@
+# requirements.txt
+# Pinned for reproducibility. All packages are CPU-only builds.
+# boto3/botocore are included in the Lambda base image but pinned here
+# so the version is explicit and not silently upgraded by AWS.
+
+# ── AWS ───────────────────────────────────────────────────────────────────────
+boto3==1.40.4
+botocore==1.40.4
+
+# ── Numerics ──────────────────────────────────────────────────────────────────
+numpy==2.4.2           # cp313 aarch64 manylinux wheel; compatible with ort 1.19+ and ctranslate2 4.x
+scipy==1.17.1          # cp313 aarch64 manylinux wheel; numpy 2.x compatible
+
+# ── ONNX runtime (CPU only) ───────────────────────────────────────────────────
+# Do NOT install onnxruntime-gpu — it attempts CUDA init and crashes on Lambda.
+onnxruntime==1.24.2
+
+# ── Whisper (CPU only) ────────────────────────────────────────────────────────
+# faster-whisper pulls ctranslate2. On aarch64, ctranslate2 publishes
+# CPU-only manylinux wheels on PyPI directly — no extra index needed.
+faster-whisper==1.2.1
+
+# ── wtpsplit replacement (lib/wtpsplit_sat.py + lib/wtpsplit_extract.py) ──────
+# We vendor the two files from wtpsplit that run on the ONNX path and strip
+# everything else. This eliminates torch, transformers, and huggingface_hub.
+#
+# Runtime deps for the vendored path:
+#   tokenizers → Rust fast tokenizer; loads tokenizer.json directly via
+#                Tokenizer.from_file() — zero Python transitive dependencies
+#   tqdm       → imported at module level in wtpsplit_extract.py
+#
+# NOT installed: wtpsplit, transformers, torch, huggingface_hub
+tokenizers==0.22.2         # Rust tokenizer — no transitive deps
+tqdm==4.67.3               # progress bar; auto-suppressed in Lambda (non-TTY)

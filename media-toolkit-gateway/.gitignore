@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+venv*/
+.venv/
+*.egg-info/
+
+# Editors / IDE
+.vscode/
+.idea/
+*.swp
+
+# Claude Code session data
+.claude/
+
+# Build output — build-deploy-s3-dist.sh's staged zips/template, regenerable
+dist/
+
+# Local archives and logs
+*.zip
+*.tar.gz
+*.log
+
+# Toolkit-explainer promo material — local only
+docs/toolkit-explainer/promo/
+
+# Sharp scrub literals — NEVER commit (they ARE the values being guarded)
+.scrub-patterns.local

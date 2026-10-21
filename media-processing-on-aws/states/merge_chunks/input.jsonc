@@ -1,0 +1,121 @@
+{
+  // Full event passed to StateMergeChunks by Step Functions.
+  // The Map state (StateChunkTranscode) replaces data.iterators in-place with its
+  // output array — a list of ChunkTranscode return dicts, one per chunk.
+  "operation": "StateMergeChunks",
+  "uuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "input": {
+    "s3uri": "s3://<your-ingest-bucket>/uploads/my_video.mxf",
+    "input_config": {
+      "use_channel_mapping": true,
+      "audio_channel_mapping": [1, 2]
+    }
+  },
+  "output": {
+    "s3uri": "s3://<your-proxy-bucket>/a1b2c3d4",
+    "output_groups": [
+      {"group_name": "proxy",         "format": "mp4"},
+      {"group_name": "audio_only",    "format": "wav"},
+      {"group_name": "frame_capture", "format": "jpeg"}
+    ]
+  },
+  "status": "COMPLETED",
+  "data": {
+    // destination: resolved at probe time from output.s3uri.
+    // StateMergeChunks uses this as the output bucket/prefix for all final outputs.
+    "destination": {
+      "bucket": "<your-proxy-bucket>",
+      "prefix": "a1b2c3d4"
+    },
+
+    // output_groups: reconciled list from StateProbeMediaFile.
+    // StateMergeChunks routes by format:
+    //   "mp4"  — segment_video chunks (TS) → concat → MP4; written to {prefix}/{group_name}/{name}.mp4
+    //   "wav"  — segment_audio chunks (FLAC) → concat → decode → WAV; written to {prefix}/{group_name}/{name}.wav
+    //   "m4a"  — segment_audio chunks (FLAC) → concat → AAC encode → M4A; written to {prefix}/{group_name}/{name}.m4a
+    //   "jpeg" — frames already uploaded by ChunkTranscode; write manifest JSON only
+    // Groups not present mean the corresponding chunk outputs were never produced (safe to skip).
+    "output_groups": [
+      {
+        "group_name":    "proxy",
+        "format":        "mp4",
+        "name":          "transcoded",
+        "codec":         "libopenh264",
+        "gop_seconds":   2.0,
+        "motion_factor": 1.6
+      },
+      {
+        "group_name":     "audio_only",
+        "format":         "wav",
+        "name":           "audio",
+        "sampling_rate":  48000,
+        "codec":          "pcm_s16le",
+        "audio_channels": 1
+      },
+      {
+        "group_name":     "frame_capture",
+        "format":         "jpeg",
+        "name":           "frame"
+      }
+    ],
+
+    "probe_s3_key": "a1b2c3d4/probe.json",
+    "duration_sec": 1200.032167,
+    "has_video":    true,
+    "has_audio":    true,
+    "is_all_intra": false,
+
+    // iterators: output of the Map state — one entry per ChunkTranscode invocation.
+    // These are NOT the probe iterators. Each entry is the return value of
+    // StateChunkTranscode lambda_handler: {item_id, outputs}.
+    // StateMergeChunks sorts by item_id before merging.
+    //
+    // outputs routing by s3_prefix:
+    //   "segment_video" → s3_key: the .ts chunk; collected in order → TS concat → MP4
+    //   "segment_audio" → s3_key: the .flac chunk; collected in order → FLAC concat → per-group WAV/M4A
+    // outputs routing for frames:
+    //   {s3_prefix}     → frame_keys: list of already-uploaded JPEG S3 keys; write manifest only
+    //
+    // A chunk may have fewer entries than expected if ProbeMediaFile produced
+    // no video group (audio-only source) — segment_video will be absent throughout.
+    "iterators": [
+      {
+        "item_id": 0,
+        "outputs": [
+          {
+            "s3_prefix": "segment_video",
+            "s3_key":    "a1b2c3d4/segment_video/video_0.ts"
+          },
+          {
+            "s3_prefix": "segment_audio",
+            "s3_key":    "a1b2c3d4/segment_audio/audio_0.flac"
+          },
+          {
+            "s3_prefix": "frame_capture",
+            // frame_capture: compact descriptor — MergeChunks reconstructs key list as:
+            //   f"frame_{start + i * step:07d}.jpg" for i in range(total)
+            // total is the actual count produced (last chunk may be short).
+            "frames": {"start": 0, "step": 30, "total": 3}
+          }
+        ]
+      },
+      {
+        "item_id": 1,
+        "outputs": [
+          {
+            "s3_prefix": "segment_video",
+            "s3_key":    "a1b2c3d4/segment_video/video_1.ts"
+          },
+          {
+            "s3_prefix": "segment_audio",
+            "s3_key":    "a1b2c3d4/segment_audio/audio_1.flac"
+          },
+          {
+            "s3_prefix": "frame_capture",
+            "frames": {"start": 18000, "step": 30, "total": 2}
+          }
+        ]
+      }
+    ]
+  }
+}

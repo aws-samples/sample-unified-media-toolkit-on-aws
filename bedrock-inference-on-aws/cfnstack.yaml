@@ -1,0 +1,3062 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# ==============================================================================
+# bedrock-inference-on-aws — N records in, N responses out. Version %%VERSION%%
+#
+# The micro-workflow that makes Bedrock calls on a caller's behalf: sync (under a
+# concurrency lease taken HERE) or batch (queued here). **Self-contained** — it owns
+# its own semaphore and depends on no sibling stack. README.md §M records the merge
+# that made it so; §1.2's split with service-quotas-on-aws is history (README.md §1.2).
+#
+# ONE CONTAINER IMAGE ON ECR, built by CodeBuild (ARM_CONTAINER, native arm64),
+# and SEVEN MEMORY TIERS off that one image. Adopted 2026-08-12 for CONSISTENCY
+# with the rest of the repo, not because this workflow needs it: it decodes no
+# media and loads no model, so a flat zip on the managed python3.13 runtime was
+# and remains technically sufficient. The siblings that do need a container need
+# it for open-source model weights; matching them means one deployment story to
+# learn, one build script shape, and one place to look when a build breaks.
+# THREE FUNCTIONS STAY FLAT ZIPS, and none of them is a workflow state: the
+# AgentCore gateway tool, the build-starter (it builds the image, so it cannot be
+# in it), and the Custom::ModelRegistrySeeder — which rides in the GATEWAY TOOL
+# package, exactly as media-processing's bucket-check custom resource does. No
+# sibling puts a CloudFormation custom resource in its image, and on the image
+# this one could not seed the registry until a docker build had finished.
+# Consequence worth stating: there is NO ImageConfig.Command anywhere below, so
+# all seven tiers run the Dockerfile's one CMD.
+#
+# THREE STATE MACHINES (README.md §M1). The orchestrator is what callers start;
+# it plans, routes to one of two standalone children through `startExecution.sync:2`,
+# and collects usage tracking:
+#
+#   ${ResourcePrefix}-bedrock-inference         plan → route → usage tracking
+#   ${ResourcePrefix}-bedrock-inference-sync    acquire → run → release → summarize
+#   ${ResourcePrefix}-bedrock-inference-batch   submit → collect → summarize
+#
+# TWO TABLES: the semaphore (`sync-infer-quotas`) and the batch queue / task tokens
+# (`batch-infer-tokens`). They are separate because their access patterns and their
+# roles are, not because of where they came from.
+#
+# SEVEN TIER FUNCTIONS, ONE SHARED ROLE, AND THE SPLIT IS MEMORY — reversing the
+# stack's founding design on 2026-08-12, deliberately and at a cost stated here so
+# no future reader mistakes it for an oversight.
+#
+# It WAS six workflow functions with six roles, and the roles were the design: no
+# role held both `bedrock:*` and `states:SendTask*`, only DrainRole could `Scan`,
+# and BatchStatusRole could write a status but never redeem a token. Compartments,
+# and six tests asserting them. The house tier pattern cannot express that — every
+# sibling points all of its tiers at ONE role, because the tiers are the same
+# image differing only in memory and any state may land on any of them. Adopting
+# the pattern therefore means adopting the single role:
+# `BedrockInferenceLambdaRole` holds `bedrock:InvokeModel` AND
+# `states:SendTaskSuccess` AND `dynamodb:Scan` on both tables, and the compartment
+# tests are gone. What remains is narrower and still load-bearing: exactly one CODE
+# PATH decrements the semaphore (states/handle_semaphore_release, on the stream,
+# deduped per eventID), and every holder-disappearance path reaches it by DELETING
+# a holder.
+#
+# THREE tiers are routed to, four are declared-and-unrouted so a state can be
+# re-pointed during sizing work without a template change (the house norm —
+# media-processing routes 3 of 7, audiostem 4 of 7). An unrouted tier costs a
+# Function + a LogGroup at deploy time and nothing at runtime.
+#
+# THREE stream/event consumers still cannot be told apart by event shape, and that
+# is now the ONLY reason three tier functions must stay distinct — it is no longer
+# an IAM boundary, just a routing marker. STREAM_HANDLER names which one each is,
+# and THE MARKER IS WHAT PINS EACH TIER: the six old functions could be packed onto
+# the three tiers in only one way, because a tier has exactly one marker and
+# `notify` is needed by two of them while `semaphore` and `drain` are needed by one
+# each.
+#
+#   Tier      Mem    STREAM_HANDLER  reached by                     was
+#   ──────────────────────────────────────────────────────────────────────────────
+#   HalfCore   896   notify          token stream; prefix-scoped    notify   (256)
+#                                    aws.bedrock                   batch-status (256)
+#   OneCore   1792   drain           token stream; 5-min schedule;  drain    (512)
+#                                    unscoped aws.bedrock;          run-inference
+#                                    RunInferenceLambdaArn                   (1024)
+#   TwoCores  3584   semaphore       quota stream; aws.states       workflow (1024)
+#                                    terminal; InferenceLambdaArn;  submit-batch
+#                                    SubmitBatchLambdaArn                    (2048)
+#
+# The ASL tokens are unchanged — `InferenceLambdaArn`, `RunInferenceLambdaArn`,
+# `SubmitBatchLambdaArn` are the only three Lambda ARNs any definition names, so
+# the three definitions*.json bodies did not change at all; only what the
+# substitutions point AT did.
+#
+# A state landing on a marked tier is harmless, and that is why this packing is
+# legal at all: the dispatcher routes an SFN task by the `operation` field in its
+# payload and never consults STREAM_HANDLER, so run-inference sharing a function
+# with the drain consumer costs nothing. The marker is read only for a DynamoDB
+# stream record or an aws.bedrock event, neither of which carries an `operation`.
+#
+# The four unrouted tiers set NO marker at all: nothing delivers them a stream or
+# an aws.bedrock event, and an unset marker RAISES rather than defaulting to a
+# branch — so a mis-wired event source is loud instead of silently draining.
+# Getting a marker wrong is still a one-line deploy-time misconfiguration.
+#
+# THE CAP IS PER RESOURCE-PREFIX, NOT PER REGION, and that is the merge's one
+# semantic change. The standalone quota stack enforced a singleton through its table
+# NAME: a second copy in a region failed at CREATE. Here the table is
+# ${ResourcePrefix}-sync-infer-quotas, so two deployments with different prefixes get
+# two independent caps against one real Bedrock quota. Deploy one prefix per region
+# if the cap has to mean what it says.
+#
+# There are no CloudFormation Exports, deliberately: an export cannot be changed or
+# deleted while any importer exists, which welds every consumer's lifecycle to this
+# one. Consumers take the outputs as plain String parameters, as every other
+# cross-stack reference in the repo does.
+# ==============================================================================
+
+Description: Bedrock inference micro-workflow — N already-rendered prompts in, N responses out, sync (leased) or batch (queued). Self-contained — owns its own concurrency semaphore and batch queue. Version %%VERSION%%
+
+Mappings:
+    # `Package` until 2026-08-12, renamed to match the siblings: `Package` now names
+    # the CodeBuild SOURCE archive (the whole repo, which the Dockerfile builds from)
+    # rather than a Lambda deployment zip. GatewayToolPackage is still a real Lambda
+    # zip — the gateway tool is the one function that stays flat.
+    CodeBuild:
+        Source:
+            Package: "%%PKG_BEDROCK_INFERENCE%%"
+            GatewayToolPackage: "%%PKG_GATEWAY_TOOL%%"
+            Bucket: "%%BUCKET_NAME%%"
+            KeyPrefix: "%%KEY_PREFIX%%"
+        Project:
+            Type: ARM_CONTAINER
+            ComputeType: BUILD_GENERAL1_LARGE
+            Image: aws/codebuild/amazonlinux2-aarch64-standard:3.0
+    ECR:
+        Repository:
+            Name: bedrock-inference-on-aws
+            # The tag IS the version, which is what makes an unbumped stack update a
+            # no-op: the buildspec's pre_build skips the docker build entirely when
+            # {Name}:{ImageTag} already exists in ECR.
+            ImageTag: "%%VERSION%%"
+    DynamoDB:
+        QuotaTable:
+            Suffix: sync-infer-quotas
+        TokenTable:
+            Suffix: batch-infer-tokens
+        CallbackTable:
+            # bi- prefix matches the sibling convention (mp-/fi-/tts-callback-tokens).
+            # Renamed from the bare `callback-tokens` 2026-09-18; TableName is
+            # createOnly, so this deploys as a table REPLACEMENT — safe only
+            # while no callback run is in flight (rows are transient tokens;
+            # a row lost mid-flight sleeps its held state to its timeout)
+            Suffix: bi-callback-tokens
+    # ── The two deploy-time constants (2026-08-12) ────────────────────────────
+    # Both were stack Parameters. They are not request settings and they are not
+    # runtime config: each is read by CloudFormation itself while building a
+    # resource, so neither can come from input_schema.py or a workflow_config JSON
+    # the way DefaultModelChain / MaxConcurrentDefault / BatchMinSavings now do.
+    # They live here, next to the memory and timeout figures, because Mappings is
+    # already where this template keeps values fixed at deploy time.
+    #
+    # BOTH CARRY A FILLER MIDDLE KEY (`Object`, `Schedule`) AND MUST. `Fn::FindInMap`
+    # takes exactly three arguments — map, top-level key, second-level key — so a
+    # single scalar under a map name cannot be read at all. Written flat
+    # (`ModelRegistry: {Key: ...}` / `!FindInMap [ModelRegistry, Key]`) the template
+    # still PARSES and still builds; it fails at CREATE/UPDATE, after the build is
+    # green. That was the shape here until cfn-lint's E1011 named it, and
+    # `test_every_findinmap_names_three_levels_that_exist` now catches it offline.
+    ModelRegistry:
+        # Interpolated into IAM policy resource ARNs below. An S3 grant has to name
+        # its object at deploy time — read from a runtime JSON the grant could not
+        # be scoped to the registry at all, which is the opposite of the point. The
+        # env var handed to the functions is set from THIS entry so the grant and
+        # the reader cannot disagree; lib/bedrock.py carries the same string as its
+        # own fallback default.
+        #
+        # _model_configs/, NOT _settings/: the proxy bucket is shared with an M2C
+        # v5 deployment whose core stack writes its OWN availablemodels.json (a
+        # bare list, no envelope) at _settings/. The original plan was a cutover —
+        # seed over v5's file in place — and that is what ran until 2026-08-13;
+        # separate paths replaced it so neither stack can clobber the other's
+        # registry, each carrying its own shape.
+        Object:
+            Key: _model_configs/availablemodels.json
+    Drain:
+        # An AWS::Events::Rule ScheduleExpression — a CloudFormation property,
+        # evaluated before any code runs. The scheduled sweep is the BACKSTOP,
+        # not the mechanism: normal drainage is event-driven (the table stream
+        # and the unscoped aws.bedrock completion rule), and the sweep exists
+        # for what events cannot cover — TTL expiry, manual row deletion, a
+        # missed event. It is what makes the queue self-healing rather than
+        # event-dependent (README.md §6.5 fix 2), so it stays; without it any of
+        # those strands a parked token until its 24 h TimeoutSeconds, turning
+        # an execution that would have succeeded late into a FAILED one.
+        #
+        # Every 6 hours, not every 5 minutes: the sweep only matters on the rare
+        # missed-event path, where its interval is the worst-case added latency
+        # — six hours against a token budget of 24, so even a row stranded the
+        # moment after a sweep gets three more chances before the token times
+        # out. At rate(5 minutes) it was 8,640 invocations a month, each a Scan
+        # of a table that is empty whenever no batch work is queued, all to
+        # shave latency off a path that almost never runs.
+        Schedule:
+            Expression: rate(6 hours)
+    # NOT under Lambda: the bundle's tier-vocabulary test pins Mappings.Lambda
+    # to {the seven tiers, Function, GatewayTool}, and the seeder is none of
+    # those — a CloudFormation custom resource with its own role, not a workflow
+    # state. Flat zip out of the gateway-tool package, like every sibling's.
+    CustomResource:
+        # NOT under Lambda: the bundle pins Mappings.Lambda to the tier
+        # vocabulary + {Function, GatewayTool} — same rule that put the
+        # seeder here (registration 2026-08-14).
+        CallbackWaker:
+            Name: callback-waker
+            Description: Completes consumer task tokens on the orchestrator's terminal EventBridge event (README.md §11)
+            Memory: 256
+            Timeout: 60
+        SeedModelRegistry:
+            Name: seed-model-registry
+            # Reads a packaged JSON, filters by geo, one S3 PUT. Runs once per
+            # stack create/update.
+            Memory: 256
+            Timeout: 120
+    Lambda:
+        Function:
+            Name: bedrock-inference
+            Description: Bedrock Inference (N records in, N responses out)
+        GatewayTool:
+            Name: gateway-tool
+            Description: AgentCore Gateway dispatcher — run_inference + get_job_status + describe_tool
+            # Writes request.jsonl. Staged JSONL bodies STREAM through (one
+            # record + an 8 MiB part buffer in memory), so the memory here
+            # buys CPU (it scales with memory) rather than headroom, and the
+            # timeout bounds one pass over the largest staged file — a real
+            # 175 MB records.jsonl timed out the old 1024 MB / 60 s config
+            # (2026-08-23). NOT a tier, and flat-zip rather than container —
+            # the same split every sibling makes.
+            Memory: 3008
+            Timeout: 300
+        # ── The seven memory tiers ────────────────────────────────────────────
+        # The house vocabulary, verbatim: 896 / 1792 / 3584 / 5376 / 7168 / 8960 /
+        # 10240 MB against half-core / 1-core / … / 6-cores. No workflow in
+        # the repo declares a tier at a different memory or a different name, so
+        # these seven pairs are copied rather than chosen. `Memory` and `Name`
+        # only — Timeout is a literal on each function, as it is in the siblings,
+        # because timeout tracks what a STATE does and not how much RAM it has.
+        #
+        # THREE are routed to, and WHICH function lands on which is forced by the
+        # STREAM_HANDLER marker, not chosen — see the header. The sizes they
+        # replaced are recorded so a future sizing pass has a baseline:
+        #
+        #   HalfCore  896  ← notify (256), batch-status (256)
+        #                    one GSI query + one UpdateItem apiece; both are rare
+        #                    and sub-second, so 3.5× the price of a millisecond of
+        #                    almost nothing is still almost nothing
+        #   OneCore  1792  ← drain (512), run-inference (1024)
+        #                    the 5-minute sweep and the serial Converse loop. 1792
+        #                    is ~1 full vCPU where 1024 was ~0.6, which the
+        #                    per-record loop should if anything prefer, and a 900 s
+        #                    invocation here is dominated by waiting on Bedrock —
+        #                    whose spend for that same 900 s is orders of magnitude
+        #                    above the Lambda GB-seconds either way
+        #   TwoCores 3584  ← workflow (1024), submit-batch (2048)
+        #                    submit-batch renders 10 000 records through
+        #                    build_converse_params into one JSONL and set the old
+        #                    2048; workflow's collect-batch holds a whole batch
+        #                    job's output plus the parsed records at once, so it
+        #                    gains headroom it did not have
+        #
+        # Every routed tier went UP and none went down, which is the direction that
+        # matters: a tier BELOW a state's old memory is an OOM waiting for the
+        # largest real payload, and 896 would have been one for workflow (1024).
+        #
+        # ThreeCores through SixCores are declared-and-unrouted, which is the norm
+        # and not an oversight — re-point a state at one to measure a different
+        # size without touching the template's shape. Do not delete them.
+        HalfCore:
+            Memory: 896
+            Name: half-core
+        OneCore:
+            Memory: 1792
+            Name: 1-core
+        TwoCores:
+            Memory: 3584
+            Name: 2-cores
+        ThreeCores:
+            Memory: 5376
+            Name: 3-cores
+        FourCores:
+            Memory: 7168
+            Name: 4-cores
+        FiveCores:
+            Memory: 8960
+            Name: 5-cores
+        SixCores:
+            Memory: 10240
+            Name: 6-cores
+
+Parameters:
+    ResourcePrefix:
+        Type: String
+        Description: 'Prefix applied to all resource names. The two tables are {ResourcePrefix}-sync-infer-quotas and {ResourcePrefix}-batch-infer-tokens. NOTE the cap is per PREFIX, not per region: two stacks with different prefixes get two independent semaphores against one real Bedrock quota — see the header.'
+    ProxyBucket:
+        Type: String
+        Description: S3 proxy bucket holding the model registry (_model_configs/availablemodels.json), the micro-workflow/ request and response objects, and batch job input/output. May be shared with an M2C v5 deployment, whose own registry at _settings/ is untouched.
+    # ── Two parameters, and only two, deliberately (2026-08-12) ───────────────
+    # Both name something OUTSIDE this stack that the deployer alone knows, which
+    # is the whole test for belonging here. Five others used to sit below:
+    #
+    #   DefaultModelChain      → lib/input_schema.py DEFAULT_MODEL_CHAIN
+    #   MaxConcurrentDefault   → lib/input_schema.py MAX_CONCURRENT_DEFAULT
+    #   BatchMinSavings        → lib/input_schema.py BATCH_MIN_SAVINGS
+    #   ModelRegistryKey       → Mappings.ModelRegistry.Object.Key
+    #   DrainScheduleExpression→ Mappings.Drain.Schedule.Expression
+    #
+    # The first three were REQUEST defaults, and the code already carried every one
+    # of them (`os.environ.get(..., "3")`, `..., "0.25"`) — so the parameter and the
+    # constant were two spellings of one number, and only the parameter could drift
+    # per-stack with nothing in the tree to show it. DefaultModelChain had drifted:
+    # the template shipped haiku-4-5 while eu-west-1 ran sonnet-4-6, which silently
+    # re-identified every chain-less request, since the gateway writes model_chain
+    # into the hash that IS workflow_id. UNPRICED_BATCH_MIN_TOKENS was already a
+    # bare constant with no parameter — that was the pattern to follow.
+    # The last two are read by CloudFormation itself; see Mappings.
+
+Resources:
+
+    ############################################################################
+    # DynamoDB #1 — the concurrency semaphore. Items (README.md §M2,
+    # unchanged by the merge except for the table's name):
+    #   pk="semaphore#{svc}#{res}"  sk="counter"            holders/max_holders/ttl
+    #   pk="semaphore#{svc}#{res}"  sk="holder#{arn}"       one per in-flight exec
+    #   pk="lease#{arn}"            sk="scope#{svc}#{res}"  reverse pointer
+    #   pk="pending#{svc}#{res}"    sk=sha256(task_token)   FIFO waiter queue
+    #   pk="stream-dedup"           sk={eventID}            exactly-once markers
+    #
+    # NO GSI. Every access is a direct key read or a single-partition query. The one
+    # lookup that would have needed an index — execution ARN to holder, for the
+    # EventBridge terminal handler, which receives only an executionArn — is served
+    # by the lease# reverse pointer written in the same transaction as the holder.
+    #
+    # Scoped per RESOURCE, not per service, in both directions: Sonnet 5 saturating
+    # does not imply Haiku 4.5 is saturated. Here `resource` is the chain's PRIMARY
+    # model id, so a per-service counter would couple unrelated models and read as a
+    # slow service.
+    #
+    # A SEPARATE TABLE from the batch queue below, and not for historical reasons:
+    # the two have disjoint access patterns (transactions and a FIFO queue here,
+    # a GSI-by-job-arn there). They used to have disjoint ROLES too — the semaphore
+    # was written by WorkflowRole and RunInferenceRole, the queue by five others —
+    # and after the 2026-08-12 collapse to one role that half of the reason is gone.
+    # The access patterns are not, and they are the half that was load-bearing.
+    #
+    # Every item carries a ttl, so TTL expiry is one of the THREE holder
+    # disappearance paths and not merely garbage collection (semaphore invariant 5).
+    # NEW_AND_OLD_IMAGES rather than KEYS_ONLY: the stream handler reads only Keys
+    # today, but diagnosing a lost decrement after the fact needs the removed
+    # holder's acquired_at, and KEYS_ONLY discards it forever.
+    ############################################################################
+    SyncInferQuotasTable:
+        Type: AWS::DynamoDB::Table
+        Metadata:
+            checkov:
+                skip:
+                    - id: CKV_AWS_119
+                      comment: >-
+                        sample posture: table holds rebuildable derived state; default SSE is deliberate (see README.md — DynamoDB posture)
+                    - id: CKV_AWS_28
+                      comment: >-
+                        sample posture: table is rebuildable derived state designed to delete with the stack; PITR protects nothing irreplaceable here
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W74
+                      reason: Ephemeral coordination state with a TTL on every item — no customer data, nothing worth a CMK's key-management cost
+                    - id: W78
+                      reason: Point-in-time recovery is pointless for a semaphore — a restored counter would be a stale count, and invariant 5's counter TTL is the recovery mechanism
+                    - id: W28
+                      reason: >-
+                          The explicit name is how the vendored semaphore client and every function
+                          in this stack agree on one table without a CFN import. Blocking a
+                          replacement-requiring update is the correct trade — replacing this table
+                          would silently reset every live holder count.
+        Properties:
+            TableName: !Sub
+                - ${ResourcePrefix}-${suffix}
+                - suffix: !FindInMap [DynamoDB, QuotaTable, Suffix]
+            BillingMode: PAY_PER_REQUEST
+            AttributeDefinitions:
+                - { AttributeName: pk, AttributeType: S }
+                - { AttributeName: sk, AttributeType: S }
+            KeySchema:
+                - { AttributeName: pk, KeyType: HASH }
+                - { AttributeName: sk, KeyType: RANGE }
+            TimeToLiveSpecification:
+                AttributeName: ttl
+                Enabled: true
+            StreamSpecification:
+                StreamViewType: NEW_AND_OLD_IMAGES
+
+    ############################################################################
+    # DynamoDB #2 — the batch queue AND the task tokens, one item each (README.md §6.1):
+    #
+    #   pk = "batch#{model_id}"   sk = "{workflow_id}"
+    #        status ∈ PENDING | SUBMITTING | SUBMITTED | COMPLETED | FAILED
+    #        task_token, job_arn, request_s3uri, model_params, ttl
+    #
+    # V5 splits this across a backlog table and a service-token table joined on
+    # jobName, because register() runs in one stack and the completion arrives in
+    # another. Here both are in this stack, so the token and the queue entry are one
+    # item and the join disappears.
+    #
+    # NEW_AND_OLD_IMAGES is required, not a preference: NotifyFunction fires on a
+    # TRANSITION to a terminal status, which means comparing OldImage.status against
+    # NewImage.status. With NEW_IMAGE only it would fire on every write to a
+    # terminal row and re-send the token on each one.
+    #
+    # ONE GSI, one purpose: the EventBridge completion handler receives a
+    # batchJobArn and nothing else.
+    ############################################################################
+    BatchInferTokensTable:
+        Type: AWS::DynamoDB::Table
+        Metadata:
+            checkov:
+                skip:
+                    - id: CKV_AWS_119
+                      comment: >-
+                        sample posture: table holds rebuildable derived state; default SSE is deliberate (see README.md — DynamoDB posture)
+                    - id: CKV_AWS_28
+                      comment: >-
+                        sample posture: table is rebuildable derived state designed to delete with the stack; PITR protects nothing irreplaceable here
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W74
+                      reason: Ephemeral queue and task-token state with a TTL on every item — no customer data, nothing worth a CMK's key-management cost
+                    - id: W78
+                      reason: Point-in-time recovery is pointless here — a restored row's task token is already expired, so a restore could only resume executions that no longer exist
+                    - id: W28
+                      reason: The explicit name is how consumers and the vendored token client agree on one table without a CFN import; the TTL, not a backup, is the recovery mechanism
+        Properties:
+            TableName: !Sub
+                - ${ResourcePrefix}-${suffix}
+                - suffix: !FindInMap [DynamoDB, TokenTable, Suffix]
+            BillingMode: PAY_PER_REQUEST
+            AttributeDefinitions:
+                - { AttributeName: pk, AttributeType: S }
+                - { AttributeName: sk, AttributeType: S }
+                - { AttributeName: job_arn, AttributeType: S }
+            KeySchema:
+                - { AttributeName: pk, KeyType: HASH }
+                - { AttributeName: sk, KeyType: RANGE }
+            GlobalSecondaryIndexes:
+                - IndexName: job_arn-index
+                  KeySchema:
+                      - { AttributeName: job_arn, KeyType: HASH }
+                  # KEYS_ONLY is not enough: BatchStatusFunction needs the row's
+                  # model_id to build the pk for its UpdateItem, and a second GetItem
+                  # to fetch it would be a read it already paid for.
+                  Projection:
+                      ProjectionType: INCLUDE
+                      NonKeyAttributes: [status, model_id]
+            TimeToLiveSpecification:
+                AttributeName: ttl
+                Enabled: true
+            StreamSpecification:
+                StreamViewType: NEW_AND_OLD_IMAGES
+
+    ############################################################################
+    # DynamoDB #3 — consumer callback tokens (README.md §11, added for
+    # the llm-prompt-driven workflows; designed jointly with the
+    # conversation-analysis workflow):
+    #
+    #   pk = execution_arn (orchestrator)   sk = sha256(token)[:32]
+    #        token, handle (the submit response JSON), ttl
+    #
+    # Rows are written by the GATEWAY at submit (before StartExecution, so the
+    # waker can never fire first) and completed/deleted by CallbackWakerLambda
+    # on the execution's terminal event. sk is a token hash so multiple
+    # consumers absorbed into ONE run each get their own row and their own
+    # wake. Notification lives HERE, once, rather than as a table+rule+waker
+    # in every consumer stack — N consumers are N rows, not N× infrastructure.
+    ############################################################################
+    CallbackTokensTable:
+        Type: AWS::DynamoDB::Table
+        Metadata:
+            checkov:
+                skip:
+                    - id: CKV_AWS_119
+                      comment: >-
+                        sample posture: table holds rebuildable derived state; default SSE is deliberate (see README.md — DynamoDB posture)
+                    - id: CKV_AWS_28
+                      comment: >-
+                        sample posture: table is rebuildable derived state designed to delete with the stack; PITR protects nothing irreplaceable here
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W74
+                      reason: Ephemeral task-token rows with a TTL on every item — no customer data, nothing worth a CMK's key-management cost
+                    - id: W78
+                      reason: Point-in-time recovery is pointless — a restored row's task token belongs to a wait state that has already timed out
+                    - id: W28
+                      reason: The explicit name is how the gateway and the waker agree on one table without a CFN import; the TTL is the recovery mechanism
+        Properties:
+            TableName: !Sub
+                - ${ResourcePrefix}-${suffix}
+                - suffix: !FindInMap [DynamoDB, CallbackTable, Suffix]
+            BillingMode: PAY_PER_REQUEST
+            AttributeDefinitions:
+                - { AttributeName: execution_arn, AttributeType: S }
+                - { AttributeName: token_hash, AttributeType: S }
+            KeySchema:
+                - { AttributeName: execution_arn, KeyType: HASH }
+                - { AttributeName: token_hash, KeyType: RANGE }
+            TimeToLiveSpecification:
+                AttributeName: ttl
+                Enabled: true
+
+    ############################################################################
+    # Bedrock batch service role.
+    #
+    # Assumed by BEDROCK, not by Lambda: a batch job runs asynchronously outside any
+    # invocation, so Bedrock itself reads the input JSONL, INVOKES THE MODEL, and
+    # writes the output — all three under this role. Scoped to this deployment's proxy
+    # bucket and, within it, to the micro-workflow/ prefix — the job never has a reason
+    # to read anything else.
+    #
+    # The two condition keys are the confused-deputy guard AWS documents for this
+    # role: without them, any account able to name this role ARN in its own
+    # CreateModelInvocationJob call could make Bedrock read and write our bucket.
+    ############################################################################
+    BedrockBatchServiceRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W11
+                      reason: Bedrock model resources cannot be enumerated at deploy time — see BedrockInferenceLambdaRole
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: bedrock.amazonaws.com
+                      Action: sts:AssumeRole
+                      Condition:
+                          StringEquals:
+                              aws:SourceAccount: !Ref AWS::AccountId
+                          ArnLike:
+                              aws:SourceArn: !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:model-invocation-job/*
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}BedrockInferenceBatchIOPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - s3:GetObject
+                                - s3:PutObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/*
+                          # ListBucket is scoped by prefix through the condition: the
+                          # job lists its own output folder and nothing else.
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                            Condition:
+                                StringLike:
+                                    s3:prefix: micro-workflow/*
+                          # THE JOB ITSELF INVOKES THE MODEL UNDER THIS ROLE, not
+                          # under the workflow role. S3 i/o alone is not enough: without
+                          # this the job is accepted, validated, scheduled, runs, and
+                          # then fails minutes later with "Customer doesn't have
+                          # permissions to invokeModel" — a real deploy-time failure
+                          # (README.md §12.2). It is expensive to diagnose because
+                          # nothing rejects the submit: the token parks, the drain sees
+                          # a healthy SUBMITTED row, and the only signal is the job's
+                          # own terminal `message`.
+                          #
+                          # Both resource forms are required and neither is redundant.
+                          # A cross-region inference profile resolves to a
+                          # foundation-model arn that may carry EITHER an empty region
+                          # (`arn:aws:bedrock:::foundation-model/...`) or this region,
+                          # and the profile arn itself is account-scoped — verified
+                          # against `get-inference-profile` for
+                          # global.anthropic.claude-sonnet-4-6, whose `models` list
+                          # contains exactly those two shapes. Same grant as
+                          # the workflow role, which is why the sync path worked while
+                          # batch did not.
+                          - Effect: Allow
+                            Action:
+                                - bedrock:InvokeModel
+                                - bedrock:InvokeModelWithResponseStream
+                            Resource:
+                                - arn:aws:bedrock:*::foundation-model/*
+                                - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*
+
+    ############################################################################
+    # IAM — ONE workflow role, and that is a reversal (2026-08-12).
+    #
+    # It used to be SIX, and the split was the design: README.md §6.3's asymmetry
+    # was enforced by IAM, not by code. The table that stood here recorded it —
+    # RunInferenceRole held bedrock:InvokeModel and no CreateModelInvocationJob so
+    # the sync loop could not submit a batch job inside a held lease; SubmitBatch
+    # held the control plane and no InvokeModel so "batch takes no lease" was
+    # unenforceable-by-permission rather than by convention; NotifyRole held
+    # states:SendTask* and no Bedrock while DrainRole held Bedrock and no Step
+    # Functions, so a drained submit structurally could not notify.
+    #
+    # ALL OF THAT IS GONE, and the cost is stated plainly rather than buried: the
+    # union role can invoke a model, submit a batch job, redeem any task token,
+    # and write both tables. Every one of those pairwise impossibilities is now a
+    # code convention that IAM will not catch. Six compartmentalization tests were
+    # deleted with it.
+    #
+    # It is deliberate. Every tiered workflow in the repo points all of its tiers at
+    # ONE role (media-processing: 7 functions, 1 role; tts, audiostem,
+    # speech-diarization the same), because the tier ladder means a STATE can move
+    # between memory sizes without a template change — and a per-state role makes
+    # that move a permissions change too, which is exactly the coupling the ladder
+    # exists to remove. Conforming to the house convention was chosen over the
+    # compartmentalization; see README.md.
+    #
+    # What still holds, and is the one invariant worth reading the code for:
+    # exactly ONE code path decrements the semaphore counter —
+    # states/handle_semaphore_release, on the quota table's stream, deduped per
+    # eventID. Every holder-disappearance path reaches it by DELETING a holder row,
+    # never by decrementing. Nothing else calls decrement_once. That was true when
+    # IAM enforced it and it is still true; it is now enforced only by the code.
+    #
+    # THREE roles remain, and the two that are not this one are genuinely separate:
+    # SeedModelRegistryRole is a CloudFormation custom resource (one S3 key, no
+    # Bedrock, no tables, not on the tier ladder), and GatewayToolRole is the
+    # untrusted edge — it holds states:StartExecution and read-only S3 and cannot
+    # call Bedrock or touch either table at all. Collapsing THOSE into the union
+    # would put Bedrock and both tables behind the internet-facing dispatcher, so
+    # they stay split. The siblings keep the same gateway/workflow split.
+    #
+    # Bedrock model resources are granted as `foundation-model/*` plus
+    # `inference-profile/*`, and that is as narrow as it can honestly be: a
+    # cross-region inference profile ARN depends on the caller's region at runtime,
+    # so the set is not enumerable at deploy time. The MODEL REGISTRY is the actual
+    # allowlist — `build_chain` rejects any id absent from it before a call is made,
+    # which is also what keeps a run from being uncosted.
+    ############################################################################
+
+    BedrockInferenceLambdaRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W11
+                      reason: One unscopeable grant. states:SendTask* is scoped to this account+region's state machines (the token's machine is the caller's, unknowable at deploy time); Bedrock model resources cannot be enumerated at deploy time because a cross-region inference profile ARN depends on the caller's runtime region. The model registry is the real allowlist; build_chain rejects any unregistered id before a call is made.
+                    - id: W76
+                      reason: Complexity over 25 is the DIRECT and accepted cost of the 2026-08-12 tier collapse — this one role is the union of six, because the house tier pattern points every tier at a single role and any state may land on any tier. Flagged rather than fixed, since the only fix is to re-split the role and abandon the tier convention. See the template header.
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}BedrockInferencePolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # All SEVEN tier groups, including the four no state
+                          # routes to. Scoped to the declared groups and
+                          # deliberately NOT AWSLambdaBasicExecutionRole: that
+                          # managed policy grants logs:CreateLogGroup on every
+                          # group, which lets a function that cannot reach its
+                          # declared group silently create an unmanaged one
+                          # instead of failing visibly.
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource:
+                                - !GetAtt BedrockInferenceLambdaHalfCoreLogGroup.Arn
+                                - !GetAtt BedrockInferenceLambda1CoreLogGroup.Arn
+                                - !GetAtt BedrockInferenceLambda2CoresLogGroup.Arn
+                                - !GetAtt BedrockInferenceLambda3CoresLogGroup.Arn
+                                - !GetAtt BedrockInferenceLambda4CoresLogGroup.Arn
+                                - !GetAtt BedrockInferenceLambda5CoresLogGroup.Arn
+                                - !GetAtt BedrockInferenceLambda6CoresLogGroup.Arn
+                          # ListBucket so object_exists() can tell "absent" from
+                          # "denied". Without it a denied HeadObject on the progress
+                          # checkpoint would have to be read as "no checkpoint yet",
+                          # and the sync loop would re-pay for every completed record.
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                          - Effect: Allow
+                            Action:
+                                - s3:GetObject
+                                - s3:PutObject
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/*
+                          # Data plane AND control plane in one statement, which is
+                          # the §6.3 asymmetry's grave marker: run_inference could
+                          # not submit a batch job and submit_batch could not
+                          # Converse, and now both can do both. Only the code stops
+                          # a batch submission from happening inside a held lease.
+                          - Effect: Allow
+                            Action:
+                                - bedrock:InvokeModel
+                                - bedrock:InvokeModelWithResponseStream
+                                - bedrock:CreateModelInvocationJob
+                                - bedrock:GetModelInvocationJob
+                            Resource:
+                                - arn:aws:bedrock:*::foundation-model/*
+                                - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*
+                                - !Sub arn:aws:bedrock:*:${AWS::AccountId}:model-invocation-job/*
+                          # Handing the batch role to Bedrock requires PassRole, and
+                          # the condition confines it to the one service that may
+                          # receive it. Still scoped, still conditioned — this one
+                          # did not widen.
+                          - Effect: Allow
+                            Action: iam:PassRole
+                            Resource: !GetAtt BedrockBatchServiceRole.Arn
+                            Condition:
+                                StringEquals:
+                                    iam:PassedToService: bedrock.amazonaws.com
+                          # THE FULL SEMAPHORE. Admission (try_acquire's
+                          # transaction: Update the counter, Put the holder and the
+                          # lease# pointer), queueing (store_pending), release
+                          # (Delete the holder and the pointer), the stream
+                          # decrement (decrement_once's Put-marker + Update-counter
+                          # transaction), and refresh_holder() on state entry.
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:GetItem
+                                - dynamodb:PutItem
+                                - dynamodb:UpdateItem
+                                - dynamodb:DeleteItem
+                                - dynamodb:Query
+                            Resource: !GetAtt SyncInferQuotasTable.Arn
+                          # Scan is required, not incidental: BOTH drain paths — the
+                          # scheduled sweep and the aws.bedrock completion — call
+                          # token_table.models_with_pending(), which is a Scan with a
+                          # status filter because "which models have a queue" is not a
+                          # key or an index. Without it every drain fails with
+                          # AccessDeniedException and the batch queue never moves.
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:GetItem
+                                - dynamodb:PutItem
+                                - dynamodb:UpdateItem
+                                - dynamodb:DeleteItem
+                                - dynamodb:Query
+                                - dynamodb:Scan
+                            Resource:
+                                - !GetAtt BatchInferTokensTable.Arn
+                                - !Sub ${BatchInferTokensTable.Arn}/index/job_arn-index
+                          # BOTH streams, because one function is now all three
+                          # stream consumers: the quota table's (STREAM_HANDLER=
+                          # semaphore) and the token table's (notify, drain). Which
+                          # branch runs is decided by the per-tier env marker, and
+                          # an unset marker RAISES rather than defaulting.
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:GetRecords
+                                - dynamodb:GetShardIterator
+                                - dynamodb:DescribeStream
+                                - dynamodb:ListStreams
+                            Resource:
+                                - !GetAtt SyncInferQuotasTable.StreamArn
+                                - !GetAtt BatchInferTokensTable.StreamArn
+                          # Redeems BOTH token kinds — the sync child's Acquire
+                          # lease token and the batch notifier's. Two roles used to
+                          # split these; see the Metadata suppression for why
+                          # neither could be scoped even then.
+                          - Effect: Allow
+                            Action:
+                                - states:SendTaskSuccess
+                                - states:SendTaskFailure
+                            # any machine in THIS account+region — the token's machine is the
+                            # caller's (ours or a customer's own), never known at deploy time
+                            Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*
+                          # Usage tracking walks the orchestrator's own history and the
+                          # child's. Execution ARNs, not state machine ARNs, and all
+                          # three machines because a child's history is read from the
+                          # orchestrator.
+                          - Effect: Allow
+                            Action:
+                                - states:DescribeExecution
+                                - states:GetExecutionHistory
+                            Resource:
+                                - !Sub
+                                  - arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${ResourcePrefix}-${name}:*
+                                  - name: !FindInMap [Lambda, Function, Name]
+                                - !Sub
+                                  - arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${ResourcePrefix}-${name}-sync:*
+                                  - name: !FindInMap [Lambda, Function, Name]
+                                - !Sub
+                                  - arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${ResourcePrefix}-${name}-batch:*
+                                  - name: !FindInMap [Lambda, Function, Name]
+                          # Usage tracking prices each invocation at its own function's
+                          # memory. Without this the report silently falls back to
+                          # _DEFAULT_MEMORY_MB for every state — which now matters MORE
+                          # than it did, because the tier ladder spreads the states
+                          # across 896 / 1792 / 3584 MB instead of clustering them at
+                          # 1024.
+                          - Effect: Allow
+                            Action: lambda:GetFunctionConfiguration
+                            Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ResourcePrefix}-*
+
+    SeedModelRegistryRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}BedrockInferenceSeedModelRegistryPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt SeedModelRegistryLogGroup.Arn
+                          # Read-then-write on the ONE registry key — the read is the
+                          # version check that makes an unbumped stack update a no-op
+                          # instead of clobbering an operator-edited registry.
+                          - Effect: Allow
+                            Action:
+                                - s3:GetObject
+                                - s3:PutObject
+                            Resource: !Sub
+                                - arn:aws:s3:::${ProxyBucket}/${key}
+                                - key: !FindInMap [ModelRegistry, Object, Key]
+
+    GatewayToolRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W11
+                      reason: states:SendTask* is scoped to this account+region's state machines — the token's machine is the caller's and unknowable at deploy time. The token itself is the capability; the callback table it comes from is writable by this role alone.
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}BedrockInferenceGatewayToolPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt GatewayToolLogGroup.Arn
+                          - Effect: Allow
+                            Action: states:StartExecution
+                            Resource: !GetAtt InferenceStateMachine.Arn
+                          # DescribeExecution and GetExecutionHistory take execution
+                          # ARNs, not the state machine ARN.
+                          - Effect: Allow
+                            Action:
+                                - states:DescribeExecution
+                                - states:GetExecutionHistory
+                            Resource: !Sub
+                                - arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${smName}:*
+                                - smName: !GetAtt InferenceStateMachine.Name
+                          # PutObject, unlike the other gateway tools in the repo:
+                          # this dispatcher CREATES input_params.json and request.jsonl at
+                          # a prefix derived from the workflow_id it just computed.
+                          # There is no caller-supplied uri to pass through.
+                          # Abort/Delete serve the streaming staged-records
+                          # path alone: its _staging/ object is copied to the
+                          # final key and removed, and a refused stream aborts
+                          # its own multipart upload (both are separate IAM
+                          # actions from PutObject — without them the cleanup
+                          # degrades to warn-logs and orphaned parts).
+                          - Effect: Allow
+                            Action:
+                                - s3:GetObject
+                                - s3:PutObject
+                                - s3:DeleteObject
+                                - s3:AbortMultipartUpload
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}/micro-workflow/*
+                          # READ-only on the one registry key: list_models /
+                          # get_model are thin reads over the seeded artifact, so
+                          # the tools and the plan cannot disagree about the
+                          # allowlist. No PutObject — the seeder owns the write.
+                          - Effect: Allow
+                            Action: s3:GetObject
+                            Resource: !Sub
+                                - arn:aws:s3:::${ProxyBucket}/${key}
+                                - key: !FindInMap [ModelRegistry, Object, Key]
+                          - Effect: Allow
+                            Action: s3:ListBucket
+                            Resource: !Sub arn:aws:s3:::${ProxyBucket}
+                          # Callback registration (README.md §11): rows the
+                          # waker completes at the terminal event. Put at
+                          # submit; Delete on synchronous completion of an
+                          # absorbed-finished run and on start failure.
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:PutItem
+                                - dynamodb:DeleteItem
+                            Resource: !GetAtt CallbackTokensTable.Arn
+                          # SendTaskSuccess for the absorbed-finished path.
+                          # Scoped to this account+region's machines
+                          # (corrected 2026-10-09: SendTask* DOES accept
+                          # state-machine ARN scoping; the token's machine
+                          # is the caller's, unknowable at deploy time, so
+                          # account+region is the bound). The REAL
+                          # controls are the token itself (unguessable,
+                          # useless without possession) and this table,
+                          # writable by this role alone.
+                          - Effect: Allow
+                            Action: states:SendTaskSuccess
+                            # any machine in THIS account+region — the token's machine is the
+                            # caller's (ours or a customer's own), never known at deploy time
+                            Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*
+
+    ############################################################################
+    # CodeBuild — builds the container image and pushes it to ECR. Adopted
+    # consistency with the rest of the repo, not because this
+    # workflow needs a container: there is no third-party dependency and no model
+    # weight, so the build is a COPY of ~40 Python files onto the managed
+    # python3.13 Lambda base image and nothing else. That is also why the project
+    # seeds nothing to S3 and touches no table, unlike tts's or face-recognition's.
+    #
+    # It is idempotent by IMAGE TAG, which is the whole reason .version must be
+    # bumped on every deploy: the tag IS the version, pre_build skips the docker
+    # build when {repo}:{tag} already exists, and Lambda resolves ImageUri to a
+    # digest at update time — so re-deploying an unbumped version leaves every
+    # function pinned to the OLD digest and the code change silently does not ship.
+    ############################################################################
+
+    CodeBuildRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W11
+                      reason: ecr:GetAuthorizationToken is an account-level action with no resource to scope to — the AWS API rejects any resource other than "*". Every other ECR grant below is scoped to this stack's one repository.
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: codebuild.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}BedrockInferenceCodeBuildPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild*
+                          - Effect: Allow
+                            Action: ecr:GetAuthorizationToken
+                            Resource: "*"
+                          - Effect: Allow
+                            Action:
+                                - ecr:CreateRepository
+                                - ecr:DescribeImages
+                                - ecr:BatchCheckLayerAvailability
+                                - ecr:CompleteLayerUpload
+                                - ecr:InitiateLayerUpload
+                                - ecr:PutImage
+                                - ecr:UploadLayerPart
+                            Resource: !Sub
+                                - arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${repositoryName}
+                                - repositoryName: !FindInMap [ECR, Repository, Name]
+                          # The source archive, and nothing else. No grant on
+                          # ProxyBucket at all — this project publishes an image and
+                          # seeds no artefacts, so it has no business in the data
+                          # bucket the workflow reads and writes.
+                          - Effect: Allow
+                            Action: s3:GetObject
+                            Resource: !Sub
+                                - arn:aws:s3:::${bucket}/*
+                                - bucket: !FindInMap [CodeBuild, Source, Bucket]
+
+    CodeBuildProject:
+        Type: AWS::CodeBuild::Project
+        Properties:
+            Name: !Sub
+                - ${ResourcePrefix}-${repositoryName}
+                - repositoryName: !FindInMap [ECR, Repository, Name]
+            Description: !Sub
+                - Build and publish the ${desc} docker image to ECR
+                - desc: !FindInMap [Lambda, Function, Description]
+            ServiceRole: !GetAtt CodeBuildRole.Arn
+            Source:
+                Type: S3
+                Location: !Sub
+                    - ${bucket}/${keyPrefix}/${package}
+                    - bucket: !FindInMap [CodeBuild, Source, Bucket]
+                      keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                      package: !FindInMap [CodeBuild, Source, Package]
+                BuildSpec: |
+                    version: 0.2
+                    phases:
+                        pre_build:
+                            commands:
+                                - echo "== Logging in to Amazon ECR =="
+                                - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+                                - |
+                                    echo "== Creating ECR repository if it does not exist =="
+                                    aws ecr create-repository --region $AWS_REGION --repository-name $IMAGE_REPO_NAME --image-scanning-configuration scanOnPush=true --encryption-configuration encryptionType=AES256; EXITCODE=$?
+                                    if [ $EXITCODE -ne 0 ] && [ $EXITCODE -ne 254 ]; then
+                                        echo "ECR create-repository failed with exit code $EXITCODE"
+                                        exit $EXITCODE
+                                    fi
+                                - |
+                                    echo "== Checking if $IMAGE_REPO_NAME:$IMAGE_TAG already exists =="
+                                    if aws ecr describe-images --region $AWS_REGION --repository-name $IMAGE_REPO_NAME --image-ids imageTag=$IMAGE_TAG 2>/dev/null; then
+                                        echo "Image $IMAGE_REPO_NAME:$IMAGE_TAG already exists — skipping build"
+                                        touch /tmp/skip_build
+                                    else
+                                        echo "Image not found — proceeding with build"
+                                    fi
+                        build:
+                            commands:
+                                - |
+                                    if [ -f /tmp/skip_build ]; then
+                                        echo "== Skipping docker build — image already exists =="
+                                    else
+                                        echo "== Building $IMAGE_REPO_NAME:$IMAGE_TAG [$(date)] =="
+                                        docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+                                        docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                                        echo "== Pushing $IMAGE_REPO_NAME:$IMAGE_TAG [$(date)] =="
+                                        docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                                        echo "== Push complete [$(date)] =="
+                                    fi
+                        post_build:
+                            commands:
+                                - |
+                                    echo "=== post_build CODEBUILD_BUILD_SUCCEEDING=$CODEBUILD_BUILD_SUCCEEDING ==="
+                                    if [ -n "$CFN_ResponseURL" ]; then
+                                        if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then
+                                            echo "== Sending SUCCESS to CloudFormation =="
+                                            curl -s -X PUT -H "Content-Type:" \
+                                                --data-binary "{\"Status\":\"SUCCESS\",\"Reason\":\"Docker image ready\",\"PhysicalResourceId\":\"$CFN_PhysicalResourceId\",\"StackId\":\"$CFN_StackId\",\"RequestId\":\"$CFN_RequestId\",\"LogicalResourceId\":\"$CFN_LogicalResourceId\",\"Data\":{\"ImageUri\":\"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG\"}}" \
+                                                "$CFN_ResponseURL"
+                                        else
+                                            echo "== Sending FAILED to CloudFormation =="
+                                            curl -s -X PUT -H "Content-Type:" \
+                                                --data-binary "{\"Status\":\"FAILED\",\"Reason\":\"Docker build failed — see CodeBuild logs\",\"PhysicalResourceId\":\"$CFN_PhysicalResourceId\",\"StackId\":\"$CFN_StackId\",\"RequestId\":\"$CFN_RequestId\",\"LogicalResourceId\":\"$CFN_LogicalResourceId\",\"Data\":{}}" \
+                                                "$CFN_ResponseURL"
+                                        fi
+                                    fi
+            Environment:
+                # ARM_CONTAINER, not the x86 default with a --platform flag: the
+                # tier functions are Architectures: [arm64], and a cross-built image
+                # is rejected by Lambda at update time with a bare
+                # InvalidParameterValueException naming neither arch.
+                Type: !FindInMap [CodeBuild, Project, Type]
+                ComputeType: !FindInMap [CodeBuild, Project, ComputeType]
+                Image: !FindInMap [CodeBuild, Project, Image]
+                PrivilegedMode: true
+                EnvironmentVariables:
+                    - Name: AWS_REGION
+                      Value: !Ref AWS::Region
+                    - Name: AWS_ACCOUNT_ID
+                      Value: !Ref AWS::AccountId
+                    - Name: IMAGE_REPO_NAME
+                      Value: !FindInMap [ECR, Repository, Name]
+                    - Name: IMAGE_TAG
+                      Value: !FindInMap [ECR, Repository, ImageTag]
+            Artifacts:
+                Type: NO_ARTIFACTS
+            EncryptionKey: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3
+            # 30, not the siblings' 60/90: they download and re-upload gigabytes of
+            # model weights inside pre_build. This build is a COPY and a push of a
+            # base image plus a few hundred KB of Python.
+            TimeoutInMinutes: 30
+            QueuedTimeoutInMinutes: 60
+            LogsConfig:
+                CloudWatchLogs:
+                    GroupName: /aws/codebuild
+                    StreamName: !Sub
+                        - ${ResourcePrefix}-${repositoryName}
+                        - repositoryName: !FindInMap [ECR, Repository, Name]
+                    Status: ENABLED
+
+    ############################################################################
+    # StartBuild custom resource — kicks CodeBuild at stack create/update and
+    # waits for the CFN callback the BUILDSPEC's post_build phase sends. The
+    # Lambda deliberately does NOT respond on the success path: if it did, CFN
+    # would proceed to create the tier functions while the image is still being
+    # pushed, and every one of them would fail on an ImageUri that does not exist
+    # yet. That inversion — the build answers CloudFormation, not the starter — is
+    # what the sibling type name Custom::StartBuildDelayResponse records.
+    ############################################################################
+
+    StartBuildLambdaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}BedrockInferenceStartBuildPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt StartBuildLambdaLogGroup.Arn
+                          - Effect: Allow
+                            Action:
+                                - codebuild:StartBuild
+                                - codebuild:BatchGetBuilds
+                            Resource: !GetAtt CodeBuildProject.Arn
+
+    StartBuildLambdaLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${name}-start-build
+                - name: !FindInMap [Lambda, Function, Name]
+            RetentionInDays: 7
+
+    # UNNAMED, matching the siblings. CFN generates the physical name, so
+    # /aws/lambda/{FunctionName} is unknowable at author time and LoggingConfig is
+    # the only way an unnamed function reaches a declared, stack-owned group.
+    StartBuildLambda:
+        Type: AWS::Lambda::Function
+        # Explicit even though LoggingConfig's !Ref implies it (cfn-lint W3005,
+        # accepted): the bundle's log-group hygiene test pins the DependsOn on
+        # every StartBuildLambda, because this function is invoked by a custom
+        # resource DURING create and a first invocation without its group logs
+        # nowhere readable.
+        DependsOn: StartBuildLambdaLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Invoked once per stack operation by CloudFormation
+        Properties:
+            Description: !Sub (${ResourcePrefix}) Bedrock Inference — Custom::StartBuildDelayResponse. Starts the CodeBuild project with the CFN callback in its environment and does not respond; the buildspec does.
+            Runtime: python3.13
+            Handler: index.lambda_handler
+            Timeout: 300
+            MemorySize: 128
+            Role: !GetAtt StartBuildLambdaRole.Arn
+            LoggingConfig:
+                LogGroup: !Ref StartBuildLambdaLogGroup
+            Code:
+                ZipFile: |
+                    import json
+                    import urllib.request
+                    import boto3
+
+                    def send_cfn(event, status, reason="", data=None):
+                        body = json.dumps({
+                            "Status": status, "Reason": reason,
+                            "PhysicalResourceId": event.get("PhysicalResourceId",
+                                                            event["LogicalResourceId"]),
+                            "StackId": event["StackId"],
+                            "RequestId": event["RequestId"],
+                            "LogicalResourceId": event["LogicalResourceId"],
+                            "Data": data or {},
+                        }).encode()
+                        req = urllib.request.Request(event["ResponseURL"], data=body,
+                                                     method="PUT",
+                                                     headers={"Content-Type": ""})
+                        urllib.request.urlopen(req)
+
+                    def lambda_handler(event, context):
+                        print('Event keys:', sorted(event))
+                        if event["RequestType"] == "Delete":
+                            send_cfn(event, "SUCCESS", "delete no-op")
+                            return
+                        try:
+                            cb = boto3.client("codebuild")
+                            cb.start_build(
+                                projectName=event["ResourceProperties"]["ProjectName"],
+                                environmentVariablesOverride=[
+                                    {"name": "CFN_ResponseURL", "value": event["ResponseURL"]},
+                                    {"name": "CFN_StackId", "value": event["StackId"]},
+                                    {"name": "CFN_RequestId", "value": event["RequestId"]},
+                                    {"name": "CFN_LogicalResourceId",
+                                     "value": event["LogicalResourceId"]},
+                                    {"name": "CFN_PhysicalResourceId",
+                                     "value": event.get("PhysicalResourceId",
+                                                        event["LogicalResourceId"])},
+                                ])
+                            # buildspec post_build sends the final CFN response
+                        except Exception as exc:
+                            send_cfn(event, "FAILED", str(exc))
+
+    StartBuild:
+        Type: Custom::StartBuildDelayResponse
+        DependsOn: StartBuildLambdaLogGroup
+        Properties:
+            ServiceToken: !GetAtt StartBuildLambda.Arn
+            ProjectName: !Ref CodeBuildProject
+            # Changing .version is what re-runs the build on update — CFN
+            # re-invokes a custom resource only when its Properties change. It is
+            # also the ImageTag, so an unbumped deploy is a double no-op: no
+            # re-invoke, and a skip even if it were re-invoked.
+            Version: "%%VERSION%%"
+
+    ############################################################################
+    # Log groups — declared explicitly rather than left to Lambda's implicit
+    # creation, so retention is bounded and the group dies with the stack. Lambda
+    # auto-creates /aws/lambda/<fn> on first invocation with never-expire
+    # retention and no stack ownership, which orphans the group on stack delete
+    # and then makes the NEXT create fail with "already exists".
+    #
+    # ALL SEVEN tiers, including the four no state routes to: a group for an
+    # unrouted tier costs nothing and its absence would be a wildcard in the role.
+    # Every AWS::Lambda::Function in this template must have a group here or
+    # beside itself; enforced by test_units.py.
+    ############################################################################
+
+    BedrockInferenceLambdaHalfCoreLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, HalfCore, Name]
+            RetentionInDays: 7
+
+    BedrockInferenceLambda1CoreLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, OneCore, Name]
+            RetentionInDays: 7
+
+    BedrockInferenceLambda2CoresLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, TwoCores, Name]
+            RetentionInDays: 7
+
+    BedrockInferenceLambda3CoresLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, ThreeCores, Name]
+            RetentionInDays: 7
+
+    BedrockInferenceLambda4CoresLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, FourCores, Name]
+            RetentionInDays: 7
+
+    BedrockInferenceLambda5CoresLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, FiveCores, Name]
+            RetentionInDays: 7
+
+    BedrockInferenceLambda6CoresLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, SixCores, Name]
+            RetentionInDays: 7
+
+    GatewayToolLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${name}-${tool}
+                - name: !FindInMap [Lambda, Function, Name]
+                  tool: !FindInMap [Lambda, GatewayTool, Name]
+            RetentionInDays: 7
+
+    SeedModelRegistryLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${name}-${state}
+                - name: !FindInMap [Lambda, Function, Name]
+                  state: !FindInMap [CustomResource, SeedModelRegistry, Name]
+            RetentionInDays: 7
+
+    ############################################################################
+    # Workflow Lambdas — ONE container image, SEVEN memory tiers, ONE role.
+    #
+    # Every tier is byte-identical except MemorySize and the STREAM_HANDLER
+    # marker. There is no `Handler` property: a PackageType: Image function takes
+    # its entry point from the image's CMD (`lambda_function.lambda_handler`, set
+    # in the Dockerfile), and setting Handler on an image function is a template
+    # validation error rather than an override.
+    #
+    # `Timeout: 900` is a LITERAL on every tier, not a mapping lookup, matching
+    # the siblings — the Lambda mapping entries carry Memory and Name only. 900 s
+    # is the ceiling and it is what the run-inference path needs: the loop
+    # checkpoints per record and yields with LambdaResourceTimeoutException when
+    # REMAINING_TIME_BUFFER_MS is left, so the full ceiling is usable window
+    # rather than exposure. The bedrock-runtime read_timeout is set to the same
+    # 900 s so a hung Converse cannot outlive the invocation. The four short
+    # states now carry the same ceiling, which costs nothing: Lambda bills
+    # duration, not timeout.
+    #
+    # Every tier gets the FULL environment, including variables only some code
+    # paths read. A per-tier subset would make moving a state between tiers a
+    # two-line change with a KeyError as the failure mode, which is exactly the
+    # coupling the ladder exists to remove.
+    ############################################################################
+
+    BedrockInferenceLambdaHalfCore:
+        Type: AWS::Lambda::Function
+        DependsOn: StartBuild
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Concurrency is bounded by the stream's shard count and by the caller's own execution count; reserved concurrency would add a second, unrelated cap
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, HalfCore, Name]
+            Description: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            Architectures: [arm64]
+            MemorySize: !FindInMap [Lambda, HalfCore, Memory]
+            Timeout: 900
+            Role: !GetAtt BedrockInferenceLambdaRole.Arn
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    MODEL_REGISTRY_KEY: !FindInMap [ModelRegistry, Object, Key]
+                    SYNC_INFER_QUOTAS_TABLE_NAME: !Ref SyncInferQuotasTable
+                    SERVICE_TOKEN_TABLE_NAME: !Ref BatchInferTokensTable
+                    BATCH_SERVICE_ROLE_ARN: !GetAtt BedrockBatchServiceRole.Arn
+                    REMAINING_TIME_BUFFER_MS: "60000"
+                    # Reached by the token table's stream (NotifyStreamMapping) AND
+                    # by the PREFIX-SCOPED aws.bedrock rule (BatchTokenRule). NOT
+                    # 'drain', even though the unscoped drain rule delivers the same
+                    # event shape to the 1-core tier: the router sends an
+                    # aws.bedrock event to states.drain when the marker says drain
+                    # (§6.5's two rules, opposite scoping), so 'drain' here would
+                    # silently turn the token path into a second drain and never
+                    # write a status.
+                    STREAM_HANDLER: "notify"
+                    TARGET_NAME: "bedrock-inference"
+                    TOOL_VERSION: "%%VERSION%%"
+            TracingConfig:
+                Mode: Active
+
+    BedrockInferenceLambda1Core:
+        Type: AWS::Lambda::Function
+        DependsOn: StartBuild
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: In-flight Bedrock calls are bounded by this stack's own concurrency semaphore, which is the whole point of the lease; drain submits are bounded per invocation by MAX_SUBMITS_PER_MODEL. Reserved concurrency would cap re-entries instead and stall checkpointed runs
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, OneCore, Name]
+            Description: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            Architectures: [arm64]
+            MemorySize: !FindInMap [Lambda, OneCore, Memory]
+            Timeout: 900
+            Role: !GetAtt BedrockInferenceLambdaRole.Arn
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    MODEL_REGISTRY_KEY: !FindInMap [ModelRegistry, Object, Key]
+                    SYNC_INFER_QUOTAS_TABLE_NAME: !Ref SyncInferQuotasTable
+                    SERVICE_TOKEN_TABLE_NAME: !Ref BatchInferTokensTable
+                    BATCH_SERVICE_ROLE_ARN: !GetAtt BedrockBatchServiceRole.Arn
+                    # The checkpoint-and-yield margin for the serial Converse loop,
+                    # which runs HERE (RunInferenceLambdaArn). Must stay well under
+                    # Timeout: below this much remaining time the loop stops rather
+                    # than starting another Converse call, because a Sandbox.Timedout
+                    # mid-Converse loses that record's spend with nothing recorded.
+                    REMAINING_TIME_BUFFER_MS: "60000"
+                    # Reached by the token table's stream (DrainStreamMapping), the
+                    # 5-minute schedule, and the UNSCOPED aws.bedrock rule. The
+                    # HalfCore tier is subscribed to the SAME table stream, so the
+                    # event shape cannot tell them apart — the marker is the only
+                    # thing that does.
+                    STREAM_HANDLER: "drain"
+                    TARGET_NAME: "bedrock-inference"
+                    TOOL_VERSION: "%%VERSION%%"
+            TracingConfig:
+                Mode: Active
+
+    BedrockInferenceLambda2Cores:
+        Type: AWS::Lambda::Function
+        DependsOn: StartBuild
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: One invocation per batch execution plus one per holder release; the account's in-progress-job limit is the real bound on submits and is service-enforced
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, TwoCores, Name]
+            Description: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            Architectures: [arm64]
+            MemorySize: !FindInMap [Lambda, TwoCores, Memory]
+            Timeout: 900
+            Role: !GetAtt BedrockInferenceLambdaRole.Arn
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    MODEL_REGISTRY_KEY: !FindInMap [ModelRegistry, Object, Key]
+                    SYNC_INFER_QUOTAS_TABLE_NAME: !Ref SyncInferQuotasTable
+                    SERVICE_TOKEN_TABLE_NAME: !Ref BatchInferTokensTable
+                    BATCH_SERVICE_ROLE_ARN: !GetAtt BedrockBatchServiceRole.Arn
+                    REMAINING_TIME_BUFFER_MS: "60000"
+                    # This tier consumes the QUOTA table's stream; the other two
+                    # consume the TOKEN table's. Wrong value here and every holder
+                    # REMOVE lands in states/notify or states/drain, which would look
+                    # for a batch row that does not exist — so the counter is never
+                    # decremented and the cap silently ratchets to zero.
+                    STREAM_HANDLER: "semaphore"
+                    TARGET_NAME: "bedrock-inference"
+                    TOOL_VERSION: "%%VERSION%%"
+            TracingConfig:
+                Mode: Active
+
+    # ── Declared and UNROUTED (2026-08-12) ────────────────────────────────────
+    # No state machine substitution, no event source, no stream mapping points at
+    # the four functions below, and they set NO STREAM_HANDLER — an unset marker
+    # RAISES in the router rather than defaulting to a branch, so wiring a stream
+    # here by mistake fails loudly on the first record instead of quietly draining
+    # the wrong queue.
+    #
+    # They exist so a sizing experiment is a one-line DefinitionSubstitution
+    # change instead of a new function, a new log group and a new role statement.
+    # This is the documented house norm, not an oversight — do not delete them.
+
+    BedrockInferenceLambda3Cores:
+        Type: AWS::Lambda::Function
+        DependsOn: StartBuild
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Unrouted tier — nothing invokes it
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, ThreeCores, Name]
+            Description: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            Architectures: [arm64]
+            MemorySize: !FindInMap [Lambda, ThreeCores, Memory]
+            Timeout: 900
+            Role: !GetAtt BedrockInferenceLambdaRole.Arn
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    MODEL_REGISTRY_KEY: !FindInMap [ModelRegistry, Object, Key]
+                    SYNC_INFER_QUOTAS_TABLE_NAME: !Ref SyncInferQuotasTable
+                    SERVICE_TOKEN_TABLE_NAME: !Ref BatchInferTokensTable
+                    BATCH_SERVICE_ROLE_ARN: !GetAtt BedrockBatchServiceRole.Arn
+                    REMAINING_TIME_BUFFER_MS: "60000"
+                    TARGET_NAME: "bedrock-inference"
+                    TOOL_VERSION: "%%VERSION%%"
+            TracingConfig:
+                Mode: Active
+
+    BedrockInferenceLambda4Cores:
+        Type: AWS::Lambda::Function
+        DependsOn: StartBuild
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Unrouted tier — nothing invokes it
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, FourCores, Name]
+            Description: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            Architectures: [arm64]
+            MemorySize: !FindInMap [Lambda, FourCores, Memory]
+            Timeout: 900
+            Role: !GetAtt BedrockInferenceLambdaRole.Arn
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    MODEL_REGISTRY_KEY: !FindInMap [ModelRegistry, Object, Key]
+                    SYNC_INFER_QUOTAS_TABLE_NAME: !Ref SyncInferQuotasTable
+                    SERVICE_TOKEN_TABLE_NAME: !Ref BatchInferTokensTable
+                    BATCH_SERVICE_ROLE_ARN: !GetAtt BedrockBatchServiceRole.Arn
+                    REMAINING_TIME_BUFFER_MS: "60000"
+                    TARGET_NAME: "bedrock-inference"
+                    TOOL_VERSION: "%%VERSION%%"
+            TracingConfig:
+                Mode: Active
+
+    BedrockInferenceLambda5Cores:
+        Type: AWS::Lambda::Function
+        DependsOn: StartBuild
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Unrouted tier — nothing invokes it
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, FiveCores, Name]
+            Description: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            Architectures: [arm64]
+            MemorySize: !FindInMap [Lambda, FiveCores, Memory]
+            Timeout: 900
+            Role: !GetAtt BedrockInferenceLambdaRole.Arn
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    MODEL_REGISTRY_KEY: !FindInMap [ModelRegistry, Object, Key]
+                    SYNC_INFER_QUOTAS_TABLE_NAME: !Ref SyncInferQuotasTable
+                    SERVICE_TOKEN_TABLE_NAME: !Ref BatchInferTokensTable
+                    BATCH_SERVICE_ROLE_ARN: !GetAtt BedrockBatchServiceRole.Arn
+                    REMAINING_TIME_BUFFER_MS: "60000"
+                    TARGET_NAME: "bedrock-inference"
+                    TOOL_VERSION: "%%VERSION%%"
+            TracingConfig:
+                Mode: Active
+
+    BedrockInferenceLambda6Cores:
+        Type: AWS::Lambda::Function
+        DependsOn: StartBuild
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Unrouted tier — nothing invokes it
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${fn}-${tier}
+                - fn: !FindInMap [Lambda, Function, Name]
+                  tier: !FindInMap [Lambda, SixCores, Name]
+            Description: !FindInMap [Lambda, Function, Description]
+            PackageType: Image
+            Code:
+                ImageUri: !Sub
+                    - ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${repo}:${tag}
+                    - repo: !FindInMap [ECR, Repository, Name]
+                      tag: !FindInMap [ECR, Repository, ImageTag]
+            Architectures: [arm64]
+            MemorySize: !FindInMap [Lambda, SixCores, Memory]
+            Timeout: 900
+            Role: !GetAtt BedrockInferenceLambdaRole.Arn
+            Environment:
+                Variables:
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    MODEL_REGISTRY_KEY: !FindInMap [ModelRegistry, Object, Key]
+                    SYNC_INFER_QUOTAS_TABLE_NAME: !Ref SyncInferQuotasTable
+                    SERVICE_TOKEN_TABLE_NAME: !Ref BatchInferTokensTable
+                    BATCH_SERVICE_ROLE_ARN: !GetAtt BedrockBatchServiceRole.Arn
+                    REMAINING_TIME_BUFFER_MS: "60000"
+                    TARGET_NAME: "bedrock-inference"
+                    TOOL_VERSION: "%%VERSION%%"
+            TracingConfig:
+                Mode: Active
+
+    # ── The model-registry seeder ─────────────────────────────────────────────
+    # Off the tier ladder AND OFF THE IMAGE — a flat python3.13 zip, loaded from the
+    # gateway-tool package, which is what every sibling does with its deploy-time
+    # custom resources (media-processing's `bucket-check` reads the same
+    # GatewayToolPackage; hybrid-search's CopySchema is a flat zip too). Three
+    # reasons, in the order they matter:
+    #
+    #   1. It is the house pattern. No sibling puts a CloudFormation custom resource
+    #      in the container image, and this one has no reason to be the exception:
+    #      it filters a packaged JSON by geo and does one S3 PUT.
+    #   2. It does not have to wait for the build. On the image it needed
+    #      `DependsOn: StartBuild`, so the registry could not be seeded until a
+    #      docker build finished. As a zip the seed runs in parallel with it.
+    #   3. It was BLOCKING THE ZIP→IMAGE MIGRATION, and that is how this was found.
+    #      `PackageType` requires replacement, and CloudFormation refuses to replace
+    #      a CUSTOM-NAMED resource — "Rename infertext-bedrock-inference-seed-model-
+    #      registry and update the stack again". The seven tiers are new logical ids
+    #      with new names, so they migrate fine; this one, keeping its name across
+    #      the change, rolled the whole stack back in 30 seconds.
+    #
+    # No ImageConfig.Command anywhere in this template as a result: all seven tiers
+    # run the Dockerfile's CMD unchanged, so the image has exactly one entry point.
+    SeedModelRegistryLambda:
+        Type: AWS::Lambda::Function
+        DependsOn: SeedModelRegistryLogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Invoked once per stack operation by CloudFormation
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${name}-${state}
+                - name: !FindInMap [Lambda, Function, Name]
+                  state: !FindInMap [CustomResource, SeedModelRegistry, Name]
+            Description: !Sub (${ResourcePrefix}) Bedrock Inference — Custom::ModelRegistrySeeder. Installs availablemodels.json from the packaged master list, filtered to this deployment's geo; skips when the installed registry_version already matches.
+            Runtime: python3.13
+            # The dotted path is why the gateway-tool zip carries `states/` and
+            # `models/` with their directory structure intact rather than flattened:
+            # the seeder resolves its master list relative to its own __file__.
+            Handler: states.seed_model_registry.lambda_function.lambda_handler
+            Code:
+                S3Bucket: !FindInMap [CodeBuild, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                      pkg: !FindInMap [CodeBuild, Source, GatewayToolPackage]
+            Architectures: [arm64]
+            MemorySize: !FindInMap [CustomResource, SeedModelRegistry, Memory]
+            Timeout: !FindInMap [CustomResource, SeedModelRegistry, Timeout]
+            Role: !GetAtt SeedModelRegistryRole.Arn
+            TracingConfig:
+                Mode: Active
+
+    ModelRegistrySeeder:
+        Type: Custom::ModelRegistrySeeder
+        DependsOn: SeedModelRegistryLogGroup
+        Properties:
+            ServiceToken: !GetAtt SeedModelRegistryLambda.Arn
+            Bucket: !Ref ProxyBucket
+            RegistryKey: !FindInMap [ModelRegistry, Object, Key]
+            # The deploy region's PREFIX, not the geo: for APAC regions this is
+            # "ap" (ap-southeast-1) while the geo vocabulary says "apac", so the
+            # seeder aliases ap→apac before validating against {us, eu, apac}.
+            # The alias lives in the seeder, not here — Fn::FindInMap accepts
+            # only Ref/FindInMap as keys, never Fn::Select, so a template-side
+            # translation would mean hand-enumerating every APAC region. Any
+            # other prefix (ca-, sa-, me-, af-, il-) fails the stack, which is
+            # what a deploy to a region family without a model list should do.
+            Geo: !Select [0, !Split ["-", !Ref AWS::Region]]
+            # Changing .version is what re-runs the seed on update: CFN re-invokes a
+            # custom resource only when its Properties change.
+            Version: "%%VERSION%%"
+
+    ############################################################################
+    # Stream → the semaphore's decrement + drain (README.md §M2.2).
+    #
+    # FilterCriteria is what makes this safe to hang off the whole table: only REMOVE
+    # on a holder item reaches the function. Without it every counter update, every
+    # pending write, and every dedup marker would invoke it — and a dedup marker's own
+    # TTL expiry would arrive as a REMOVE, which is the one event that must never be
+    # read as a released holder. states/handle_semaphore_release re-checks both key
+    # prefixes anyway and logs rather than raising, because a raise here fails the
+    # whole batch and the stream redelivers it forever.
+    #
+    # BisectBatchOnFunctionError keeps one poison record from blocking a shard;
+    # MaximumRetryAttempts bounds it. Both are safe because decrement_once is
+    # idempotent per eventID (semaphore invariant 2) — a redelivered record
+    # deduplicates rather than double-decrementing, and the drain that follows it is a
+    # query-then-admit that finds nothing the second time.
+    ############################################################################
+    SemaphoreStreamMapping:
+        Type: AWS::Lambda::EventSourceMapping
+        Properties:
+            EventSourceArn: !GetAtt SyncInferQuotasTable.StreamArn
+            FunctionName: !GetAtt BedrockInferenceLambda2Cores.Arn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+            BisectBatchOnFunctionError: true
+            MaximumRetryAttempts: 3
+            FilterCriteria:
+                Filters:
+                    - Pattern: '{"eventName": ["REMOVE"], "dynamodb": {"Keys": {"pk": {"S": [{"prefix": "semaphore#"}]}, "sk": {"S": [{"prefix": "holder#"}]}}}}'
+
+    ############################################################################
+    # Stream → notify, and stream → drain. TWO mappings on ONE stream (the TOKEN
+    # table's — distinct from the quota stream above), landing on TWO TIERS that
+    # differ only in memory and in their STREAM_HANDLER marker.
+    #
+    # They used to be separated by IAM as well (§6.3): the notifier held
+    # states:SendTask* and no Bedrock, the drain the reverse. After the 2026-08-12
+    # collapse to one role, the MARKER is the only thing that separates them —
+    # which is why the two FilterCriteria below and the marker on each tier now
+    # carry the whole weight. Swapping the two FunctionName values here would
+    # deploy cleanly and produce a queue that never notifies.
+    #
+    # The FilterCriteria differ, and each is a correctness requirement:
+    #
+    #   notify  INSERT/MODIFY only. A REMOVE is the drain's news, not the
+    #           notifier's — by the time a row is deleted its token was already
+    #           redeemed, and re-sending on a REMOVE would try to complete an
+    #           execution that has moved on.
+    #   drain   REMOVE (notified, or TTL-expired) and MODIFY (a status change that
+    #           freed a slot). An INSERT is a row that was just SUBMITTING; draining
+    #           on it would submit against a limit nothing said had room.
+    #
+    # BisectBatchOnFunctionError keeps one poison record from blocking a shard;
+    # MaximumRetryAttempts bounds it. Both are safe because the notifier is
+    # idempotent per transition (it compares OldImage.status) and the drain is a
+    # query-then-submit that finds nothing the second time.
+    ############################################################################
+
+    NotifyStreamMapping:
+        Type: AWS::Lambda::EventSourceMapping
+        Properties:
+            EventSourceArn: !GetAtt BatchInferTokensTable.StreamArn
+            FunctionName: !GetAtt BedrockInferenceLambdaHalfCore.Arn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+            BisectBatchOnFunctionError: true
+            MaximumRetryAttempts: 3
+            FilterCriteria:
+                Filters:
+                    - Pattern: '{"eventName": ["INSERT", "MODIFY"], "dynamodb": {"NewImage": {"pk": {"S": [{"prefix": "batch#"}]}, "status": {"S": ["COMPLETED", "FAILED"]}}}}'
+
+    DrainStreamMapping:
+        Type: AWS::Lambda::EventSourceMapping
+        Properties:
+            EventSourceArn: !GetAtt BatchInferTokensTable.StreamArn
+            FunctionName: !GetAtt BedrockInferenceLambda1Core.Arn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+            BisectBatchOnFunctionError: true
+            MaximumRetryAttempts: 3
+            FilterCriteria:
+                Filters:
+                    - Pattern: '{"eventName": ["REMOVE"], "dynamodb": {"Keys": {"pk": {"S": [{"prefix": "batch#"}]}}}}'
+                    - Pattern: '{"eventName": ["MODIFY"], "dynamodb": {"NewImage": {"pk": {"S": [{"prefix": "batch#"}]}, "status": {"S": ["COMPLETED", "FAILED"]}}}}'
+
+    ############################################################################
+    # EventBridge, aws.bedrock — TWO RULES WITH OPPOSITE SCOPING (README.md §6.5).
+    #
+    # This is the least obvious thing in the template, so: the token rule is scoped
+    # to this deployment's own job-name prefix, and the drain rule is deliberately
+    # NOT scoped at all.
+    #
+    # A foreign completion is legitimate news that ACCOUNT capacity freed — the
+    # in-progress-job limit is per account, while this stack is not a singleton. If
+    # stack A fills the account's job limit, stack B's PENDING rows would drain only
+    # when one of B's OWN jobs completes; B has nothing in flight, so no event ever
+    # arrives. Deadlock, bounded only by TTL.
+    #
+    # But a foreign completion is NEVER news about one of our tokens, so the status
+    # writer must not see it. The live v5 rule
+    # (deployment/media2cloud-backend-stack.yaml:2401) has no scoping filter at all
+    # and fires on every Bedrock batch job in the account — while MediaConvert at
+    # :2289 filters userMetadata.solutionUuid and Transcribe at :2325 filters a
+    # job-name prefix. This is that gap, fixed, by splitting one rule into two.
+    ############################################################################
+
+    BatchTokenRule:
+        Type: AWS::Events::Rule
+        Properties:
+            Name: !Sub ${ResourcePrefix}-bedrock-inference-batch-token
+            Description: This deployment's OWN Bedrock batch completions — prefix-scoped, because a foreign job's completion is never news about one of our task tokens
+            EventPattern:
+                source: [aws.bedrock]
+                region: [!Ref "AWS::Region"]
+                detail-type: ["Batch Inference Job State Change"]
+                detail:
+                    status: [Completed, PartiallyCompleted, Failed, Stopped, Expired]
+                    # The job name is the workflow_id, and the arn's last segment is
+                    # the job id — so the prefix filter is on the arn's ACCOUNT
+                    # segment, which is what confines this to our own account's jobs.
+                    # Cross-account is the only foreignness EventBridge can filter
+                    # here; a same-account second deployment is handled by the
+                    # handler itself, which logs and ignores an arn with no row.
+                    batchJobArn:
+                        # Quoted: a plain YAML scalar may not END with a colon —
+                        # unquoted, this line makes the whole template unparseable.
+                        - prefix: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:"
+            State: ENABLED
+            Targets:
+                - Id: BedrockInferenceBatchStatus
+                  Arn: !GetAtt BedrockInferenceLambdaHalfCore.Arn
+
+    BatchTokenRulePermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !GetAtt BedrockInferenceLambdaHalfCore.Arn
+            Action: lambda:InvokeFunction
+            Principal: events.amazonaws.com
+            SourceArn: !GetAtt BatchTokenRule.Arn
+
+    BatchCapacityRule:
+        Type: AWS::Events::Rule
+        Properties:
+            Name: !Sub ${ResourcePrefix}-bedrock-inference-batch-capacity
+            Description: ANY Bedrock batch completion in the account, INCLUDING another stack's — deliberately unscoped. The job limit is per account while this stack is not a singleton, so a foreign completion is the only signal that capacity freed (README.md §6.5 fix 1). Do not add a prefix filter here.
+            EventPattern:
+                source: [aws.bedrock]
+                detail-type: ["Batch Inference Job State Change"]
+                detail:
+                    status: [Completed, PartiallyCompleted, Failed, Stopped, Expired]
+            State: ENABLED
+            Targets:
+                - Id: BedrockInferenceDrain
+                  Arn: !GetAtt BedrockInferenceLambda1Core.Arn
+
+    BatchCapacityRulePermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !GetAtt BedrockInferenceLambda1Core.Arn
+            Action: lambda:InvokeFunction
+            Principal: events.amazonaws.com
+            SourceArn: !GetAtt BatchCapacityRule.Arn
+
+    ############################################################################
+    # Scheduled sweep — §6.5 fix 2, and the thing that makes the queue
+    # self-healing rather than event-dependent. Backstop for TTL expiry, manual row
+    # deletion, and any missed event. The payload carries no image, so the drain
+    # falls back to models_with_pending().
+    ############################################################################
+
+    DrainScheduleRule:
+        Type: AWS::Events::Rule
+        Properties:
+            Name: !Sub ${ResourcePrefix}-bedrock-inference-drain-sweep
+            Description: Periodic batch-queue sweep. Without it the queue only drains on events, and the one case no event covers is the last job in flight completing while the account is still full elsewhere.
+            ScheduleExpression: !FindInMap [Drain, Schedule, Expression]
+            State: ENABLED
+            Targets:
+                - Id: BedrockInferenceDrainSweep
+                  Arn: !GetAtt BedrockInferenceLambda1Core.Arn
+                  Input: '{"operation": "Drain"}'
+
+    DrainScheduleRulePermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !GetAtt BedrockInferenceLambda1Core.Arn
+            Action: lambda:InvokeFunction
+            Principal: events.amazonaws.com
+            SourceArn: !GetAtt DrainScheduleRule.Arn
+
+    ############################################################################
+    # Step Functions — THREE machines (README.md §M1).
+    #
+    #   InferenceStateMachine        ${ResourcePrefix}-bedrock-inference
+    #       plan → route → usage tracking. What callers start; the name and ARN are
+    #       unchanged by the merge, so a consumer's own startExecution.sync:2 and its
+    #       $.Output.data.records_succeeded keep working.
+    #   SyncInferenceStateMachine    ${ResourcePrefix}-bedrock-inference-sync
+    #       acquire lease → run inference → release lease → summarize.
+    #   BatchInferenceStateMachine   ${ResourcePrefix}-bedrock-inference-batch
+    #       submit batch → collect output → summarize.
+    #
+    # WHY THREE AND NOT ONE. Each child is independently startable given a plan,
+    # which makes a stuck sync run re-runnable without re-planning and makes each
+    # branch's history readable on its own instead of interleaved into one machine's.
+    # The cost is one extra execution per run and the `.sync:2` grants below.
+    #
+    # Each child ends with its OWN Summarize rather than returning to a shared one:
+    # the two call sites of lib/response.build_summary are the price of a child that
+    # returns a complete summary.json + response.jsonl by itself.
+    #
+    # THE SYNC CHILD HAS NO `Release lease on failure` STATE. In-band release was
+    # deleted with the merge; a holder left behind by a failure is reclaimed by
+    # QuotaTerminalRule below (the child's own terminal event) or, failing that, by the
+    # holder's TTL. In-band release only ever SHORTENED that window — it was a latency
+    # optimisation, not the correctness mechanism, and removing it costs a named window
+    # documented in lib/semaphore_client.py's invariant 1.
+    ############################################################################
+
+    StateMachineLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/states/${ResourcePrefix}-${name}
+                - name: !FindInMap [Lambda, Function, Name]
+            RetentionInDays: 7
+
+    SyncStateMachineLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/states/${ResourcePrefix}-${name}-sync
+                - name: !FindInMap [Lambda, Function, Name]
+            RetentionInDays: 7
+
+    BatchStateMachineLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/states/${ResourcePrefix}-${name}-batch
+                - name: !FindInMap [Lambda, Function, Name]
+            RetentionInDays: 7
+
+    ############################################################################
+    # The orchestrator's role, and the one block in this template most likely to be
+    # got wrong: `states:startExecution.sync:2` needs FIVE grants, not one.
+    #
+    #   states:StartExecution        on each child STATE MACHINE arn
+    #   states:DescribeExecution     on each child EXECUTION arn pattern
+    #   states:StopExecution         on each child EXECUTION arn pattern
+    #   events:PutRule / PutTargets / DescribeRule
+    #                                on the MANAGED rule Step Functions creates for
+    #                                itself, named
+    #                                StepFunctionsGetEventsForStepFunctionsExecutionRule
+    #
+    # Omitting the events:* three is the classic `.sync:2` failure: the state machine
+    # deploys, the child starts and succeeds, and the parent hangs until its own
+    # TimeoutSeconds because the completion event has no route back. The symptom looks
+    # like a slow child, not like an IAM error.
+    ############################################################################
+    StateMachineRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W11
+                      reason: X-Ray tracing and CloudWatch Logs delivery require wildcard resources
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Action: sts:AssumeRole
+                      Principal:
+                          Service: !Sub states.${AWS::Region}.amazonaws.com
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}BedrockInferenceSFNPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # Only the shared workflow function: the orchestrator plans
+                          # and reports and does nothing else. It cannot invoke
+                          # RunInference or SubmitBatch at all — those belong to the
+                          # children, and the separation means an orchestrator ASL edit
+                          # cannot accidentally run inference outside a lease.
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource: !GetAtt BedrockInferenceLambda2Cores.Arn
+                          - Effect: Allow
+                            Action: states:StartExecution
+                            Resource:
+                                - !GetAtt SyncInferenceStateMachine.Arn
+                                - !GetAtt BatchInferenceStateMachine.Arn
+                          - Effect: Allow
+                            Action:
+                                - states:DescribeExecution
+                                - states:StopExecution
+                            Resource:
+                                - !Sub
+                                  - arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${ResourcePrefix}-${name}-sync:*
+                                  - name: !FindInMap [Lambda, Function, Name]
+                                - !Sub
+                                  - arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${ResourcePrefix}-${name}-batch:*
+                                  - name: !FindInMap [Lambda, Function, Name]
+                          # The managed rule. Its name is fixed by Step Functions and
+                          # is the same for every `.sync` integration in the account,
+                          # which is why the resource is a literal rather than
+                          # something derived from this stack.
+                          - Effect: Allow
+                            Action:
+                                - events:PutRule
+                                - events:PutTargets
+                                - events:DescribeRule
+                            Resource: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogDelivery
+                                - logs:GetLogDelivery
+                                - logs:UpdateLogDelivery
+                                - logs:DeleteLogDelivery
+                                - logs:ListLogDeliveries
+                                - logs:PutLogEvents
+                                - logs:PutResourcePolicy
+                                - logs:DescribeResourcePolicies
+                                - logs:DescribeLogGroups
+                            Resource: "*"
+                          - Effect: Allow
+                            Action:
+                                - xray:PutTraceSegments
+                                - xray:PutTelemetryRecords
+                                - xray:GetSamplingRules
+                                - xray:GetSamplingTargets
+                            Resource: "*"
+
+    SyncStateMachineRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W11
+                      reason: X-Ray tracing and CloudWatch Logs delivery require wildcard resources
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Action: sts:AssumeRole
+                      Principal:
+                          Service: !Sub states.${AWS::Region}.amazonaws.com
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}BedrockInferenceSyncSFNPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # Two TIERS, and no states:* at all: this child starts
+                          # nothing and describes nothing. 2-cores is the Acquire
+                          # lease / Release lease / Summarize target
+                          # (InferenceLambdaArn) and, because Acquire is a
+                          # waitForTaskToken state, it is that function that redeems
+                          # the token — not this role. 1-core is
+                          # RunInferenceLambdaArn.
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource:
+                                - !GetAtt BedrockInferenceLambda2Cores.Arn
+                                - !GetAtt BedrockInferenceLambda1Core.Arn
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogDelivery
+                                - logs:GetLogDelivery
+                                - logs:UpdateLogDelivery
+                                - logs:DeleteLogDelivery
+                                - logs:ListLogDeliveries
+                                - logs:PutLogEvents
+                                - logs:PutResourcePolicy
+                                - logs:DescribeResourcePolicies
+                                - logs:DescribeLogGroups
+                            Resource: "*"
+                          - Effect: Allow
+                            Action:
+                                - xray:PutTraceSegments
+                                - xray:PutTelemetryRecords
+                                - xray:GetSamplingRules
+                                - xray:GetSamplingTargets
+                            Resource: "*"
+
+    BatchStateMachineRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W11
+                      reason: X-Ray tracing and CloudWatch Logs delivery require wildcard resources
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Action: sts:AssumeRole
+                      Principal:
+                          Service: !Sub states.${AWS::Region}.amazonaws.com
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}BedrockInferenceBatchSFNPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          # ONE tier, because both of this machine's Lambda targets
+                          # (InferenceLambdaArn and SubmitBatchLambdaArn) land on
+                          # 2-cores after the collapse — listing it twice would be
+                          # legal and meaningless.
+                          #
+                          # NOT the 1-core tier, and that is still the point of the
+                          # 2026-08-12 shape: the repair tail starts the SYNC CHILD
+                          # MACHINE rather than calling the inference function
+                          # directly. Read that as a WORKFLOW invariant now, not an
+                          # IAM one — 2-cores runs under the union role and can
+                          # therefore call bedrock:InvokeModel, so what stops a
+                          # Converse call outside a lease is the ASL and the
+                          # dispatcher's `operation` routing, not a missing grant.
+                          # Before the collapse this line was load-bearing on its
+                          # own; now it is defence in depth over a code convention.
+                          - Effect: Allow
+                            Action: lambda:InvokeFunction
+                            Resource: !GetAtt BedrockInferenceLambda2Cores.Arn
+                          # The repair tail's five `.sync:2` grants — see the long
+                          # comment on StateMachineRole for why events:* is three of
+                          # them and what omitting it looks like (a child that
+                          # succeeds while the parent hangs to its own timeout).
+                          #
+                          # This is the SECOND role that may StartExecution, and it
+                          # narrows the old invariant rather than breaking it: "only
+                          # the orchestrator may start a child" becomes "the START
+                          # GRAPH IS ACYCLIC" — orchestrator → {sync, batch},
+                          # batch → sync, sync → nothing. Scoped to the sync child
+                          # alone: this role must never be able to start THIS machine
+                          # or the orchestrator, either of which is a recursion with a
+                          # real Bedrock bill.
+                          - Effect: Allow
+                            Action: states:StartExecution
+                            Resource: !GetAtt SyncInferenceStateMachine.Arn
+                          - Effect: Allow
+                            Action:
+                                - states:DescribeExecution
+                                - states:StopExecution
+                            Resource: !Sub
+                                - arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${ResourcePrefix}-${name}-sync:*
+                                - name: !FindInMap [Lambda, Function, Name]
+                          - Effect: Allow
+                            Action:
+                                - events:PutRule
+                                - events:PutTargets
+                                - events:DescribeRule
+                            Resource: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogDelivery
+                                - logs:GetLogDelivery
+                                - logs:UpdateLogDelivery
+                                - logs:DeleteLogDelivery
+                                - logs:ListLogDeliveries
+                                - logs:PutLogEvents
+                                - logs:PutResourcePolicy
+                                - logs:DescribeResourcePolicies
+                                - logs:DescribeLogGroups
+                            Resource: "*"
+                          - Effect: Allow
+                            Action:
+                                - xray:PutTraceSegments
+                                - xray:PutTelemetryRecords
+                                - xray:GetSamplingRules
+                                - xray:GetSamplingTargets
+                            Resource: "*"
+
+    # The children are declared BEFORE the orchestrator because the orchestrator's
+    # DefinitionSubstitutions name their ARNs.
+    #
+    # Each machine's ASL is INLINE below — this template is the single source of truth
+    # for what deploys, and there is no build-time injection step. definitions.json,
+    # definitions_sync.json and definitions_batch.json are READABILITY COPIES of these
+    # three blocks: lintable, diffable, and openable in a state machine editor on their
+    # own. EDIT BOTH SIDES. The build refuses to proceed on a drift and
+    # test_units.py's test_each_inline_definition_still_matches_its_readability_copy
+    # compares them exactly, because a copy that silently diverges is worse than no
+    # copy — the reviewed diff would not be what shipped.
+    SyncInferenceStateMachine:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            StateMachineName: !Sub
+                - ${ResourcePrefix}-${name}-sync
+                - name: !FindInMap [Lambda, Function, Name]
+            RoleArn: !GetAtt SyncStateMachineRole.Arn
+            LoggingConfiguration:
+                Destinations:
+                    - CloudWatchLogsLogGroup:
+                          LogGroupArn: !GetAtt SyncStateMachineLogGroup.Arn
+                IncludeExecutionData: true
+                Level: ALL
+            TracingConfiguration:
+                Enabled: true
+            DefinitionSubstitutions:
+                InferenceLambdaArn: !GetAtt BedrockInferenceLambda2Cores.Arn
+                RunInferenceLambdaArn: !GetAtt BedrockInferenceLambda1Core.Arn
+            DefinitionString: |-
+                {
+                    "Comment": "SYNC inference child (README.md §M1). Takes a concurrency lease from this stack's own sync-infer-quotas semaphore, runs the serial Converse loop under it, releases, and summarizes. Standalone and independently startable: given a plan (the orchestrator's Validate & plan output, i.e. $.data with workflow_id / config / quota / output / keys populated) this machine needs nothing else, and it ends with its own Summarize so it returns a complete summary.json + response.jsonl. NO Catch anywhere, deliberately — see 'Acquire lease'. Input: {\"uuid\":\"<correlation>\",\"input\":{...},\"data\":{<plan>}}",
+                    "StartAt": "Acquire lease",
+                    "States": {
+                        "Acquire lease": {
+                            "Comment": "In-stack now: targets this image's own 2-cores tier, not a foreign quota stack's function (README.md §M2.4 — the workflow role therefore holds states:SendTask*, and the cost of that is recorded there). Acquired LATE by construction: all S3 reads, record parsing and planning happened in the orchestrator's Validate & plan, so queued work still makes progress while this waits. TimeoutSeconds must exceed the guarded span of everything else contending for this scope; a token that times out while queued is a dead waiter the drain has to reap.\n\nNO Catch, and that is a deliberate change from the pre-merge ASL. Every post-acquire state used to Catch to a 'Release lease on failure' state; the four holder-disappearance triggers are now (1) normal release below, (3) the terminal-state EventBridge rule, and (4) the holder's own TTL — trigger 2 is gone, matching face-recognition, whose ASL has no Catch on its semaphore states either. The window this costs is named: try_acquire can succeed and the SendTaskSuccess that follows it can fail, leaving a live holder on a token nobody will redeem. That execution now sits here for the full TimeoutSeconds before the terminal rule reclaims the slot. The in-band release only ever SHORTENED that window — the slot was unusable to the drain either way — so this is a latency regression on the rarest failure path, not a leak.",
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                            "ResultPath": null,
+                            "Parameters": {
+                                "FunctionName": "${InferenceLambdaArn}",
+                                "Payload": {
+                                    "operation": "StateAcquireLease",
+                                    "service.$": "$.data.quota.service",
+                                    "resource.$": "$.data.quota.resource",
+                                    "max_concurrent.$": "$.data.quota.max_concurrent",
+                                    "execution_arn.$": "$$.Execution.Id",
+                                    "task_token.$": "$$.Task.Token"
+                                }
+                            },
+                            "TimeoutSeconds": 86400,
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException",
+                                        "Lambda.SdkClientException",
+                                        "Lambda.TooManyRequestsException"
+                                    ],
+                                    "IntervalSeconds": 1,
+                                    "MaxAttempts": 2,
+                                    "BackoffRate": 1.2
+                                }
+                            ],
+                            "Next": "Run inference"
+                        },
+                        "Run inference": {
+                            "Comment": "The serial Converse loop. ONE in-flight call per lease (§10 item 1) — parallelising inside the held span would turn a cap of 3 into 3×N with no error anywhere. Forty serial calls do not fit in one 15-minute invocation, so the loop checkpoints per record in S3 and raises LambdaResourceTimeoutException; the Retry below is what re-enters it. MaxAttempts 10 × 15 min ≈ 2.5 h of wall clock, which is why 'auto' sends large sets to batch. BackoffRate 1 because the raise is a deliberate yield, not a failure to back off from — an exponential delay would idle a held lease.\n\nNo Catch: a failure here propagates to the parent, and the holder is reclaimed by the terminal-state rule on this execution's own FAILED event.",
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                                "FunctionName": "${RunInferenceLambdaArn}",
+                                "Payload": {
+                                    "operation": "StateRunInference",
+                                    "uuid.$": "$.uuid",
+                                    "input.$": "$.input",
+                                    "data.$": "$.data",
+                                    "execution_arn.$": "$$.Execution.Id"
+                                }
+                            },
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "LambdaResourceTimeoutException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 10,
+                                    "BackoffRate": 1
+                                },
+                                {
+                                    "ErrorEquals": [
+                                        "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException",
+                                        "Lambda.SdkClientException",
+                                        "Lambda.TooManyRequestsException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 3,
+                                    "BackoffRate": 1.5
+                                }
+                            ],
+                            "Next": "Release lease"
+                        },
+                        "Release lease": {
+                            "Comment": "Trigger 1 of the three remaining holder-disappearance paths. Deletes the holder ONLY; the counter is decremented by this stack's own stream handler on the holder's REMOVE record, which is what makes all three paths converge on one decrement and one drain. This handler never raises — a release failure is reported in $.data.lease, and the holder TTL plus the terminal-state rule are the backstops.",
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                                "FunctionName": "${InferenceLambdaArn}",
+                                "Payload": {
+                                    "operation": "StateReleaseLease",
+                                    "uuid.$": "$.uuid",
+                                    "input.$": "$.input",
+                                    "data.$": "$.data",
+                                    "execution_arn.$": "$$.Execution.Id"
+                                }
+                            },
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException",
+                                        "Lambda.SdkClientException",
+                                        "Lambda.TooManyRequestsException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 3,
+                                    "BackoffRate": 1.5
+                                }
+                            ],
+                            "Next": "Summarize"
+                        },
+                        "Summarize": {
+                            "Comment": "This child's own terminal state, and the only state that sees the whole result set — which is why the all-records-failed decision lives here (§7). Duplicated with the batch child by design (README.md §M decision 1): both call the same lib/response.build_summary, and each child returning a complete summary.json is what makes it independently startable and independently useful. Partial success IS success: 39 of 40 ends SUCCEEDED with one FAILED line and its reason in summary.failures[]. Only EVERY record failing raises BedrockInferenceFailed, and summary.json is written first so the per-record reasons survive the failure.\n\nNote this runs AFTER the lease is released: summarizing is S3 and arithmetic, and holding a Bedrock concurrency slot through it would cap throughput on work that needs no slot.",
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                                "FunctionName": "${InferenceLambdaArn}",
+                                "Payload": {
+                                    "operation": "StateSummarize",
+                                    "uuid.$": "$.uuid",
+                                    "input.$": "$.input",
+                                    "data.$": "$.data"
+                                }
+                            },
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException",
+                                        "Lambda.SdkClientException",
+                                        "Lambda.TooManyRequestsException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 3,
+                                    "BackoffRate": 1.5
+                                }
+                            ],
+                            "End": true
+                        }
+                    }
+                }
+
+    BatchInferenceStateMachine:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            StateMachineName: !Sub
+                - ${ResourcePrefix}-${name}-batch
+                - name: !FindInMap [Lambda, Function, Name]
+            RoleArn: !GetAtt BatchStateMachineRole.Arn
+            LoggingConfiguration:
+                Destinations:
+                    - CloudWatchLogsLogGroup:
+                          LogGroupArn: !GetAtt BatchStateMachineLogGroup.Arn
+                IncludeExecutionData: true
+                Level: ALL
+            TracingConfiguration:
+                Enabled: true
+            DefinitionSubstitutions:
+                InferenceLambdaArn: !GetAtt BedrockInferenceLambda2Cores.Arn
+                SubmitBatchLambdaArn: !GetAtt BedrockInferenceLambda2Cores.Arn
+                # The repair tail IS the sync child machine (§8) — not a second copy
+                # of its lease/checkpoint/release spine, and not a direct call to the
+                # inference function. Same token name the orchestrator uses for the
+                # same ARN, deliberately: each machine's substitutions are balanced
+                # against its OWN ASL's tokens, so two spellings of one thing would
+                # pass that test and confuse every reader.
+                SyncInferenceStateMachineArn: !GetAtt SyncInferenceStateMachine.Arn
+            DefinitionString: |-
+                {
+                    "Comment": "BATCH inference child (README.md §M1). Submits one Bedrock batch job for all N records, parks on a task token until the job finishes, collects the output, and summarizes. No lease on the SUBMISSION path: the in-progress-job limit is account-level and service-enforced, so a local cap would serialize submissions Bedrock is willing to accept in parallel (§1.1). Standalone and independently startable given a plan whose $.data.batch.can_batch is true. Input: {\"uuid\":\"<correlation>\",\"input\":{...},\"data\":{<plan>}}\n\nFOUR states, and the repair tail is a NESTED CALL rather than a copied spine (README.md §P8). Repairing failed records IS sync inference — lease, chain walk, checkpoint, release — so this machine invokes the sync CHILD MACHINE for it instead of duplicating four of its states here. What that buys: run_inference and the sync ASL are untouched, there is exactly one lease/checkpoint/release spine in the stack, and 'either child is startable on its own given a plan' still holds because the repair lives here and not in the orchestrator. What it costs: the start graph gains an edge, so it is stated as an invariant — orchestrator → {sync, batch}, batch → sync, sync → nothing, ACYCLIC, and a test pins it. A machine that could reach itself is a recursion with a real Bedrock bill.\n\nThe route into the repair is a Catch on 'Collect batch output', not a Choice. collect_batch RAISES BatchRecordsIncompleteException over already-committed S3 state, and the exception is control flow rather than a fault: the caught path summarizes normally and this execution SUCCEEDS. The cost is deliberate and accepted — a partial batch renders as a red state in the console and emits a LambdaFunctionsFailed datapoint — because a run that had a problem SHOULD be legible in the execution graph months later, where a boolean on a payload has to be dug out of the history. It is also the only mechanism that can discriminate: a .sync:2 child failure reaches its parent as States.TaskFailed, never as the child's own error name, so an equivalent Catch one level up in the orchestrator could not tell a repairable batch from any other failure.",
+                    "StartAt": "Submit batch",
+                    "States": {
+                        "Submit batch": {
+                            "Comment": "One job, all N records, parked on a task token. The row is written status=SUBMITTING before CreateModelInvocationJob, so a Lambda death in between still leaves a record of the attempt (§6.2). A quota-shaped refusal returns normally with status=PENDING and the task stays parked — a drain submits it when capacity frees, which is why TimeoutSeconds is a full day rather than sized to a job's runtime. There is no Catch: no lease was taken, and NotifyFunction reports a failed job through SendTaskFailure, so the failure surfaces as itself.\n\nResultPath (not OutputPath) is what makes the repair tail possible: it MERGES the resumed token's payload under $.batch_result and leaves $.data — the plan — intact for every state after this one, including the caught path, which needs the plan to start the repair child with.",
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                            "ResultPath": "$.batch_result",
+                            "Parameters": {
+                                "FunctionName": "${SubmitBatchLambdaArn}",
+                                "Payload": {
+                                    "operation": "StateSubmitBatch",
+                                    "uuid.$": "$.uuid",
+                                    "input.$": "$.input",
+                                    "data.$": "$.data",
+                                    "task_token.$": "$$.Task.Token"
+                                }
+                            },
+                            "TimeoutSeconds": 86400,
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException",
+                                        "Lambda.SdkClientException",
+                                        "Lambda.TooManyRequestsException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 3,
+                                    "BackoffRate": 1.5
+                                }
+                            ],
+                            "Next": "Collect batch output"
+                        },
+                        "Collect batch output": {
+                            "Comment": "$.batch_result is the SendTaskSuccess payload from NotifyFunction, and it carries job_arn for a reason: the notifier DELETES the row after sending, so by the time this state runs the table lookup is usually a miss. Records are mapped from the job output by record_id, never by position — Bedrock does not guarantee output order and interleaves padding records.\n\nThe Catch is the fork into the repair tail (§8). collect_batch writes response.jsonl AND seeds _progress.json with the successful lines, and only THEN raises BatchRecordsIncompleteException — write-then-raise, so the raise is a routing signal over durable state rather than a lost result. Everything this state returned on that path is discarded, which is by design and not a leak: Summarize recomputes every count from response.jsonl, and the repair's own numbers come back through the repair state's ResultSelector.\n\nThe Catch carries an EXPLICIT ResultPath because the default is '$', which would replace the whole input with the error object and leave the repair with no plan, no keys and no workflow_id. $.data.batch_incomplete merges instead, and $.data is still there to merge into because a caught error replaces the state's RESULT, not its INPUT — see Submit batch's ResultPath.\n\nThe Retry ladder names only Lambda.* integration errors, and must never name States.ALL: Step Functions evaluates Retry before Catch, so a ladder that swallowed BatchRecordsIncompleteException would re-read the whole batch output three times before the repair it exists to trigger ever fired. A Python class name can never collide with the Lambda. prefix, so the ladder is self-enforcing; a test pins it anyway.",
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                                "FunctionName": "${InferenceLambdaArn}",
+                                "Payload": {
+                                    "operation": "StateCollectBatch",
+                                    "uuid.$": "$.uuid",
+                                    "input.$": "$.input",
+                                    "data.$": "$.data",
+                                    "batch_result.$": "$.batch_result"
+                                }
+                            },
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException",
+                                        "Lambda.SdkClientException",
+                                        "Lambda.TooManyRequestsException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 3,
+                                    "BackoffRate": 1.5
+                                }
+                            ],
+                            "Catch": [
+                                {
+                                    "ErrorEquals": [
+                                        "BatchRecordsIncompleteException"
+                                    ],
+                                    "ResultPath": "$.data.batch_incomplete",
+                                    "Next": "Run repair inference"
+                                }
+                            ],
+                            "Next": "Summarize"
+                        },
+                        "Run repair inference": {
+                            "Comment": "The repair pass IS the sync child machine, started with this machine's own plan (§8). run_inference resumes from the _progress.json that collect_batch seeded with the successful batch lines, so it infers exactly the gaps — through the normal chain walk, with the primary model keeping first shot, which is what restores chain-fallback semantics to batch (a single-model job has nothing to fall back to; a batch miss was transient flakiness rather than a model verdict, and even a refusal deserves the primary's second look before the chain escalates it, because refusals are not deterministic). It re-writes response.jsonl in request order over the collect pass's copy. Repaired records price at the ON-DEMAND rate, which is truthful: a run that needed repair costs visibly more than a clean batch run.\n\nNAMED {workflow_id}-repair, so it cannot collide with the -sync sibling a mode flip on the same workflow_id would create, and so the console shows which pass an execution was. It runs EXACTLY ONCE by construction: the Catch that routes here is on Collect batch output, and this state's only exits are Summarize and its own degrade-to-Summarize Catch, so there is no edge back. A record that fails the repair too stays a FAILED line.\n\nResultSelector takes two fields and no more. records_resumed is the repair child's own count of records the seeded checkpoint made it SKIP — i.e. the batch successes — and Summarize turns it into records_repaired as succeeded minus resumed, which is what the repair RECOVERED rather than what it attempted. ResultPath is a NESTED path, so it merges under $.data rather than replacing it.\n\nThe Catch on States.ALL degrades rather than fails, and the reason is a perverse incentive: with repair OFF a 95/100 batch is a SUCCEEDED execution with five FAILED lines, so a failed repair must not turn that same run into a FAILED execution — response.jsonl is already complete and correct on S3 either way. The reason lands in summary.repair_error, which is the only trace of a caught error a caller can read. Retry is transport-only for the same reason the orchestrator's branches are: States.TaskFailed would re-issue startExecution under this fixed name and return ExecutionAlreadyExists, so the caller would see a name collision instead of the real error.\n\nTimeoutSeconds matches the orchestrator's sync branch because the child is the same child: up to 24 h queued for a lease plus ~2.5 h of checkpoint/re-enter retries.",
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::states:startExecution.sync:2",
+                            "Parameters": {
+                                "StateMachineArn": "${SyncInferenceStateMachineArn}",
+                                "Name.$": "States.Format('{}-repair', $.data.workflow_id)",
+                                "Input": {
+                                    "uuid.$": "$.uuid",
+                                    "input.$": "$.input",
+                                    "data.$": "$.data"
+                                }
+                            },
+                            "ResultSelector": {
+                                "execution_arn.$": "$.ExecutionArn",
+                                "records_resumed.$": "$.Output.data.records_resumed"
+                            },
+                            "ResultPath": "$.data.repair",
+                            "TimeoutSeconds": 100800,
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "StepFunctions.SdkClientException",
+                                        "StepFunctions.ThrottlingException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 2,
+                                    "BackoffRate": 2
+                                }
+                            ],
+                            "Catch": [
+                                {
+                                    "ErrorEquals": [
+                                        "States.ALL"
+                                    ],
+                                    "ResultPath": "$.data.repair_error",
+                                    "Next": "Summarize"
+                                }
+                            ],
+                            "Next": "Summarize"
+                        },
+                        "Summarize": {
+                            "Comment": "This child's own terminal state — the same handler and the same lib/response.build_summary as the sync child's Summarize (README.md §M decision 1). Two call sites for one builder rather than a shared post-join state, which is what makes each child return a complete summary.json + response.jsonl on its own. Partial success IS success: 39 of 40 ends SUCCEEDED with one FAILED line and its reason in summary.failures[]. Only EVERY record failing raises BedrockInferenceFailed, and summary.json is written first so the per-record reasons survive the failure.\n\nThe SINGLE terminal state for all three paths — clean batch, repaired batch, failed repair — and that is safe because it is a pure idempotent function of response.jsonl plus the plan. The repair child writes summary.json too, from its own Summarize; this one runs after it, over the same response.jsonl, and is the only one of the two that can see $.data.repair. Last writer wins, and both writers agree on everything but the repair fields.\n\nsummary.quota_table is empty on a clean batch run, which is the accurate answer: batch takes no lease, so no cap governed it. On a repaired run it names the table, because the repair took a lease like any sync run.",
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                                "FunctionName": "${InferenceLambdaArn}",
+                                "Payload": {
+                                    "operation": "StateSummarize",
+                                    "uuid.$": "$.uuid",
+                                    "input.$": "$.input",
+                                    "data.$": "$.data"
+                                }
+                            },
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException",
+                                        "Lambda.SdkClientException",
+                                        "Lambda.TooManyRequestsException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 3,
+                                    "BackoffRate": 1.5
+                                }
+                            ],
+                            "End": true
+                        }
+                    }
+                }
+
+    # ResourcePrefix is a substitution here and not only a !Sub: the orchestrator's
+    # Comment names the machine callers start, and a comment that drifts from the
+    # deployed name is worse than no comment.
+    InferenceStateMachine:
+        Type: AWS::StepFunctions::StateMachine
+        Properties:
+            StateMachineName: !Sub
+                - ${ResourcePrefix}-${name}
+                - name: !FindInMap [Lambda, Function, Name]
+            RoleArn: !GetAtt StateMachineRole.Arn
+            LoggingConfiguration:
+                Destinations:
+                    - CloudWatchLogsLogGroup:
+                          LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+                IncludeExecutionData: true
+                Level: ALL
+            TracingConfiguration:
+                Enabled: true
+            DefinitionSubstitutions:
+                InferenceLambdaArn: !GetAtt BedrockInferenceLambda2Cores.Arn
+                SyncInferenceStateMachineArn: !GetAtt SyncInferenceStateMachine.Arn
+                BatchInferenceStateMachineArn: !GetAtt BatchInferenceStateMachine.Arn
+                ResourcePrefix: !Ref ResourcePrefix
+            DefinitionString: |-
+                {
+                    "Comment": "bedrock-inference ORCHESTRATOR (README.md §M1). Plans the work, routes it to one of two standalone child state machines, and collects usage tracking. It runs no Bedrock call itself and holds no lease — the sync child owns the lease, the batch child owns the queue, and each child ends with its own Summarize so each returns a complete summary.json + response.jsonl and is independently startable given a plan. This is the machine callers start: its name is ${ResourcePrefix}-bedrock-inference and its ARN is the InferenceStateMachineArn output, so a consumer calling startExecution.sync:2 on it reads $.Output.data.records_succeeded exactly as before the split. Input: {\"operation\":\"StateValidateAndPlan\",\"uuid\":\"<correlation>\",\"input\":{\"request_s3uri\":\"s3://.../input_params.json\"},\"data\":{}}\n\nFOUR STATES, ONE PATH, NO Catch ANYWHERE. Failures propagate as themselves: whatever the child raised — BedrockInferenceFailed from Summarize with its per-record message, a ValidationException from the plan, a genuine States.Timeout — is what the caller receives, because nothing here intercepts it. A Fail state cannot do better; its Error and Cause must be STATIC (a States.Timeout carries no Cause, and an intrinsic over an absent path fails the state), so catching in order to re-raise could only ever replace a specific error with a generic one. Lease cleanup does not need a Catch either: the child's holder is reclaimed by QuotaTerminalRule on the child's own terminal event, which also covers ABORTED — a status no Catch can see (README.md §M1.1).",
+                    "StartAt": "Validate & plan",
+                    "States": {
+                        "Validate & plan": {
+                            "Comment": "Everything that can fail deterministically fails here, BEFORE a token is spent and before a child execution exists: the request parses, the records parse, every model in the chain is registered, and the mode is chosen and reported. Planning lives in the orchestrator rather than in each child so the two children share one plan and neither has to re-read S3 to learn what it is running. No Catch: nothing has been acquired and no child has started, so there is nothing to release and a failure here should surface as itself.",
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                                "FunctionName": "${InferenceLambdaArn}",
+                                "Payload": {
+                                    "operation": "StateValidateAndPlan",
+                                    "uuid.$": "$.uuid",
+                                    "input.$": "$.input",
+                                    "data.$": "$.data",
+                                    "execution_arn.$": "$$.Execution.Id"
+                                }
+                            },
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException",
+                                        "Lambda.SdkClientException",
+                                        "Lambda.TooManyRequestsException"
+                                    ],
+                                    "IntervalSeconds": 1,
+                                    "MaxAttempts": 2,
+                                    "BackoffRate": 1.2
+                                }
+                            ],
+                            "Next": "Choose mode"
+                        },
+                        "Choose mode": {
+                            "Comment": "The mode was RESOLVED in Validate & plan, not here — 'auto' never reaches this state. Choice states cannot read the model registry, and the auto decision needs the primary model's batchJob.canSupport plus the record count. Resolving it in the Lambda also means the reason is reportable ($.data.mode_reason → summary.mode_reason), which matters because mode is excluded from workflow_id (§3) and the summary is the only place a caller learns which path ran.\n\nNO Default, deliberately: a mode that is neither 'sync' nor 'batch' fails the execution with States.NoChoiceMatched, which is the same outcome a Fail state here would produce and needs no state to say it. What must never happen is a Default that falls through to sync — that would run a 5000-record set through a serial lease-held loop that cannot finish inside the child's retry budget. choose_mode() returns only these two values and a test pins that, so this is unreachable either way.",
+                            "Type": "Choice",
+                            "Choices": [
+                                {
+                                    "Variable": "$.data.mode",
+                                    "StringEquals": "sync",
+                                    "Next": "Run sync inference"
+                                },
+                                {
+                                    "Variable": "$.data.mode",
+                                    "StringEquals": "batch",
+                                    "Next": "Run batch inference"
+                                }
+                            ]
+                        },
+                        "Run sync inference": {
+                            "Comment": "The sync child, called synchronously so this execution's history carries the child's outcome. The child is NAMED {workflow_id}-sync rather than workflow_id: the same records through sync and through batch are deliberately the SAME workflow_id (EXCLUDED_KEYS contains 'mode'), so an unsuffixed child name would be ambiguous between the two children and a mode flip on a retried workflow_id would collide with the sibling's history. The orchestrator execution keeps the bare workflow_id, which is what makes a resubmit hit ExecutionAlreadyExists and return the existing run rather than paying twice (§3). TimeoutSeconds exceeds the child's own worst case (up to 24 h queued for a lease plus ~2.5 h of checkpoint/re-enter retries) so the child's own bounds fire first and report themselves.",
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::states:startExecution.sync:2",
+                            "ResultPath": "$.child",
+                            "ResultSelector": {
+                                "data.$": "$.Output.data",
+                                "execution_arn.$": "$.ExecutionArn",
+                                "status.$": "$.Status"
+                            },
+                            "Parameters": {
+                                "StateMachineArn": "${SyncInferenceStateMachineArn}",
+                                "Name.$": "States.Format('{}-sync', $.data.workflow_id)",
+                                "Input": {
+                                    "uuid.$": "$.uuid",
+                                    "input.$": "$.input",
+                                    "data.$": "$.data"
+                                }
+                            },
+                            "TimeoutSeconds": 100800,
+                            "Retry": [
+                                {
+                                    "Comment": "TRANSPORT failures only. States.TaskFailed is deliberately absent: it is what a genuine child failure raises, and retrying that re-issues startExecution under the SAME name, which returns StepFunctions.ExecutionAlreadyExists — so the caller would see a name collision instead of the child's real error. StepFunctions.ExecutionAlreadyExists is likewise not retried: it means this exact child already ran or is running, and a second attempt under a new name would pay for the work twice. Both propagate.",
+                                    "ErrorEquals": [
+                                        "StepFunctions.SdkClientException",
+                                        "StepFunctions.ThrottlingException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 2,
+                                    "BackoffRate": 2
+                                }
+                            ],
+                            "Next": "Usage tracking"
+                        },
+                        "Run batch inference": {
+                            "Comment": "The batch child. No lease on its SUBMISSION path: the Bedrock in-progress-job limit is account-level and service-enforced, so a local cap would serialize submissions Bedrock is willing to accept in parallel (§1.1). Its repair tail does take one, by starting the sync child itself (§8) — which is why TimeoutSeconds is 190800 rather than 90000: the child's own worst case is now 86400 s parked on the submit token PLUS its repair grandchild's 100800 s bound, and a parent timeout shorter than that would ABORT a running repair mid-flight instead of letting the child report its own bound. The extra hour is collect and summarize.",
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::states:startExecution.sync:2",
+                            "ResultPath": "$.child",
+                            "ResultSelector": {
+                                "data.$": "$.Output.data",
+                                "execution_arn.$": "$.ExecutionArn",
+                                "status.$": "$.Status"
+                            },
+                            "Parameters": {
+                                "StateMachineArn": "${BatchInferenceStateMachineArn}",
+                                "Name.$": "States.Format('{}-batch', $.data.workflow_id)",
+                                "Input": {
+                                    "uuid.$": "$.uuid",
+                                    "input.$": "$.input",
+                                    "data.$": "$.data"
+                                }
+                            },
+                            "TimeoutSeconds": 190800,
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "StepFunctions.SdkClientException",
+                                        "StepFunctions.ThrottlingException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 2,
+                                    "BackoffRate": 2
+                                }
+                            ],
+                            "Next": "Usage tracking"
+                        },
+                        "Usage tracking": {
+                            "Comment": "Rolls up Lambda cost across the whole execution TREE — this one, the child it started, and anything that child started in turn. Reading only the orchestrator would report near-zero: its own history is one child span and two short Lambda calls, while every Converse retry and every checkpoint re-entry lives in the child. Child spans are tagged and NOT billed as Lambda time, which is the whole reason this module uses face-recognition's kind-tagged model rather than the seven-stack state-span model (README.md §M4). $.child.data is the child's Summarize output, so this state's return carries records_succeeded / records_failed / keys.response unchanged and a caller's ResultSelector on $.Output.data keeps working across the split.\n\nNo child_execution_arn parameter, deliberately. A repaired batch run is a TREE — orchestrator → batch child → sync repair grandchild — and a scalar could name only one of the two, while the grandchild is where the repair's Converse calls and lease wait are billed. The handler discovers descendants instead, from the ExecutionArn each .sync:2 TaskSubmitted event carries, and recurses; the one edge the scalar covered is the first thing that discovery finds.\n\nSUCCESS PATH ONLY — there is no failure-path twin. A failed run's Lambda time is worth well under a cent (every function here is 1024-2048 MB) and it is an ESTIMATE from history timestamps, not billing data; the money that actually matters is Bedrock tokens, and those are already on S3 per record in _progress.json before any failure, priced, because run_inference checkpoints a full response line per record. Nobody bills a customer for a failed run or capacity-plans off failures, so the state that used to record this bought a sub-cent estimate at the price of laundering every distinct child error into one static Fail. The handler still never raises, for a different reason now: this is the terminal state, and a reporting exception here would fail an execution whose response.jsonl and summary.json are already written.",
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "OutputPath": "$.Payload",
+                            "Parameters": {
+                                "FunctionName": "${InferenceLambdaArn}",
+                                "Payload": {
+                                    "operation": "StateUsageTracking",
+                                    "uuid.$": "$.uuid",
+                                    "input.$": "$.input",
+                                    "data.$": "$.child.data",
+                                    "execution_arn.$": "$$.Execution.Id"
+                                }
+                            },
+                            "Retry": [
+                                {
+                                    "ErrorEquals": [
+                                        "Lambda.ServiceException",
+                                        "Lambda.AWSLambdaException",
+                                        "Lambda.SdkClientException",
+                                        "Lambda.TooManyRequestsException"
+                                    ],
+                                    "IntervalSeconds": 2,
+                                    "MaxAttempts": 3,
+                                    "BackoffRate": 1.5
+                                }
+                            ],
+                            "End": true
+                        }
+                    }
+                }
+
+    ############################################################################
+    # The terminal-state rule — trigger 3 of the THREE holder-disappearance paths
+    # (README.md §M3.4), and the one that matters most now that the sync child's
+    # in-band `Release lease on failure` state is gone.
+    #
+    # The three paths, all of which DELETE a holder and converge on the stream's one
+    # decrement:
+    #   1. the sync child's own `Release lease` state, on the success path
+    #   2. this rule, on any terminal status of any of the three machines
+    #   3. the holder's TTL, up to an hour
+    #
+    # Path 2 is what reclaims a slot after a mid-lease failure, a StopExecution, or
+    # an orchestrator timeout. Without it a killed execution would hold its lease
+    # until TTL expiry with nothing anywhere reporting it.
+    #
+    # ALL THREE MACHINES are listed, though only the sync child ever holds a lease.
+    # The orchestrator and the batch child are no-ops (list_leases returns [] and the
+    # handler returns released: 0), and they are here so that an ABORTED orchestrator
+    # whose child outlives it, or a future lease on the batch path, cannot become a
+    # silent leak. The alternative — enumerating only the sync child — is correct today
+    # and quietly wrong after the next ASL change.
+    #
+    # SUCCEEDED is in the list and is not redundant with path 1: it covers a Lambda
+    # that released and crashed before returning, and an ASL that never reached its
+    # release state at all. That the handler is idempotent is what lets one target
+    # serve all four statuses with no branching.
+    ############################################################################
+
+    QuotaTerminalRule:
+        Type: AWS::Events::Rule
+        Properties:
+            Name: !Sub ${ResourcePrefix}-bedrock-inference-quota-terminal
+            Description: Release any concurrency lease still held by a terminated execution of any of this stack's three state machines
+            EventPattern:
+                source: [aws.states]
+                detail-type: ["Step Functions Execution Status Change"]
+                detail:
+                    status: [SUCCEEDED, FAILED, ABORTED, TIMED_OUT]
+                    # Scoped to THIS stack's machines. Unscoped, the rule would invoke
+                    # the handler on every execution in the account — correct, because
+                    # list_leases() returns [] for all of them, but expensive for
+                    # nothing.
+                    stateMachineArn:
+                        - !GetAtt InferenceStateMachine.Arn
+                        - !GetAtt SyncInferenceStateMachine.Arn
+                        - !GetAtt BatchInferenceStateMachine.Arn
+            State: ENABLED
+            Targets:
+                # The 2-cores tier, routed by event shape: the router sends any
+                # source=aws.states event to states/handle_execution_terminal. That
+                # handler DELETES and only deletes — the stream owns the decrement
+                # (semaphore invariant 1), which is what makes an aborted execution wake
+                # a waiter exactly as a clean release does.
+                - Id: BedrockInferenceTerminalCleanup
+                  Arn: !GetAtt BedrockInferenceLambda2Cores.Arn
+
+    QuotaTerminalRulePermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !GetAtt BedrockInferenceLambda2Cores.Arn
+            Action: lambda:InvokeFunction
+            Principal: events.amazonaws.com
+            SourceArn: !GetAtt QuotaTerminalRule.Arn
+
+    ############################################################################
+    # AgentCore Gateway tool
+    #
+    # Unlike the other gateway tools in the repo, this dispatcher WRITES the request
+    # objects rather than passing an s3uri through: the output prefix is
+    # micro-workflow/{target}/{workflow_id}, so the hash has to exist before the
+    # objects can be written. It imports lib/identity.py rather than reimplementing
+    # the rule, and StateValidateAndPlan recomputes the same hash from the same
+    # material — two copies would be a hash that silently disagrees, and the symptom
+    # is a resubmit that re-pays for work already done (README.md §3).
+    ############################################################################
+
+    GatewayToolLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Single-purpose dispatcher; reserved concurrency unnecessary
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${name}-${tool}
+                - name: !FindInMap [Lambda, Function, Name]
+                  tool: !FindInMap [Lambda, GatewayTool, Name]
+            Description: !Sub
+                - (${ResourcePrefix}) ${desc}
+                - desc: !FindInMap [Lambda, GatewayTool, Description]
+            Runtime: python3.13
+            Architectures: [arm64]
+            Handler: lambda_function.lambda_handler
+            Role: !GetAtt GatewayToolRole.Arn
+            MemorySize: !FindInMap [Lambda, GatewayTool, Memory]
+            Timeout: !FindInMap [Lambda, GatewayTool, Timeout]
+            Code:
+                S3Bucket: !FindInMap [CodeBuild, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                      pkg: !FindInMap [CodeBuild, Source, GatewayToolPackage]
+            Environment:
+                Variables:
+                    INFERENCE_STATE_MACHINE_ARN: !GetAtt InferenceStateMachine.Arn
+                    PROXY_BUCKET: !Ref ProxyBucket
+                    MODEL_REGISTRY_KEY: !FindInMap [ModelRegistry, Object, Key]
+                    CALLBACK_TABLE: !Ref CallbackTokensTable
+                    # Must equal the GatewayTarget Name in
+                    # media-toolkit-gateway/cfnstack.yaml — it is the {target} segment of
+                    # the derived output prefix, so a mismatch relocates every
+                    # request object and breaks idempotent resubmit.
+                    TARGET_NAME: "bedrock-inference"
+                    # Inside workflow_id: a version bump re-runs everything, because
+                    # a change to the shaping in lib/bedrock.py produces different
+                    # calls for the same request and returning the old result would
+                    # attribute it to the new code.
+                    TOOL_VERSION: "%%VERSION%%"
+            TracingConfig:
+                Mode: Active
+
+    GatewayToolPermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !GetAtt GatewayToolLambda.Arn
+            Action: lambda:InvokeFunction
+            Principal: bedrock-agentcore.amazonaws.com
+            SourceAccount: !Ref AWS::AccountId
+
+    ############################################################################
+    # Callback waker (README.md §11) — the service-side half of
+    # callback_task_token. ONE rule on the ORCHESTRATOR machine's native
+    # status-change events (the same mechanism `.sync` uses internally) wakes
+    # every consumer registered in CallbackTokensTable. The consumer-side
+    # alternative — a table + rule + waker per consumer stack — multiplies by
+    # N workflows and fans every completion out to N rules for N-1 misses;
+    # notification is a SERVICE concern, owned here once.
+    #
+    # Orchestrator ONLY, unlike QuotaTerminalRule's three machines: consumers
+    # hold orchestrator execution ARNs (job_id), and the children's terminal
+    # events would be pure Query misses.
+    ############################################################################
+
+    CallbackWakerLogGroup:
+        Type: AWS::Logs::LogGroup
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W84
+                      reason: CloudWatch Logs encrypts data at rest by default using an AWS-managed key
+        Properties:
+            LogGroupName: !Sub
+                - /aws/lambda/${ResourcePrefix}-${name}-${tool}
+                - name: !FindInMap [Lambda, Function, Name]
+                  tool: !FindInMap [CustomResource, CallbackWaker, Name]
+            RetentionInDays: 7
+
+    CallbackWakerRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W11
+                      reason: states:SendTask* is scoped to this account+region's state machines — the token's machine is the caller's and unknowable at deploy time. This role can only redeem tokens it reads from the callback table, which only the gateway role writes.
+        Properties:
+            Path: !Sub /${ResourcePrefix}/
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: !Sub ${ResourcePrefix}BedrockInferenceCallbackWakerPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Resource: !GetAtt CallbackWakerLogGroup.Arn
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:Query
+                                - dynamodb:DeleteItem
+                            Resource: !GetAtt CallbackTokensTable.Arn
+                          # Scoped to this account+region's machines
+                          # (corrected 2026-10-09 — see the gateway role's
+                          # W11); the token is the capability, the table is
+                          # the gate.
+                          - Effect: Allow
+                            Action: states:SendTaskSuccess
+                            # any machine in THIS account+region — the token's machine is the
+                            # caller's (ours or a customer's own), never known at deploy time
+                            Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*
+
+    CallbackWakerLambda:
+        Type: AWS::Lambda::Function
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    - id: W89
+                      reason: Not using VPC
+                    - id: W92
+                      reason: Invoked once per terminal execution event; reserved concurrency unnecessary
+        Properties:
+            FunctionName: !Sub
+                - ${ResourcePrefix}-${name}-${tool}
+                - name: !FindInMap [Lambda, Function, Name]
+                  tool: !FindInMap [CustomResource, CallbackWaker, Name]
+            Description: !Sub
+                - (${ResourcePrefix}) ${desc}
+                - desc: !FindInMap [CustomResource, CallbackWaker, Description]
+            Runtime: python3.13
+            Architectures: [arm64]
+            Handler: callback_waker.lambda_handler
+            Role: !GetAtt CallbackWakerRole.Arn
+            MemorySize: !FindInMap [CustomResource, CallbackWaker, Memory]
+            Timeout: !FindInMap [CustomResource, CallbackWaker, Timeout]
+            Code:
+                S3Bucket: !FindInMap [CodeBuild, Source, Bucket]
+                S3Key: !Sub
+                    - ${keyPrefix}/${pkg}
+                    - keyPrefix: !FindInMap [CodeBuild, Source, KeyPrefix]
+                      pkg: !FindInMap [CodeBuild, Source, GatewayToolPackage]
+            Environment:
+                Variables:
+                    CALLBACK_TABLE: !Ref CallbackTokensTable
+
+    CallbackCompletionRule:
+        Type: AWS::Events::Rule
+        Properties:
+            Name: !Sub ${ResourcePrefix}-bedrock-inference-callback-completion
+            Description: Complete consumer callback task tokens when an orchestrator execution reaches a terminal state
+            EventPattern:
+                source: [aws.states]
+                detail-type: ["Step Functions Execution Status Change"]
+                detail:
+                    status: [SUCCEEDED, FAILED, ABORTED, TIMED_OUT]
+                    stateMachineArn:
+                        - !GetAtt InferenceStateMachine.Arn
+            State: ENABLED
+            Targets:
+                - Id: BedrockInferenceCallbackWaker
+                  Arn: !GetAtt CallbackWakerLambda.Arn
+
+    CallbackCompletionRulePermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !GetAtt CallbackWakerLambda.Arn
+            Action: lambda:InvokeFunction
+            Principal: events.amazonaws.com
+            SourceArn: !GetAtt CallbackCompletionRule.Arn
+
+Outputs:
+    InferenceStateMachineArn:
+        Description: ARN of the ORCHESTRATOR state machine — the one consumers start, with an execution named workflow_id; ExecutionAlreadyExists is success. The two children are started by this machine and never by a consumer.
+        Value: !GetAtt InferenceStateMachine.Arn
+    InferenceStateMachineName:
+        Description: Name of the orchestrator state machine. The children are this name plus -sync / -batch.
+        Value: !GetAtt InferenceStateMachine.Name
+    GatewayToolLambdaArn:
+        Description: ARN of the gateway tool Lambda — pass to media-toolkit-gateway as BedrockInferenceToolLambdaArn
+        Value: !GetAtt GatewayToolLambda.Arn
+    SyncInferQuotasTableName:
+        Description: Name of the concurrency semaphore table. Diagnostic only — no other stack reads it. NOTE the cap is per ResourcePrefix, not per region, so two deployments with different prefixes hold two independent caps against one real Bedrock quota (see the template header).
+        Value: !Ref SyncInferQuotasTable
+    BatchInferTokensTableName:
+        Description: Name of the batch queue / task token table. Diagnostic only — no other stack reads it. Separate from the semaphore table because the two have disjoint access patterns and disjoint roles.
+        Value: !Ref BatchInferTokensTable
+    CallbackTokensTableName:
+        Description: Name of the consumer callback-token table (README.md §11). Diagnostic only — consumers never touch it; they pass callback_task_token to run_inference and the gateway/waker do the rest.
+        Value: !Ref CallbackTokensTable
+    BedrockBatchServiceRoleArn:
+        Description: Role Bedrock assumes to read batch input and write batch output. Scoped to the micro-workflow/ prefix of the proxy bucket.
+        Value: !GetAtt BedrockBatchServiceRole.Arn

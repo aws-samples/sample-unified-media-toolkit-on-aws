@@ -1,0 +1,50 @@
+{
+  "comment": "Per tool: `required` names the fields the gateway refuses without (a prose entry like 'a OR b' states a one-of rule the schema cannot express); `example` is a minimal VALID request including recommended optionals; every other accepted parameter is declared, with type and description, in the tool's InputSchema (delivered via tools/list). The shapes and field names are the contract; every s3 uri, ARN, and id value is an invented placeholder — substitute your deployment's own. Each submit example passes this gateway's full input validation (pinned by a unit test), so an example that drifts from the real contract fails the build.",
+  "tools": {
+    "put_prompt": {
+      "required": ["category", "text"],
+      "example": {
+        "category": "my-scene-summary",
+        "text": "<!-- Version: v1 -->\n<!-- Comment: an invented example prompt -->\n# System Prompt\nBe terse.\n# User Prompt\nSummarize {{transcript}}.\n",
+        "stage": "dev"
+      }
+    },
+    "get_prompt": {
+      "required": ["category"],
+      "example": {
+        "category": "my-scene-summary",
+        "version": "v1"
+      }
+    },
+    "list_prompts": {
+      "required": [],
+      "example": {}
+    },
+    "promote_prompt": {
+      "required": ["category", "version"],
+      "example": {
+        "category": "my-scene-summary",
+        "version": "v1",
+        "to_stage": "prod"
+      }
+    },
+    "delete_prompt": {
+      "required": ["category", "version"],
+      "example": {
+        "category": "my-scene-summary",
+        "version": "v1"
+      }
+    },
+    "deprecate_prompt": {
+      "required": ["category", "version"],
+      "example": {
+        "category": "my-scene-summary",
+        "version": "v1"
+      }
+    },
+    "describe_tool": {
+      "required": [],
+      "example": {}
+    }
+  }
+}

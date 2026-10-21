@@ -1,0 +1,53 @@
+{
+  "contract_version": 1,
+  "target": "hybrid-search",
+  "stability": "Every entry in `outputs` is stable API: the keys, the invariant scoring/status fields, and the field names/nesting shown in each example. Removing or renaming any of them is a breaking change and requires a TOOL_VERSION bump plus a changelog note here. This target writes NO consumer-facing output files — both entries are kind `inline`: search results ride the search_content response and index jobs report counts via get_job_status. Per-document PAYLOAD fields vary by collection schema (each schema's `result_fields`); the scoring fields are invariant. Anything on S3 (`_lancedb_index/` storage layout, `_search/` transients such as vectors.json, row-group objects) is internal and may change or vanish without notice.",
+  "outputs": {
+    "search-results": {
+      "kind": "inline",
+      "returned_by": "search_content",
+      "description": "Ranked per-document hits returned inline by search_content — use for: rendering ranked hits, deep-linking into assets by timestamp (asset_id + start_ms/end_ms)",
+      "example": {
+        "results": [
+          {
+            "doc_id": "9b1a5c7e0d3f4a6b8c2e1f0a9d8b7c6e",
+            "asset_id": "asset:uuid:...",
+            "start_ms": 12000,
+            "end_ms": 18500,
+            "text": "A reporter interviews the senator about the bill.",
+            "named_entities": "Jane Doe, Richard Roe",
+            "segment_parent_id": "seg-0004",
+            "score": 0.7312,
+            "rrf_score": 0.0136621,
+            "match_sources": { "ann:vector": 0.008, "fts:named_entities": 0.005 },
+            "highlights": { "text": "...Jane <em>Doe</em>..." },
+            "source_index": "scene",
+            "final_score": 1.0,
+            "title": "Evening News",
+            "genres": "news,politics"
+          }
+        ],
+        "total": 42,
+        "k": 10,
+        "search_term": "Jane Doe on a stormy beach",
+        "collection_id": "default",
+        "skipped_indices": ["topic"]
+      },
+      "notes": "INVARIANT per doc: doc_id, asset_id, start_ms, end_ms, score (raw ANN cosine or FTS relevance), rrf_score (within-index score-weighted RRF aggregate), match_sources ({sub_query: contribution} — which ANN/FTS sub-queries surfaced the doc), source_index (the scope that surfaced it: shot/scene/segment/utterance/topic), final_score (cross-index score normalized to [0,1], top hit = 1.0 — the sort key). SCHEMA-DEPENDENT payload: the collection schema's result_fields per doc_type (default schemas: scene → text/named_entities/segment_parent_id, shot → frame_s3_key/scene_parent_id, segment → text, utterance → text/scene_parent_id/topic_parent_id, topic → text/named_entities). CONDITIONAL: highlights ({field: text with matched tokens wrapped in <em>}) on FTS matches only; title/genres only when asset_metadata was registered at indexing. skipped_indices lists scopes that were NOT searched: index not yet registered, no docs, or dropped at decompose (no runnable sub-queries) — it is how a caller tells 'no matches' from 'never searched' — a graceful miss, not an error."
+    },
+    "index-status": {
+      "kind": "inline",
+      "returned_by": "get_job_status",
+      "description": "get_job_status SUCCEEDED counts for an index_content job — use for: verifying an indexing run landed (prepared/skipped/indexed)",
+      "example": {
+        "job_id": "arn:aws:states:eu-west-1:123456789012:execution:m2c-hybrid-search-indexer:1f0e...",
+        "status": "SUCCEEDED",
+        "collection_id": "default",
+        "prepared": 77,
+        "skipped": 0,
+        "indexed": 77
+      },
+      "notes": "prepared = documents embedded into rows this run; skipped = per-document dedup hits (doc_id = md5(collection:asset:doc_type:start_ms:end_ms:chunk_idx) already indexed — a full resubmit legitimately reports prepared=0, skipped=N, indexed=0); indexed = rows written, summed across the per-table Map iterations — prepared == indexed on success. FAILED/TIMED_OUT/ABORTED responses replace the counts with `error`."
+    }
+  }
+}

@@ -1,0 +1,253 @@
+{
+ "contract_version": 1,
+ "target": "media-processing",
+ "note": "Keys in `outputs` are FORMAT KINDS, not outputs[] labels. This stack's outputs[] labels are the caller-chosen group_name of each requested output group (plus the fixed `probe` and `usage`), so labels cannot be enumerated here. Each group entry's `desc` is joined by the group's format kind, read from the run's reconciled output_groups — never from the file extension, because a jpeg/png group's output object is frame_manifest.json. `probe` and `usage` join directly by label.",
+ "stability": "Every entry in `outputs` is stable API: format kinds, basename patterns, and the field names/nesting shown in each example. Removing or renaming any of them is a breaking change and requires a TOOL_VERSION bump plus a changelog note here. Files NOT listed here (segment_video/ .ts and segment_audio/ .flac chunk intermediates — deleted after a successful merge unless KEEP_SEGMENT_CHUNKS is set — and anything else under the prefix) are internal and may change or vanish without notice. `description` is one line by design — it is joined verbatim into each get_job_status outputs[] entry as `desc`.",
+ "outputs": {
+  "mp4": {
+   "basename": "{name}.mp4",
+   "kind": "file",
+   "mime": "video/mp4",
+   "description": "Transcoded H.264 (openH264) MP4 proxy — use for playback, review, vision pipelines; audio is one AAC 96 kbps 48 kHz stereo track regardless of source layout",
+   "example": null,
+   "contents": {
+    "video": "H.264 (openH264), request width x height (default 960x540), deinterlaced when the source is interlaced, +faststart",
+    "audio": "AAC 96 kbps, 48 kHz, 2-channel — re-encoded from the stereo-downmixed FLAC intermediate; absent for video-only sources"
+   },
+   "notes": "{name} defaults to the group_name; the object lives at {prefix}/{group_name}/{name}.mp4. Not master-referenced: the audio track is derived from the shared 2-channel FLAC intermediate (channel selection and downmix already applied), so it does not preserve the source channel layout."
+  },
+  "wav": {
+   "basename": "{name}.wav",
+   "kind": "file",
+   "mime": "audio/wav",
+   "description": "Extracted PCM WAV audio (pcm_s16le, default mono 48 kHz) — use for ASR or waveform work; derived from a stereo-downmixed intermediate, not the master channel layout",
+   "example": null,
+   "contents": {
+    "audio": "pcm_s16le; audio_channels (default 1) and sampling_rate (default 48000) from the group parameters, applied at merge"
+   },
+   "notes": "{name} defaults to the group_name. The shared .flac intermediate is always 2-channel stereo; the group's final channel count is applied at merge, so a mono WAV is a downmix of that stereo intermediate."
+  },
+  "m4a": {
+   "basename": "{name}.m4a",
+   "kind": "file",
+   "mime": "audio/mp4",
+   "description": "Extracted AAC M4A audio (default stereo 48 kHz 96 kbps) — use for compact audio delivery; derived from a stereo-downmixed intermediate, not the master channel layout",
+   "example": null,
+   "contents": {
+    "audio": "AAC; audio_channels (default 2), sampling_rate (default 48000), audio_bitrate (default 96 kbps) from the group parameters, applied at merge; +faststart"
+   },
+   "notes": "{name} defaults to the group_name. Derived from the same shared 2-channel .flac intermediate as every other audio group."
+  },
+  "jpeg": {
+   "basename": "frame_manifest.json",
+   "kind": "file",
+   "mime": "application/json",
+   "description": "Frame-capture manifest for a jpeg group — the group's output object; use to enumerate the captured frame_NNNNNNN.jpg files under the group prefix",
+   "example": {
+    "total": 1200,
+    "prefix": "<prefix>/<group_name>",
+    "keys": [
+     "frame_0000000.jpg"
+    ],
+    "dimension": [
+     960,
+     540
+    ]
+   },
+   "notes": "The manifest IS the output object output_keys points at for a jpeg group; the actual frames live under `prefix` and `keys` lists them (basenames relative to `prefix`, frame_{N:07d}.jpg with N the source frame number, stepping by ceil(fps x frame_interval_sec)). `dimension` is the frame [width, height] in pixels."
+  },
+  "png": {
+   "basename": "frame_manifest.json",
+   "kind": "file",
+   "mime": "application/json",
+   "description": "Frame-capture manifest for a png group — the group's output object; use to enumerate the captured frame_NNNNNNN.png files under the group prefix",
+   "example": {
+    "total": 1200,
+    "prefix": "<prefix>/<group_name>",
+    "keys": [
+     "frame_0000000.png"
+    ],
+    "dimension": [
+     960,
+     540
+    ]
+   },
+   "notes": "Identical shape to the jpeg manifest; only the key extension differs (.png). The manifest IS the output object for the group — the frames live under `prefix` and `keys` lists them."
+  },
+  "metadata": {
+   "basename": "{name}.json",
+   "kind": "file",
+   "mime": "application/json",
+   "description": "Resolved technical metadata (duration + its source rung, is_all_intra, stream facts) plus the detail-filtered ffprobe dict — use for codec/resolution/duration/timecode questions without transcoding",
+   "example": {
+    "format_name": "mxf",
+    "duration_sec": 6.04,
+    "duration_source": "ffprobe_ts",
+    "file_size": 89412378,
+    "has_video": true,
+    "has_audio": true,
+    "is_all_intra": false,
+    "video": {
+     "codec": "h264",
+     "width": 1920,
+     "height": 1080,
+     "fps": "25/1",
+     "interlaced": true,
+     "sample_aspect_ratio": "1:1",
+     "field_order": "tt"
+    },
+    "audio_streams": [
+     {
+      "mapid": "0:a:0",
+      "codec": "pcm_s24le",
+      "channels": 1,
+      "sample_rate": 48000
+     }
+    ],
+    "mxf": {
+     "fps": 25.0,
+     "drop_frame": false,
+     "essence_type": "AVCI_100_1080i",
+     "mxf_info": {},
+     "frame_count": 151,
+     "duration_sec": 6.04,
+     "start_timecode": "09:59:30:00"
+    },
+    "probe_info": {}
+   },
+   "notes": "{name} defaults to metadata.json. `mxf` is present ONLY for MXF sources — absence means not-MXF; presence means every field is a real mxf2raw measurement. `mxf.frame_count` and `mxf.duration_sec` are omitted when the MXF header records no duration (count=-1, valid on e.g. Sony eVTR D10); `mxf.start_timecode` is omitted when absent. `video` is present only when the source has a video stream. `duration_sec`+`duration_source` and `is_all_intra` are resolved facts, not ffprobe passthroughs; `is_all_intra` may be null for ambiguous codecs. `probe_info` is the ffprobe dict filtered by the group's `detail` level (`full` adds per-stream disposition/tags); its interior shape is ffmpeg's, not this stack's contract."
+  },
+  "probe": {
+   "basename": "probe.json",
+   "kind": "file",
+   "mime": "application/json",
+   "description": "Probe-state envelope around the verbatim ffprobe result (probe_info) — use for raw stream/format facts; prefer a metadata group for resolved facts like is_all_intra",
+   "example": {
+    "uuid": "<workflow_id>",
+    "source_bucket": "<bucket>",
+    "source_key": "path/to/source.mxf",
+    "format_name": "mxf",
+    "duration_sec": 6.04,
+    "duration_source": "ffprobe_ts",
+    "file_size": 89412378,
+    "probe_info": {
+     "format": {},
+     "streams": [
+      {}
+     ],
+     "chapters": [],
+     "programs": []
+    },
+    "iterators": [
+     {}
+    ]
+   },
+   "notes": "`probe_info` is the verbatim, unfiltered `ffprobe -show_format -show_streams -show_chapters -show_programs` output — its interior shape is ffmpeg's and is NOT a stable contract shape; only the envelope fields shown are. `iterators` is the internal chunk plan ([] on a metadata-only run) — do not integrate against it."
+  },
+  "usage": {
+   "basename": "usage_tracking.json",
+   "kind": "file",
+   "mime": "application/json",
+   "description": "Per-state durations and estimated cost — use for reporting what this run cost",
+   "example": {
+    "execution_arn": "arn:aws:states:...",
+    "source_key": "path/to/source.mxf",
+    "pipeline_wall_sec": 142.3,
+    "total_estimated_cost": 0.00412,
+    "states": [
+     {
+      "state_name": "Merge segment chunks",
+      "operation": "StateMergeChunks",
+      "lambda_arn": "arn:aws:lambda:...",
+      "architecture": "arm64",
+      "memory_mb": 5376,
+      "invocations": 1,
+      "retried": 0,
+      "wall_sec": 3.2,
+      "total_billed_sec": 3.2,
+      "incomplete": false,
+      "estimated_cost": 1.2e-05
+     }
+    ]
+   },
+   "notes": "Costs are us-east-1 pricing estimates, not billing data. `retried` counts attempts that ended in TaskFailed (routine — chunk-transcode retries are normal); `incomplete` is true only when an attempt has no terminal event at all. Both are absent from the final `Usage tracking` entry, which estimates itself before its own terminal event exists. This stack's usage shape differs from its siblings' usage_tracking.json — do not assume cross-stack parity."
+  },
+  "ad_mix": {
+   "basename": "{name}.wav",
+   "kind": "file",
+   "mime": "audio/wav",
+   "description": "Audio-description mix: the programme audio ducked (sidechain) under the narration takes placed by the AD workflow's render_manifest.json, loudness-normalized (I=-24, TP=-2) — stereo PCM WAV, proxy-grade bed (stereo-downmixed intermediate, not the master layout)",
+   "example": null,
+   "contents": {
+    "audio": "pcm_s16le; audio_channels (default 2) and sampling_rate (default 48000) from the group parameters; duration pinned to the programme bed"
+   }
+  },
+  "edit_manifest": {
+   "basename": "edit_manifest.json",
+   "kind": "file",
+   "mime": "application/json",
+   "description": "Quick-edit evidence manifest — requested vs actual per cut (ms + frames), the derived record timeline, crops (ratios and pixels), normalizations, transitions, overlays, measured loudness, source ETags",
+   "example": {
+    "target": {
+     "width": 1920,
+     "height": 1080,
+     "fps": "25"
+    },
+    "total_frames": 600,
+    "total_ms": 24000.0,
+    "total_authored_ms": 26600,
+    "crossfade_mode": "overlap-trim",
+    "loudnorm_on": true,
+    "segments": [
+     {
+      "segment_index": 0,
+      "source_s3uri": "s3://bucket/a.mp4",
+      "channel": "av",
+      "requested_in_ms": 10000,
+      "requested_out_ms": 18000,
+      "src_in_frame": 250,
+      "src_out_frame": 450,
+      "record_in_ms": 0.0,
+      "record_out_ms": 8000.0,
+      "record_in_frame": 0,
+      "record_out_frame": 200,
+      "transition_in": {
+       "type": "fade",
+       "duration_ms": 500
+      },
+      "normalizations": [
+       "scale_pad"
+      ]
+     }
+    ],
+    "overlays": [],
+    "sources": {
+     "s3://bucket/a.mp4": {
+      "etag": "abc",
+      "duration_sec": 600.0
+     }
+    }
+   }
+  },
+  "capture_manifest": {
+   "basename": "capture_manifest.json",
+   "kind": "file",
+   "mime": "application/json",
+   "description": "Frame-capture manifest for a capture_frames run — maps each marker index to its still's key with requested vs actual ms and the source frame number (replaces frame_manifest.json for this mode; the group label still joins the jpeg/png entry)",
+   "example": {
+    "total": 2,
+    "prefix": "<prefix>/frames",
+    "captures": [
+     {
+      "index": 0,
+      "source_s3uri": "s3://bucket/a.mp4",
+      "requested_ms": 1030,
+      "actual_ms": 1040.0,
+      "frame": 26,
+      "s3_key": "<prefix>/frames/frame_0000.jpg"
+     }
+    ]
+   }
+  }
+ }
+}

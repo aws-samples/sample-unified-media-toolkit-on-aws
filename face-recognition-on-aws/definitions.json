@@ -1,0 +1,657 @@
+{
+    "Comment": "Face recognition micro-workflow. Extracts frames via media-processing child execution, probe-then-fill face detection on grid images, temporal tracking, celebrity recognition, identity clustering via sandbox collection, persistent-collection search/index. A DynamoDB counting semaphore (acquired AFTER frame extraction, released after the last Rekognition state) bounds concurrent Rekognition usage.",
+    "StartAt": "Prepare media processing",
+    "States": {
+        "Prepare media processing": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${FaceRecognitionLambda1Core.Arn}",
+                "Payload": {
+                    "operation": "StatePrepareMediaProcessing",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Run media processing"
+        },
+        "Run media processing": {
+            "Type": "Task",
+            "Comment": "HELD (2026-09-18, the family sibling pattern): submits the frame-extraction request to the media-processing GATEWAY with this state's task token; MP's waker completes it with the submit handle + terminal status AS DATA (never a detonation) \u2014 Extract processed frames enforces SUCCEEDED and derives the manifest/probe keys from MP's output contract. Idempotent: the token derives from this run's uuid, so a redrive absorbs into the same MP run (retires the minted facerec-{hex} child uuid). Replaces the direct states:startExecution.sync:2 of MP's machine (its internal execution output was our API, no idempotency, extra IAM).",
+            "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+            "Parameters": {
+                "FunctionName": "${FaceRecognitionLambda1Core.Arn}",
+                "Payload": {
+                    "operation": "StateSubmitMediaProcessing",
+                    "uuid.$": "$.uuid",
+                    "data.$": "$.data",
+                    "mp_gateway_arn": "${MediaProcessingGatewayLambdaArn}",
+                    "task_token.$": "$$.Task.Token"
+                }
+            },
+            "ResultPath": "$.data.media_processing_output",
+            "TimeoutSeconds": 14400,
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 5,
+                    "MaxAttempts": 4,
+                    "BackoffRate": 2.0
+                }
+            ],
+            "Next": "Extract processed frames"
+        },
+        "Extract processed frames": {
+            "Type": "Task",
+            "Comment": "Normalizes the gateway handle to the legacy field shape every downstream state reads (frames_bucket, manifest_key, probe_key, duration_sec, media_processing_arn); enforces MP's terminal status; legacy shapes pass through untouched.",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${FaceRecognitionLambda1Core.Arn}",
+                "Payload": {
+                    "operation": "StateExtractProcessedFrames",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Prepare probe iterators"
+        },
+        "Prepare probe iterators": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${FaceRecognitionLambda3Cores.Arn}",
+                "Payload": {
+                    "operation": "StatePrepareProbeIterators",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "LambdaResourceTimeoutException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 10,
+                    "BackoffRate": 1
+                },
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Acquire semaphore"
+        },
+        "Acquire semaphore": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+            "ResultPath": null,
+            "Parameters": {
+                "FunctionName": "${FaceRecognitionLambda1Core.Arn}",
+                "Payload": {
+                    "operation": "StateAcquireSemaphore",
+                    "execution_arn.$": "$$.Execution.Id",
+                    "task_token.$": "$$.Task.Token",
+                    "uuid.$": "$.uuid",
+                    "max_concurrent_executions.$": "$.input.input_config.max_concurrent_executions"
+                }
+            },
+            "TimeoutSeconds": 86400,
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Map probe detection"
+        },
+        "Map probe detection": {
+            "Type": "Map",
+            "MaxConcurrencyPath": "$.input.input_config.detect_map_concurrency",
+            "ItemsPath": "$.data.iterators",
+            "ItemSelector": {
+                "operation": "StateProbeDetectFaces",
+                "item_id.$": "$$.Map.Item.Index",
+                "item_data.$": "$$.Map.Item.Value",
+                "execution_arn.$": "$$.Execution.Id"
+            },
+            "ItemProcessor": {
+                "ProcessorConfig": {
+                    "Mode": "INLINE"
+                },
+                "StartAt": "Probe detect faces",
+                "States": {
+                    "Probe detect faces": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "OutputPath": "$.Payload",
+                        "Parameters": {
+                            "FunctionName": "${FaceRecognitionLambda3Cores.Arn}",
+                            "Payload.$": "$"
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "LambdaResourceTimeoutException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 10,
+                                "BackoffRate": 1
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "ProvisionedThroughputExceededException",
+                                    "ThrottlingException",
+                                    "InternalServerError",
+                                    "ServiceUnavailableException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 6,
+                                "BackoffRate": 1.2
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException",
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 1.2
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Sandbox.Timedout",
+                                    "Lambda.Unknown"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 2
+                            }
+                        ],
+                        "End": true
+                    }
+                }
+            },
+            "ResultPath": "$.data.iterators",
+            "Next": "Plan dense detection"
+        },
+        "Plan dense detection": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${FaceRecognitionLambda1Core.Arn}",
+                "Payload": {
+                    "operation": "StatePlanDenseDetection",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Map detect faces"
+        },
+        "Map detect faces": {
+            "Type": "Map",
+            "MaxConcurrencyPath": "$.input.input_config.detect_map_concurrency",
+            "ItemsPath": "$.data.iterators",
+            "ItemSelector": {
+                "operation": "StateDetectFaces",
+                "item_id.$": "$$.Map.Item.Index",
+                "item_data.$": "$$.Map.Item.Value",
+                "execution_arn.$": "$$.Execution.Id"
+            },
+            "ItemProcessor": {
+                "ProcessorConfig": {
+                    "Mode": "INLINE"
+                },
+                "StartAt": "Detect faces",
+                "States": {
+                    "Detect faces": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "OutputPath": "$.Payload",
+                        "Parameters": {
+                            "FunctionName": "${FaceRecognitionLambda3Cores.Arn}",
+                            "Payload.$": "$"
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "LambdaResourceTimeoutException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 10,
+                                "BackoffRate": 1
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "ProvisionedThroughputExceededException",
+                                    "ThrottlingException",
+                                    "InternalServerError",
+                                    "ServiceUnavailableException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 6,
+                                "BackoffRate": 1.2
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException",
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 1.2
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Sandbox.Timedout",
+                                    "Lambda.Unknown"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 2
+                            }
+                        ],
+                        "End": true
+                    }
+                }
+            },
+            "ResultPath": "$.data.iterators",
+            "Next": "Build face tracks"
+        },
+        "Build face tracks": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${FaceRecognitionLambda1Core.Arn}",
+                "Payload": {
+                    "operation": "StateBuildFaceTracks",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Map recognize celebrities"
+        },
+        "Map recognize celebrities": {
+            "Type": "Map",
+            "MaxConcurrencyPath": "$.input.input_config.detect_map_concurrency",
+            "ItemsPath": "$.data.iterators",
+            "ItemSelector": {
+                "operation": "StateRecognizeCelebrities",
+                "item_id.$": "$$.Map.Item.Index",
+                "item_data.$": "$$.Map.Item.Value",
+                "execution_arn.$": "$$.Execution.Id"
+            },
+            "ItemProcessor": {
+                "ProcessorConfig": {
+                    "Mode": "INLINE"
+                },
+                "StartAt": "Recognize celebrities",
+                "States": {
+                    "Recognize celebrities": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "OutputPath": "$.Payload",
+                        "Parameters": {
+                            "FunctionName": "${FaceRecognitionLambda3Cores.Arn}",
+                            "Payload.$": "$"
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "LambdaResourceTimeoutException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 10,
+                                "BackoffRate": 1
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "ProvisionedThroughputExceededException",
+                                    "ThrottlingException",
+                                    "InternalServerError",
+                                    "ServiceUnavailableException"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 6,
+                                "BackoffRate": 1.2
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException",
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 1.2
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Sandbox.Timedout",
+                                    "Lambda.Unknown"
+                                ],
+                                "IntervalSeconds": 2,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 2
+                            }
+                        ],
+                        "End": true
+                    }
+                }
+            },
+            "ResultPath": "$.data.iterators",
+            "Next": "Cluster identities"
+        },
+        "Cluster identities": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${FaceRecognitionLambda3Cores.Arn}",
+                "Payload": {
+                    "operation": "StateClusterIdentities",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data",
+                    "execution_arn.$": "$$.Execution.Id"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "LambdaResourceTimeoutException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 10,
+                    "BackoffRate": 1
+                },
+                {
+                    "ErrorEquals": [
+                        "ProvisionedThroughputExceededException",
+                        "ThrottlingException",
+                        "InternalServerError",
+                        "ServiceUnavailableException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 1.2
+                },
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Search and index faces"
+        },
+        "Search and index faces": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${FaceRecognitionLambda1Core.Arn}",
+                "Payload": {
+                    "operation": "StateSearchIndexFaces",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data",
+                    "execution_arn.$": "$$.Execution.Id"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "LambdaResourceTimeoutException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 10,
+                    "BackoffRate": 1
+                },
+                {
+                    "ErrorEquals": [
+                        "ProvisionedThroughputExceededException",
+                        "ThrottlingException",
+                        "InternalServerError",
+                        "ServiceUnavailableException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 1.2
+                },
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Release semaphore"
+        },
+        "Release semaphore": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "ResultPath": null,
+            "Parameters": {
+                "FunctionName": "${FaceRecognitionLambda1Core.Arn}",
+                "Payload": {
+                    "operation": "StateReleaseSemaphore",
+                    "execution_arn.$": "$$.Execution.Id"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Finalize outputs"
+        },
+        "Finalize outputs": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${FaceRecognitionLambda1Core.Arn}",
+                "Payload": {
+                    "operation": "StateFinalizeOutputs",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Store debug images"
+        },
+        "Store debug images": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${FaceRecognitionLambda3Cores.Arn}",
+                "Payload": {
+                    "operation": "StateStoreDebugImages",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "LambdaResourceTimeoutException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 10,
+                    "BackoffRate": 1
+                },
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Usage tracking"
+        },
+        "Usage tracking": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${FaceRecognitionLambda1Core.Arn}",
+                "Payload": {
+                    "operation": "StateUsageTracking",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data",
+                    "execution_arn.$": "$$.Execution.Id"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "End": true
+        }
+    }
+}

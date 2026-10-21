@@ -1,0 +1,204 @@
+{
+    "Comment": "Media processing state machine split into chunks, transcode, and stitch them back together",
+    "StartAt": "Probe media file",
+    "States": {
+        "Probe media file": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${MediaProcessingLambda3Cores.Arn}",
+                "Payload": {
+                    "operation": "StateProbeMediaFile",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Metadata only?"
+        },
+        "Metadata only?": {
+            "Comment": "Metadata-only requests are fully served by the probe state — skip the Map and merge, but still run usage tracking (the End state the gateway reads the final output from)",
+            "Type": "Choice",
+            "Choices": [
+                {
+                    "Variable": "$.data.metadata_only",
+                    "BooleanEquals": true,
+                    "Next": "Usage tracking"
+                }
+            ],
+            "Default": "Map transcode segment chunk iterators"
+        },
+        "Map transcode segment chunk iterators": {
+            "Type": "Map",
+            "MaxConcurrency": 40,
+            "ItemsPath": "$.data.iterators",
+            "ItemSelector": {
+                "operation": "StateChunkTranscode",
+                "item_data.$": "$$.Map.Item.Value"
+            },
+            "ItemProcessor": {
+                "ProcessorConfig": {
+                    "Mode": "INLINE"
+                },
+                "StartAt": "Transcode segment chunk (X mins)",
+                "States": {
+                    "Transcode segment chunk (X mins)": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "OutputPath": "$.Payload",
+                        "Parameters": {
+                            "FunctionName.$": "$.item_data.function_arn",
+                            "Payload.$": "$"
+                        },
+                        "Catch": [
+                            {
+                                "ErrorEquals": [
+                                    "Sandbox.Timedout",
+                                    "Lambda.Unknown"
+                                ],
+                                "Next": "Transcode segment chunk (Retry larger memory)",
+                                "ResultPath": "$.error"
+                            }
+                        ],
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Sandbox.Timedout",
+                                    "Lambda.Unknown"
+                                ],
+                                "MaxAttempts": 0
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "ValidationException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 1.0
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException",
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 1.2
+                            }
+                        ],
+                        "End": true
+                    },
+                    "Transcode segment chunk (Retry larger memory)": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "OutputPath": "$.Payload",
+                        "Parameters": {
+                            "FunctionName": "${MediaProcessingLambda6Cores.Arn}",
+                            "Payload.$": "$"
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "ValidationException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 1.0
+                            },
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException",
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 1.0
+                            }
+                        ],
+                        "End": true
+                    }
+                }
+            },
+            "ResultPath": "$.data.iterators",
+            "Next": "Merge segment chunks"
+        },
+        "Merge segment chunks": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName.$": "$.data.function_arn",
+                "Payload": {
+                    "operation": "StateMergeChunks",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "Next": "Usage tracking"
+        },
+        "Usage tracking": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${MediaProcessingLambdaHalfCore.Arn}",
+                "Payload": {
+                    "operation": "StateUsageTracking",
+                    "uuid.$": "$.uuid",
+                    "input.$": "$.input",
+                    "output.$": "$.output",
+                    "data.$": "$.data",
+                    "execution_arn.$": "$$.Execution.Id"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 1,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.2
+                }
+            ],
+            "End": true
+        }
+    }
+}

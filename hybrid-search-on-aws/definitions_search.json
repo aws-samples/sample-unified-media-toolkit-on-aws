@@ -1,0 +1,120 @@
+{
+    "Comment": "Hybrid search workflow. Decomposes query (operator parsing + SLM entity extraction + embedding), fans out per-index searches in parallel, reranks with weights from decomposition.",
+    "StartAt": "Set input defaults",
+    "States": {
+        "Set input defaults": {
+            "Type": "Pass",
+            "Comment": "Merge optional fields (search_term, search_image_s3uri) with empty-string defaults so downstream states never reference absent keys.",
+            "Parameters": {
+                "merged.$": "States.JsonMerge(States.StringToJson('{\"collection_id\":\"\",\"workflow_config_uri\":\"\",\"search_term\":\"\",\"search_image_s3uri\":\"\",\"k\":10}'), $$.Execution.Input, false)"
+            },
+            "ResultPath": "$.input",
+            "Next": "Decompose search request"
+        },
+        "Decompose search request": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "ResultSelector": {
+                "decomposition.$": "$.Payload"
+            },
+            "ResultPath": "$.decompose_result",
+            "Parameters": {
+                "FunctionName": "${SearchLambdaArn}",
+                "Payload": {
+                    "operation": "StateDecomposeSearchRequest",
+                    "request_id.$": "$$.Execution.Name",
+                    "workflow_config_uri.$": "$.input.merged.workflow_config_uri",
+                    "search_term.$": "$.input.merged.search_term",
+                    "search_image_s3uri.$": "$.input.merged.search_image_s3uri",
+                    "k.$": "$.input.merged.k",
+                    "collection_id.$": "$.input.merged.collection_id"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 1.5
+                }
+            ],
+            "Next": "(Map) Search indices"
+        },
+        "(Map) Search indices": {
+            "Type": "Map",
+            "MaxConcurrency": 0,
+            "ItemsPath": "$.decompose_result.decomposition.queries",
+            "ItemSelector": {
+                "operation": "StateSearchIndex",
+                "query.$": "$$.Map.Item.Value"
+            },
+            "ItemProcessor": {
+                "ProcessorConfig": {
+                    "Mode": "INLINE"
+                },
+                "StartAt": "Search index",
+                "States": {
+                    "Search index": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "OutputPath": "$.Payload",
+                        "Parameters": {
+                            "FunctionName": "${SearchLambdaArn}",
+                            "Payload.$": "$"
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "Lambda.ServiceException",
+                                    "Lambda.AWSLambdaException",
+                                    "Lambda.SdkClientException",
+                                    "Lambda.TooManyRequestsException"
+                                ],
+                                "IntervalSeconds": 1,
+                                "MaxAttempts": 2,
+                                "BackoffRate": 1
+                            }
+                        ],
+                        "End": true
+                    }
+                }
+            },
+            "ResultPath": "$.search_results",
+            "Next": "Rerank results"
+        },
+        "Rerank results": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+                "FunctionName": "${SearchLambdaArn}",
+                "Payload": {
+                    "operation": "StateRerankResults",
+                    "search_term.$": "$.decompose_result.decomposition.original_query",
+                    "k.$": "$.input.merged.k",
+                    "decomposition.$": "$.decompose_result.decomposition",
+                    "search_results.$": "$.search_results"
+                }
+            },
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 1.5
+                }
+            ],
+            "End": true
+        }
+    }
+}
