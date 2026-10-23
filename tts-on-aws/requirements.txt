@@ -34,7 +34,7 @@ soundfile==0.13.1
 # ── Text tokenizer (LLM prompt construction) ─────────────────────────────────
 # transformers is used ONLY for AutoTokenizer (Qwen2 BPE + special tokens) —
 # no torch backend needed for tokenization-only use.
-transformers==4.51.3
+transformers==5.10.1
 tokenizers==0.21.4
 
 # ── QC gate (ASR roundtrip) ───────────────────────────────────────────────────
