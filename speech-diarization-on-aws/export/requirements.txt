@@ -5,7 +5,7 @@ aiosignal==1.4.0
 alembic==1.18.4
 annotated-doc==0.0.4
 antlr4-python3-runtime==4.9.3
-anyio==4.12.1
+anyio==4.14.2
 asteroid-filterbanks==0.4.0
 attrs==25.4.0
 av==16.1.0
