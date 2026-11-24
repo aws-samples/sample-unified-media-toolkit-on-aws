@@ -90,7 +90,7 @@ pyannote-metrics==4.0.0
 pyannote-pipeline==4.0.0
 pyannoteai-sdk==0.4.0
 pycparser==3.0
-Pygments==2.19.2
+Pygments==2.20.0
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 pytorch-lightning==2.6.1
