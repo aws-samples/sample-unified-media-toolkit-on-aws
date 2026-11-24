@@ -97,7 +97,7 @@ pytorch-lightning==2.6.1
 pytorch-metric-learning==2.9.0
 PyYAML==6.0.3
 regex==2026.2.28
-requests==2.32.5
+requests==2.33.0
 rich==14.3.3
 ruamel.yaml==0.18.17
 ruamel.yaml.clib==0.2.15
